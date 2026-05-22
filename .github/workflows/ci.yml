@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ============================================================
+  # Rust: 格式 + Clippy + 测试（三平台矩阵）
+  # ============================================================
+  rust-check:
+    name: Rust ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo deps
+        uses: Swatinem/rust-cache@v2
+
+      # 前端先 build 一次（rust-embed 需要 frontend/dist 才能编译 vpn-server）
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend (for rust-embed)
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
+      # 格式（仅 Linux 跑一次即可）
+      - name: cargo fmt
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
+
+      # Clippy
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+      # 测试
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+  # ============================================================
+  # Frontend: ESLint + tsc + build
+  # ============================================================
+  frontend-check:
+    name: Frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: cd frontend && npm ci
+
+      - name: ESLint
+        run: cd frontend && npm run lint --if-present
+
+      - name: TypeScript check + build
+        run: cd frontend && npm run build
+
+  # ============================================================
+  # cargo-deny: 依赖审计（许可证 + 漏洞）
+  # ============================================================
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    continue-on-error: true  # MVP 阶段不阻塞，仅警告
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

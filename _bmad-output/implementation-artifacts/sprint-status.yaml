@@ -1,5 +1,5 @@
 # generated: 2026-05-22
-# last_updated: 2026-05-22 (Story 1.1 created)
+# last_updated: 2026-05-22 (Epic 1 全部 10 个 Story 实施完成，待 review)
 # project: vpn
 # project_key: NOKEY
 # tracking_system: file-system
@@ -46,16 +46,16 @@ development_status:
   # Epic 1: Project Foundation & Deployable Skeleton (10 stories)
   # ============================================================
   epic-1: in-progress
-  1-1-init-workspace-and-frontend: in-progress
-  1-2-setup-sqlx-and-init-migration: backlog
-  1-3-implement-api-types-foundation: backlog
-  1-4-implement-core-errors-and-traits: backlog
-  1-5-implement-server-skeleton-and-middleware: backlog
-  1-6-implement-acme-and-https-enforcement: backlog
-  1-7-implement-react-skeleton-and-antd-theme: backlog
-  1-8-embed-frontend-and-spa-fallback: backlog
-  1-9-docker-multistage-build: backlog
-  1-10-github-actions-ci-matrix: backlog
+  1-1-init-workspace-and-frontend: review
+  1-2-setup-sqlx-and-init-migration: review
+  1-3-implement-api-types-foundation: review
+  1-4-implement-core-errors-and-traits: review
+  1-5-implement-server-skeleton-and-middleware: review
+  1-6-implement-acme-and-https-enforcement: review
+  1-7-implement-react-skeleton-and-antd-theme: review
+  1-8-embed-frontend-and-spa-fallback: review
+  1-9-docker-multistage-build: review
+  1-10-github-actions-ci-matrix: review
   epic-1-retrospective: optional
 
   # ============================================================
