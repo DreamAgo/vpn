@@ -1,0 +1,17 @@
+# 排除不需要进入构建上下文的文件，加快 docker build
+
+target/
+frontend/node_modules/
+frontend/dist/
+.git/
+.github/
+_bmad/
+_bmad-output/
+.agents/
+.claude/
+docs/
+*.db
+.env*
+.DS_Store
+*.md
+!README.md

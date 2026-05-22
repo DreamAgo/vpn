@@ -1,20 +1,41 @@
+import { ConfigProvider, App as AntdApp } from 'antd';
+import zhCN from 'antd/locale/zh_CN';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+
+import { theme } from './theme';
+import { AppLayout } from './components/layout/AppLayout';
+import { PlaceholderPage } from './components/PlaceholderPage';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,
+      refetchOnWindowFocus: false,
+      retry: 1,
+    },
+  },
+});
+
 function App() {
   return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        height: '100vh',
-        fontFamily:
-          '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif',
-      }}
-    >
-      <div>
-        <h1>vpn 项目正在运行</h1>
-        <p>Story 1.7 将配置 AntD 主题与 ProLayout 主框架</p>
-      </div>
-    </div>
+    <ConfigProvider locale={zhCN} theme={theme}>
+      <AntdApp>
+        <QueryClientProvider client={queryClient}>
+          <BrowserRouter>
+            <Routes>
+              <Route element={<AppLayout />}>
+                <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                <Route path="/dashboard" element={<PlaceholderPage name="仪表盘" />} />
+                <Route path="/users" element={<PlaceholderPage name="用户管理" />} />
+                <Route path="/peers" element={<PlaceholderPage name="节点管理" />} />
+                <Route path="/audit-logs" element={<PlaceholderPage name="审计日志" />} />
+              </Route>
+            </Routes>
+          </BrowserRouter>
+        </QueryClientProvider>
+      </AntdApp>
+    </ConfigProvider>
   );
 }
 

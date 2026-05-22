@@ -1,0 +1,45 @@
+# vpn 服务端单容器部署
+#
+# 使用：
+#   1. 设置域名 DNS 解析到本机
+#   2. 修改下方 environment.VPN_DOMAIN 为你的域名
+#   3. docker compose -f docker/docker-compose.yml up -d
+#   4. 浏览器访问 https://<域名> 完成 setup wizard
+
+services:
+  vpn:
+    image: vpn:latest
+    container_name: vpn-server
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "80:80"      # ACME HTTP-01 + HTTPS 重定向
+      - "443:443"    # HTTPS 管理后台 + API
+      - "51820:51820/udp"  # WireGuard 数据平面
+    environment:
+      VPN_BIND_ADDR: "0.0.0.0:8080"
+      VPN_HTTPS: "true"
+      VPN_DOMAIN: "vpn.example.com"  # ← 修改为你的真实域名
+      DATABASE_URL: "sqlite:///var/lib/vpn/vpn.db?mode=rwc"
+      VPN_DATA_DIR: "/var/lib/vpn"
+      RUST_LOG: "info,sqlx=warn"
+    volumes:
+      - vpn-data:/var/lib/vpn
+    cap_add:
+      - NET_ADMIN  # 创建 TUN 设备需要
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  vpn-data:
+    driver: local
