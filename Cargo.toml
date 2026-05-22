@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vpn-api-types",
+    "crates/vpn-core",
+    "crates/vpn-wireguard",
+    "crates/vpn-platform",
+    "crates/vpn-server",
+    "crates/vpn-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Shangguanjunjie"]
+repository = "https://github.com/Shangguanjunjie/vpn"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# === 异步运行时 ===
+tokio = { version = "1.52", features = ["full"] }
+
+# === 内部 crate ===
+vpn-api-types = { path = "crates/vpn-api-types" }
+vpn-core = { path = "crates/vpn-core" }
+vpn-wireguard = { path = "crates/vpn-wireguard" }
+vpn-platform = { path = "crates/vpn-platform" }
+
+# === 序列化 ===
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# === 错误处理 ===
+anyhow = "1.0"
+thiserror = "2.0"
+
+# === 日志 ===
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# === 时间与 ID ===
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# === 异步辅助 ===
+async-trait = "0.1"
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

@@ -1,0 +1,31 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# 数据库与运行时
+*.db
+*.db-journal
+.sqlx/dummy
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 前端
+/frontend/node_modules
+/frontend/dist
+
+# 私钥与证书（仅开发期）
+*.pem
+*.key
