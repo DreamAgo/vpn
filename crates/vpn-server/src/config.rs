@@ -34,6 +34,9 @@ pub struct ServerConfig {
     pub wg_backend: String,
     /// WireGuard 接口名。默认 `wg0`。
     pub wg_interface: String,
+    /// 服务端自身网关的网段（CIDR 列表，如所在 Docker 网络），
+    /// 会作为 allowed_routes 下发给客户端，使其经隧道访问这些网段。默认空。
+    pub server_routes: Vec<String>,
 }
 
 impl ServerConfig {
@@ -72,6 +75,15 @@ impl ServerConfig {
 
         let wg_backend = env::var("VPN_WG_BACKEND").unwrap_or_else(|_| "noop".to_string());
         let wg_interface = env::var("VPN_WG_INTERFACE").unwrap_or_else(|_| "wg0".to_string());
+        let server_routes = env::var("VPN_SERVER_ROUTES")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(Self {
             bind_addr,
@@ -85,6 +97,7 @@ impl ServerConfig {
             audit_retention_days,
             wg_backend,
             wg_interface,
+            server_routes,
         })
     }
 }
@@ -108,6 +121,7 @@ mod tests {
             env::remove_var("VPN_AUDIT_RETENTION_DAYS");
             env::remove_var("VPN_WG_BACKEND");
             env::remove_var("VPN_WG_INTERFACE");
+            env::remove_var("VPN_SERVER_ROUTES");
         }
         let cfg = ServerConfig::from_env().unwrap();
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");

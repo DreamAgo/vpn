@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
             &config.wg_backend,
             &config.wg_interface,
             config.vpn_listen_port,
+            config.server_routes.clone(),
         )
         .await
         .context("装配 PeerService 失败")?,
