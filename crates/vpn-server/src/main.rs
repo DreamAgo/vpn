@@ -14,8 +14,8 @@ use vpn_server::{
         SqliteSystemConfigRepository, SqliteUserRepository,
     },
     services::{
-        build_peer_service, Argon2Hasher, AuditService, AuthService, JwtTokenIssuer, PeerService,
-        UserService,
+        build_peer_service_with_backend, Argon2Hasher, AuditService, AuthService, JwtTokenIssuer,
+        PeerService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -78,9 +78,17 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("VPN_SUBNET 非法 CIDR：{}", config.vpn_subnet))?;
     let peer_service = Arc::new(
-        build_peer_service(peer_repo, &config_repo, subnet, config.vpn_endpoint.clone())
-            .await
-            .context("装配 PeerService 失败")?,
+        build_peer_service_with_backend(
+            peer_repo,
+            &config_repo,
+            subnet,
+            config.vpn_endpoint.clone(),
+            &config.wg_backend,
+            &config.wg_interface,
+            config.vpn_listen_port,
+        )
+        .await
+        .context("装配 PeerService 失败")?,
     );
     tracing::info!(
         server_public_key = %peer_service.server_public_key_string(),

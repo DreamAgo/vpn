@@ -30,6 +30,10 @@ pub struct ServerConfig {
     pub vpn_endpoint: String,
     /// 审计日志保留天数（Story 5.3 清理任务）。默认 180。
     pub audit_retention_days: u32,
+    /// WireGuard 后端："noop"（默认，仅记账，无需特权）或 "kernel"（Linux 内核 WireGuard，需 root/CAP_NET_ADMIN + wg 工具）。
+    pub wg_backend: String,
+    /// WireGuard 接口名。默认 `wg0`。
+    pub wg_interface: String,
 }
 
 impl ServerConfig {
@@ -66,6 +70,9 @@ impl ServerConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(180);
 
+        let wg_backend = env::var("VPN_WG_BACKEND").unwrap_or_else(|_| "noop".to_string());
+        let wg_interface = env::var("VPN_WG_INTERFACE").unwrap_or_else(|_| "wg0".to_string());
+
         Ok(Self {
             bind_addr,
             database_url,
@@ -76,6 +83,8 @@ impl ServerConfig {
             vpn_listen_port,
             vpn_endpoint,
             audit_retention_days,
+            wg_backend,
+            wg_interface,
         })
     }
 }
@@ -97,6 +106,8 @@ mod tests {
             env::remove_var("VPN_LISTEN_PORT");
             env::remove_var("VPN_ENDPOINT");
             env::remove_var("VPN_AUDIT_RETENTION_DAYS");
+            env::remove_var("VPN_WG_BACKEND");
+            env::remove_var("VPN_WG_INTERFACE");
         }
         let cfg = ServerConfig::from_env().unwrap();
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");
@@ -105,5 +116,7 @@ mod tests {
         assert_eq!(cfg.vpn_listen_port, 51820);
         assert_eq!(cfg.vpn_endpoint, "127.0.0.1:51820");
         assert_eq!(cfg.audit_retention_days, 180);
+        assert_eq!(cfg.wg_backend, "noop");
+        assert_eq!(cfg.wg_interface, "wg0");
     }
 }
