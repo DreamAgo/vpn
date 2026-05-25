@@ -1,5 +1,5 @@
 # generated: 2026-05-22
-# last_updated: 2026-05-25 (Epic 4 完整[CLI+向导] + Epic 5 前后端 实施完成，待 review；真实 WG 数据面留桩)
+# last_updated: 2026-05-25 (Epic 6 文档/发布/打包脚手架完成；真机 E2E 与覆盖率待真机)
 # project: vpn
 # project_key: NOKEY
 # tracking_system: file-system
@@ -136,14 +136,17 @@ development_status:
   # ============================================================
   # Epic 6: Production Release (9 stories)
   # ============================================================
-  epic-6: backlog
-  6-1-write-readme: backlog
-  6-2-write-docs: backlog
-  6-3-build-linux-packages: backlog
-  6-4-build-macos-package: backlog
-  6-5-build-windows-installer: backlog
+  epic-6: in-progress
+  6-1-write-readme: review
+  6-2-write-docs: review
+  # 打包为脚手架（packaging/），实际构建需对应平台 CI/真机
+  6-3-build-linux-packages: review
+  6-4-build-macos-package: review
+  6-5-build-windows-installer: review
+  # E2E 需真机双节点拓扑 + 真实 WG 数据面，见 REAL-HARDWARE-CHECKLIST
   6-6-implement-e2e-tests: backlog
-  6-7-configure-release-pipeline: backlog
+  6-7-configure-release-pipeline: review
+  # 覆盖率达标需接入 cargo-llvm-cov 并测量
   6-8-achieve-test-coverage-target: backlog
-  6-9-security-audit-and-user-testing: backlog
+  6-9-security-audit-and-user-testing: review
   epic-6-retrospective: optional

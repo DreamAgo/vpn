@@ -1,0 +1,19 @@
+#!/bin/sh
+# macOS .pkg postinstall：在安装 vpn-cli 后运行（以 root 身份，由 Installer 调用）。
+# 文件名必须为 "postinstall"（无扩展名）才会被 pkgbuild --scripts 识别。
+#
+# 作用：确保二进制可执行，并提示用户如何注册 daemon。
+# 不在此处 launchctl load LaunchAgent —— LaunchAgent 属于登录用户会话，
+# root 安装上下文无法可靠定位目标用户，交由用户执行 `vpn-cli daemon install`。
+set -e
+
+BIN="/usr/local/bin/vpn-cli"
+
+if [ -f "${BIN}" ]; then
+    chmod 0755 "${BIN}"
+fi
+
+echo "vpn-cli 已安装到 ${BIN}。"
+echo "如需后台自动连接，请在登录用户会话执行： vpn-cli daemon install"
+
+exit 0

@@ -28,9 +28,13 @@ build:
     cd frontend && npm run build
     cargo build --release --workspace
 
-# 构建 Docker 镜像（占位，由 Story 1.9 实现）
+# 构建并启动 Docker（单容器服务端）
 docker:
-    @echo "TODO: Docker build will be implemented in Story 1.9"
+    docker compose -f docker/docker-compose.yml up -d --build
+
+# 依赖安全审计（许可证 + 漏洞，需安装 cargo-deny）
+audit:
+    cargo deny check
 
 # 代码格式与 Lint（CI 强制执行）
 lint:

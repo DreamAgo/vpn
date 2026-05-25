@@ -1,0 +1,39 @@
+# cargo-deny 配置：依赖漏洞 + 许可证 + 来源审计
+# 用法：cargo install cargo-deny && cargo deny check
+
+[advisories]
+# 漏洞数据库默认为 RustSec advisory-db
+yanked = "deny"
+# 忽略列表：仅在确认无影响时按 ID 临时加入，并附说明
+ignore = []
+
+[licenses]
+# 允许的许可证（与本项目 MIT 兼容的常见宽松许可）
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+# 个别 crate 的许可证例外（按需补充，附理由）
+exceptions = []
+
+[bans]
+# 多版本同一 crate 仅警告（依赖树常见，不阻塞）
+multiple-versions = "warn"
+wildcards = "allow"
+# 明确禁止的 crate（如已知不安全/弃用）可在此列出
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
