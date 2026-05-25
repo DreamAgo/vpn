@@ -89,6 +89,17 @@ impl SqlitePeerRepository {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
+    /// 列出活跃 peer 的 (wg_public_key, vpn_ip)，用于启动时向内核接口恢复配置。
+    pub async fn list_active_peer_keys(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT wg_public_key, vpn_ip FROM peers WHERE status NOT IN ('deleted', 'force_removed')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(rows)
+    }
+
     /// 插入新 peer。wg_public_key / vpn_ip 冲突返回 DuplicateResource。
     #[allow(clippy::too_many_arguments)]
     pub async fn insert(

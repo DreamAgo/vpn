@@ -2,18 +2,27 @@
 
 本项目在无 root / 无真实网卡 / 单一开发平台（macOS）的环境下完成了**控制平面 + 可测逻辑**的全部实现与测试。以下条目属于**系统集成层**，必须在目标平台真机（或对应 OS 的 CI runner）上完成与验证。它们当前以可编译的骨架、`NoopWireGuardControl` 注入或 `#[ignore]` 测试形式存在，不影响其余功能与全部自动化测试通过。
 
-## 1. WireGuard 真实数据平面（最高优先）
+## 1. WireGuard 真实数据平面
 
-**现状**：`vpn_wireguard::WireGuardControl` 已抽象增删 peer；服务端注入 `NoopWireGuardControl`（只在内存记账，不碰网卡），所有 peer API 据此通过集成测试。`render_client_config` 可生成标准 `.conf`，「接入指南」页支持下载，可临时用官方 WireGuard 客户端导入接入。
+### ✅ 服务端：已用内核 WireGuard 实现并真机验证（2026-05-25 @ 192.168.188.89）
 
-**待办**：
-- [ ] **解决依赖冲突**：`boringtun 0.6` 要求 `x25519-dalek =2.0.0-rc.3`，与当前 `vpn-wireguard` 的 `x25519-dalek ^2`(2.0.1) 不兼容。二选一：
-  - workspace 统一锁 `x25519-dalek = "=2.0.0-rc.3"`；或
-  - 改用 `defguard_wireguard_rs`（内核态，Linux 性能更好，PRD/架构原始选型）。
-- [ ] 实现 `BoringTunControl`（或内核态等价物）落实 `WireGuardControl`：创建 `wg0` 接口、配置服务端公私钥、监听 UDP，并把 peer 增删落到真实接口。
-- [ ] Story 4.4：boringtun timer task（每 100ms `update_timers`，处理 `TunnResult`，task 崩溃自动重启）——规避静默断线。
-- [ ] 客户端 `vpn-cli` daemon 数据面转发（`run_data_plane` 骨架）：TUN ↔ WireGuard ↔ UDP 真实收发。
-- [ ] 服务端启动恢复在真实接口上 reload 所有 active peer（逻辑已在 `peer_service`，需接真实 control）。
+不走 boringtun，改用 **Linux 内核 WireGuard**（`vpn_wireguard::KernelWireGuardControl`，经 `ip`/`wg` 命令操作内核接口），**彻底规避了 boringtun↔x25519-dalek 依赖冲突**。通过 `VPN_WG_BACKEND=kernel` 启用（默认 `noop`）。
+
+真机验证结果：
+- 启动自动创建 `wg0`（10.8.0.1/24，监听 UDP 51820，服务端公钥就绪）；
+- `POST /peers/register` → 内核 `wg0` 实时新增 peer（`wg show` 可见 allowed-ips）；
+- 网络命名空间客户端建真实隧道，**握手成功 + ping 10.8.0.1 0% 丢包（~0.3ms）**；
+- 启动恢复：`build_peer_service_with_backend` 会把 active peers 重新下发到内核接口。
+
+运行要求：Linux + 内核 WireGuard + `wireguard-tools` + root/CAP_NET_ADMIN。
+
+### 待办（客户端 + 进阶）
+- [ ] 客户端 `vpn-cli` daemon 数据面：当前 `run_data_plane` 为骨架。两条路线任选——
+  (a) 客户端也用内核/`wg-quick`（Linux/macOS 有 wg 工具时最简单，可复用 `GET /peers/me/config` 下载的 .conf）；
+  (b) 用户态 boringtun（需先解决 `boringtun 0.6` 要求 `x25519-dalek =2.0.0-rc.3` 的冲突：workspace 锁版本，或客户端独立 crate 隔离依赖）。
+- [ ] **异地组网（站点互通）**：两个客户端经服务端互 ping，需 `net.ipv4.ip_forward=1` + 服务端在 peers 间转发（allowed-ips 已覆盖整个子网，开转发即可，待验证）。
+- [ ] Story 4.4 boringtun timer task：仅当选用户态后端时需要；内核后端不涉及。
+- [ ] 容器化部署内核后端：容器需 `--cap-add NET_ADMIN` + host 内核 WireGuard；UDP 端口建议 `network_mode: host` 避免 NAT 破坏握手。
 
 ## 2. 客户端三平台系统集成（vpn-platform，均有骨架 + `#[ignore]` 测试）
 

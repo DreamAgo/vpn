@@ -97,11 +97,11 @@ development_status:
   # Epic 4: VPN Tunnel & Client Connectivity (18 stories)
   # ============================================================
   epic-4: in-progress
-  # 可测核心已实现并通过测试；真实 boringtun 转发 / wg0 接口 / 真机系统集成留桩，待目标平台真机验证
+  # 服务端真实数据面已用内核 WireGuard 实现并真机验证(2026-05-25)；客户端 daemon 转发仍为骨架
   4-1-implement-wireguard-api-and-keys: review
   4-2-implement-ip-pool-management: review
-  4-3-implement-server-wireguard-interface-and-recovery: review
-  4-4-implement-boringtun-timer-task: backlog
+  4-3-implement-server-wireguard-interface-and-recovery: review   # 内核 wg0 真机验证：握手+ping 通过
+  4-4-implement-boringtun-timer-task: backlog                     # 改用内核后端，仅用户态客户端才需要
   4-5-implement-peer-register-api: review
   4-6-implement-peer-heartbeat-and-offline-detection: review
   4-7-implement-peer-logout-and-config-download: review

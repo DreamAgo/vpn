@@ -14,8 +14,8 @@ use uuid::Uuid;
 use vpn_api_types::peer::{PeerRegisterRequest, PeerRegisterResponse};
 use vpn_core::{AppError, Result};
 use vpn_wireguard::{
-    generate_keypair, public_key_from_private, render_client_config, IpPool, NoopWireGuardControl,
-    WgPeerConfig, WireGuardControl,
+    generate_keypair, public_key_from_private, render_client_config, IpPool,
+    KernelWireGuardControl, NoopWireGuardControl, WgPeerConfig, WireGuardControl,
 };
 
 use crate::repositories::{
@@ -291,21 +291,44 @@ impl PeerService {
     }
 }
 
-/// 启动装配：load-or-generate 服务端 WG 密钥 + 构造回填后的 IpPool + Noop control，
-/// 组装成可注入 AppState 的 PeerService（Story 4.1 + 4.3 可测部分）。
-///
-/// - system_config 无私钥 → 生成密钥对并持久化（private + public）。
-/// - 有私钥 → 读出并从私钥推导公钥（不信任存储的公钥，避免不一致）。
-/// - IpPool 由 peers 表中所有非 deleted 的 vpn_ip 回填（mark_used）。
+/// 装配 PeerService（默认 Noop 后端，用于测试 / 无特权环境）。
 pub async fn build_peer_service(
     peer_repo: SqlitePeerRepository,
     config_repo: &SqliteSystemConfigRepository,
     subnet: Ipv4Net,
     server_endpoint: String,
 ) -> Result<PeerService> {
-    // 1. load-or-generate 服务端 WG 密钥
-    let public_key = match config_repo.get(KEY_SERVER_WG_PRIVATE).await? {
-        Some(private) => public_key_from_private(&private)?,
+    build_peer_service_with_backend(
+        peer_repo,
+        config_repo,
+        subnet,
+        server_endpoint,
+        "noop",
+        "wg0",
+        51820,
+    )
+    .await
+}
+
+/// 装配 PeerService，可选 WireGuard 后端。
+///
+/// `backend`：`"kernel"` 使用 Linux 内核 WireGuard（需 root/CAP_NET_ADMIN + `wg` 工具），
+/// 其余值（含 `"noop"`）使用无副作用的记账实现。
+pub async fn build_peer_service_with_backend(
+    peer_repo: SqlitePeerRepository,
+    config_repo: &SqliteSystemConfigRepository,
+    subnet: Ipv4Net,
+    server_endpoint: String,
+    backend: &str,
+    iface: &str,
+    listen_port: u16,
+) -> Result<PeerService> {
+    // 1. load-or-generate 服务端 WG 密钥（私钥 + 公钥都需要）
+    let (private_key, public_key) = match config_repo.get(KEY_SERVER_WG_PRIVATE).await? {
+        Some(private) => {
+            let public = public_key_from_private(&private)?;
+            (private, public)
+        }
         None => {
             let kp = generate_keypair();
             config_repo
@@ -314,7 +337,7 @@ pub async fn build_peer_service(
             config_repo
                 .set(KEY_SERVER_WG_PUBLIC, &kp.public_key)
                 .await?;
-            kp.public_key
+            (kp.private_key, kp.public_key)
         }
     };
 
@@ -329,8 +352,39 @@ pub async fn build_peer_service(
         }
     }
 
-    // 3. Noop control（真实 boringtun 后端留待真机集成）
-    let control: Arc<dyn WireGuardControl> = Arc::new(NoopWireGuardControl::new(public_key));
+    // 3. 选择 WireGuard 后端
+    let control: Arc<dyn WireGuardControl> = if backend == "kernel" {
+        let server_addr = ip_pool
+            .server_addr()
+            .ok_or_else(|| AppError::WireGuard("子网无可用服务端地址".to_string()))?;
+        let kc = KernelWireGuardControl::start(
+            iface,
+            &private_key,
+            &public_key,
+            server_addr,
+            subnet.prefix_len(),
+            listen_port,
+        )
+        .await?;
+        // 启动恢复：把已存在的 active peers 重新下发到内核接口
+        for (pubkey, ip_str) in peer_repo.list_active_peer_keys().await? {
+            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                let cfg = WgPeerConfig {
+                    public_key: pubkey,
+                    vpn_ip: ip,
+                    endpoint: None,
+                };
+                if let Err(e) = kc.configure_peer(&cfg).await {
+                    tracing::warn!(error = %e, "启动恢复 peer 配置失败");
+                }
+            }
+        }
+        tracing::info!(iface, "使用内核 WireGuard 后端");
+        Arc::new(kc)
+    } else {
+        tracing::info!("使用 Noop WireGuard 后端（无真实隧道）");
+        Arc::new(NoopWireGuardControl::new(public_key))
+    };
 
     Ok(PeerService::new(
         peer_repo,
