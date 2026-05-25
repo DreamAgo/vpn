@@ -20,6 +20,63 @@ export interface Page<T> {
   pageSize: number;
 }
 
+// ===== Auth DTOs (与 vpn-api-types::auth 对齐) =====
+
+export interface SetupStatusResponse {
+  needsSetup: boolean;
+}
+
+export interface LoginRequest {
+  username: string;
+  password: string;
+}
+
+export interface LoginResponse {
+  accessToken: string;
+  refreshToken: string;
+  accessExpiresIn: number;
+  mustChangePassword: boolean;
+}
+
+export interface RefreshRequest {
+  refreshToken: string;
+}
+
+export interface RefreshResponse {
+  accessToken: string;
+  accessExpiresIn: number;
+}
+
+export interface LogoutRequest {
+  refreshToken: string;
+}
+
+export interface ChangePasswordRequest {
+  oldPassword: string;
+  newPassword: string;
+}
+
+export interface FirstTimeSetupRequest {
+  username: string;
+  email: string;
+  password: string;
+}
+
+export interface FirstTimeSetupResponse {
+  userId: string;
+  accessToken: string;
+  refreshToken: string;
+}
+
+export interface SystemInfo {
+  version: string;
+  vpnSubnet: string;
+  serverPublicKey: string;
+  serverEndpoint: string;
+  listenPort: number;
+  startedAt: number;
+}
+
 /** 业务错误码（与 vpn-api-types::error_codes 对齐）。 */
 export const ErrorCodes = {
   InvalidCredentials: 1001,

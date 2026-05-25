@@ -1,13 +1,20 @@
 //! Axum Router 工厂。
 
-use axum::{routing::get, Router};
+use std::sync::Arc;
+
+use axum::{
+    middleware::from_fn_with_state,
+    routing::{get, post},
+    Router,
+};
 use tower::ServiceBuilder;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
 };
+use vpn_core::service::TokenIssuer;
 
-use crate::{handlers, state::AppState};
+use crate::{handlers, middleware, state::AppState};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
@@ -18,6 +25,8 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 /// 2. TraceLayer 记录结构化日志（请求/响应/耗时）
 /// 3. handler 业务逻辑
 /// 4. PropagateRequestIdLayer 把 request_id 复制到响应头
+///
+/// 认证路由（需要 JWT 的端点）会单独走 `middleware::require_auth`。
 pub fn build_router(state: AppState) -> Router {
     let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
 
@@ -29,9 +38,44 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::new(request_id_header));
 
-    Router::new()
+    // 公开路由（无需认证）
+    let public_routes = Router::new()
         .route("/health", get(handlers::health::health_handler))
+        .route(
+            "/api/v1/auth/setup-status",
+            get(handlers::auth::setup_status),
+        )
+        .route(
+            "/api/v1/auth/first-time-setup",
+            post(handlers::auth::first_time_setup),
+        )
+        .route("/api/v1/auth/login", post(handlers::auth::login))
+        .route("/api/v1/auth/refresh", post(handlers::auth::refresh));
+
+    // 认证路由（需要 JWT）
+    let authed_routes = if let Some(svc) = &state.auth_service {
+        let issuer: Arc<dyn TokenIssuer> = svc.issuer.clone();
+        Router::new()
+            .route("/api/v1/auth/logout", post(handlers::auth::logout))
+            .route(
+                "/api/v1/auth/change-password",
+                post(handlers::auth::change_password),
+            )
+            .route(
+                "/api/v1/admin/system/info",
+                get(handlers::system::system_info),
+            )
+            .layer(from_fn_with_state(issuer, middleware::auth::require_auth))
+    } else {
+        // AuthService 未初始化（如健康检查测试场景）：不注册认证路由
+        Router::new()
+    };
+
+    Router::new()
+        .merge(public_routes)
+        .merge(authed_routes)
         .with_state(state)
+        .fallback(handlers::static_files::static_handler)
         .layer(middleware)
 }
 

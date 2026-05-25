@@ -15,6 +15,7 @@ use vpn_api_types::ApiResponse;
 use vpn_core::AppError;
 
 /// Axum 用的错误包装。包含 AppError + 请求上下文（request_id, timestamp）。
+#[derive(Debug)]
 pub struct ApiError {
     pub inner: AppError,
     pub request_id: String,
@@ -27,6 +28,21 @@ impl ApiError {
             inner: err,
             request_id,
             timestamp_ms,
+        }
+    }
+}
+
+/// 从 AppError 自动转 ApiError（用于 extractor 拒绝、handler `?` 运算符）。
+///
+/// request_id 与 timestamp 使用默认值；正常 handler 错误路径应通过
+/// middleware 注入正确的 request_id（Story 2.7 + 优化），此处的兜底
+/// 保证类型转换可用。
+impl From<AppError> for ApiError {
+    fn from(err: AppError) -> Self {
+        Self {
+            inner: err,
+            request_id: "n/a".to_string(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
         }
     }
 }

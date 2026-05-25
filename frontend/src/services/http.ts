@@ -8,7 +8,7 @@
  * 4. 解包 ApiResponse 信封（成功取 data；失败 throw）
  * 5. 401/403 自动处理（清空 token + 跳转 /login）
  */
-import axios, { type AxiosResponse } from 'axios';
+import axios, { type AxiosResponse, type InternalAxiosRequestConfig } from 'axios';
 import { keysToCamel, keysToSnake } from '@/utils/caseConvert';
 import type { ApiResponse } from '@/types/api';
 
@@ -20,6 +20,13 @@ export const setAccessToken = (token: string | null) => {
 };
 
 export const getAccessToken = (): string | null => accessToken;
+
+// 401 静默刷新回调（由 authStore 注册，避免循环依赖）。
+// 返回新的 access token；失败返回 null。
+let refreshHandler: (() => Promise<string | null>) | null = null;
+export const registerRefreshHandler = (fn: (() => Promise<string | null>) | null) => {
+  refreshHandler = fn;
+};
 
 export const http = axios.create({
   baseURL: '/api/v1',
@@ -55,15 +62,35 @@ http.interceptors.response.use(
     const err = new ApiError(body.code, body.message, body.requestId);
     return Promise.reject(err);
   },
-  (error) => {
+  async (error) => {
     // 网络错误或 HTTP 4xx/5xx
     if (error.response) {
-      const body = keysToCamel<ApiResponse<unknown>>(error.response.data);
-      // 401 清空 token；具体跳转逻辑由 AuthProvider 处理
-      if (error.response.status === 401) {
+      const original = error.config as
+        | (InternalAxiosRequestConfig & { _retried?: boolean; url?: string })
+        | undefined;
+      const isRefreshCall = original?.url?.includes('/auth/refresh');
+
+      // 401：尝试一次静默刷新后重放原请求
+      if (error.response.status === 401 && original && !original._retried && !isRefreshCall) {
+        original._retried = true;
+        if (refreshHandler) {
+          const newToken = await refreshHandler();
+          if (newToken) {
+            original.headers.Authorization = `Bearer ${newToken}`;
+            return http(original);
+          }
+        }
         accessToken = null;
       }
-      return Promise.reject(new ApiError(body.code ?? error.response.status, body.message ?? error.message, body.requestId ?? ''));
+
+      const body = keysToCamel<ApiResponse<unknown>>(error.response.data);
+      return Promise.reject(
+        new ApiError(
+          body.code ?? error.response.status,
+          body.message ?? error.message,
+          body.requestId ?? ''
+        )
+      );
     }
     return Promise.reject(error);
   }

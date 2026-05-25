@@ -1,5 +1,5 @@
 # generated: 2026-05-22
-# last_updated: 2026-05-22 (Epic 1 全部 10 个 Story 实施完成，待 review)
+# last_updated: 2026-05-25 (Epic 2 全部 13 个 Story 实施完成，待 review)
 # project: vpn
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-22
-last_updated: 2026-05-22
+last_updated: 2026-05-25
 project: vpn
 project_key: NOKEY
 tracking_system: file-system
@@ -61,20 +61,20 @@ development_status:
   # ============================================================
   # Epic 2: Admin Authentication & First-Run Setup (13 stories)
   # ============================================================
-  epic-2: backlog
-  2-1-users-and-sessions-schema: backlog
-  2-2-implement-password-hasher-and-token-issuer: backlog
-  2-3-implement-user-and-session-repos: backlog
-  2-4-implement-first-time-setup-api: backlog
-  2-5-implement-login-api-and-rate-limiting: backlog
-  2-6-implement-refresh-and-logout-api: backlog
-  2-7-implement-auth-middleware-and-require-admin: backlog
-  2-8-implement-change-password-and-force-first-change: backlog
-  2-9-implement-system-info-api: backlog
-  2-10-implement-login-page: backlog
-  2-11-implement-setup-wizard: backlog
-  2-12-implement-dashboard-skeleton: backlog
-  2-13-implement-account-settings-page: backlog
+  epic-2: in-progress
+  2-1-users-and-sessions-schema: review
+  2-2-implement-password-hasher-and-token-issuer: review
+  2-3-implement-user-and-session-repos: review
+  2-4-implement-first-time-setup-api: review
+  2-5-implement-login-api-and-rate-limiting: review
+  2-6-implement-refresh-and-logout-api: review
+  2-7-implement-auth-middleware-and-require-admin: review
+  2-8-implement-change-password-and-force-first-change: review
+  2-9-implement-system-info-api: review
+  2-10-implement-login-page: review
+  2-11-implement-setup-wizard: review
+  2-12-implement-dashboard-skeleton: review
+  2-13-implement-account-settings-page: review
   epic-2-retrospective: optional
 
   # ============================================================
