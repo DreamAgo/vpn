@@ -2,6 +2,17 @@
 
 本项目在无 root / 无真实网卡 / 单一开发平台（macOS）的环境下完成了**控制平面 + 可测逻辑**的全部实现与测试。以下条目属于**系统集成层**，必须在目标平台真机（或对应 OS 的 CI runner）上完成与验证。它们当前以可编译的骨架、`NoopWireGuardControl` 注入或 `#[ignore]` 测试形式存在，不影响其余功能与全部自动化测试通过。
 
+## 0. Docker 部署 + Docker 网络组网（✅ 真机验证 2026-05-25 @ 192.168.188.89）
+
+容器化部署（bridge + 发布端口，零接触宿主现有业务）：
+- 运行时镜像须与 builder 同 glibc：`rust:1.90-slim` 现为 trixie（glibc 2.39），运行时用 `debian:trixie-slim`（bookworm 的 2.36 会 `GLIBC_2.39 not found`）。
+- 运行时镜像装 `wireguard-tools iproute2 iptables`；容器 `--cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1`，发布 `8889/tcp` + `51820/udp`。
+- entrypoint 先 `iptables -t nat -A POSTROUTING -s <VPN_SUBNET> ! -d <VPN_SUBNET> -j MASQUERADE` 再 exec vpn-server（让 VPN 客户端流量以网关身份进 docker 网络，回程自动）。
+- 容器 **join 目标 docker 网络** + `VPN_SERVER_ROUTES=<docker子网>`：服务端经 `allowed_routes` 把该网段下发给客户端，客户端零手工配网段即可访问。
+- 内核 WireGuard 接口在**容器 netns**内创建可用；UDP 经发布端口 DNAT，WireGuard 握手不受影响；容器 netns 内 FORWARD 默认 ACCEPT（无需处理宿主 FORWARD DROP）。
+
+验证：VPN 客户端经隧道 ping 隔离 docker 网络（172.31.100.0/24）里的 nginx 容器 0% 丢包 + HTTP 200。
+
 ## 1. WireGuard 真实数据平面
 
 ### ✅ 服务端：已用内核 WireGuard 实现并真机验证（2026-05-25 @ 192.168.188.89）
