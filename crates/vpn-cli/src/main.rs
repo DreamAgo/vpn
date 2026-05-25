@@ -36,9 +36,16 @@ async fn run() -> CliResult<()> {
             server,
             username,
             password,
+            routes,
         } => {
-            let msg =
-                cli::run_login(server, username.as_deref(), password.as_deref(), &repo).await?;
+            let msg = cli::run_login(
+                server,
+                username.as_deref(),
+                password.as_deref(),
+                routes,
+                &repo,
+            )
+            .await?;
             println!("{msg}");
         }
         Command::Logout => {

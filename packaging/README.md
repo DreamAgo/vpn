@@ -42,12 +42,17 @@ Linux → systemd **user** service；macOS → launchd LaunchAgent
 - 安装内容：
   - `/usr/bin/vpn-server`、`/usr/bin/vpn-cli`
   - `/lib/systemd/system/vpn-server.service`（system 服务，`CAP_NET_ADMIN`，
-    `After=network-online.target`，`EnvironmentFile=/etc/vpn-server/vpn-server.env`）
+    `After=network-online.target`，`EnvironmentFile=/etc/vpn-server/vpn-server.env`，
+    `ExecStartPost`/`ExecStopPost` 调用转发脚本）
   - `/etc/vpn-server/vpn-server.env`（config 文件，升级不覆盖）
+  - `/usr/lib/vpn-server/wg-forward-setup.sh`、`wg-forward-teardown.sh`（0755，转发/防火墙脚本）
   - `/var/lib/vpn-server/`（数据目录，归 `vpn-server` 用户）
+- 运行期依赖：`wireguard-tools`（deb/rpm `depends`，提供 `wg` / `wg-quick`，
+  kernel 后端必需）。
 - 脚本：
   - `scripts/postinstall.sh`：创建 `vpn-server` 系统用户、修权限、`systemctl daemon-reload` + `enable`。
   - `scripts/preremove.sh`：`stop` + `disable` 服务（不删数据/配置）。
+  - `scripts/wg-forward-setup.sh` / `wg-forward-teardown.sh`：见下「异地组网/转发」。
 - 安装后配置与启动：
 
   ```sh
@@ -58,8 +63,48 @@ Linux → systemd **user** service；macOS → launchd LaunchAgent
 
 - 环境变量见 `linux/vpn-server.env.example`：`VPN_BIND_ADDR`、`DATABASE_URL`、
   `VPN_HTTPS`、`VPN_DOMAIN`、`VPN_DATA_DIR`、`VPN_SUBNET`、`VPN_LISTEN_PORT`、
-  `VPN_ENDPOINT`、`VPN_AUDIT_RETENTION_DAYS`。
+  `VPN_ENDPOINT`、`VPN_AUDIT_RETENTION_DAYS`、`VPN_WG_BACKEND`、`VPN_WG_INTERFACE`、
+  `VPN_NAT`、`VPN_NAT_EGRESS`。
 - 需真机/CI：`nfpm package` 需在 Linux 上运行；arm64 包需对应 target 交叉构建。
+
+### 异地组网 / 内核转发（kernel WireGuard 后端）
+
+服务端有两种 WireGuard 数据平面后端，由 `VPN_WG_BACKEND` 选择：
+
+- `noop`（默认）：不操作内核，仅用于开发 / 无特权环境 / 演示。
+- `kernel`（生产）：使用 Linux 内核 WireGuard，真正创建 `VPN_WG_INTERFACE`
+  （默认 `wg0`）并下发 peer。要求：
+  - root 或 `CAP_NET_ADMIN`（本服务单元已授予 `AmbientCapabilities=CAP_NET_ADMIN`）；
+  - 已安装 `wireguard-tools`（包依赖已声明）；
+  - 内核内置 WireGuard（Linux ≥ 5.6，旧内核需 `wireguard-dkms`）。
+
+要让两个站点的 LAN 经服务端互通（站点对站点）或客户端互访，服务端内核必须
+**开启转发并放行防火墙**。这些由服务单元的 `ExecStartPost` /`ExecStopPost`
+调用 `wg-forward-setup.sh` / `wg-forward-teardown.sh` 自动完成（仅 kernel 后端生效）：
+
+1. `sysctl net.ipv4.ip_forward=1` —— 打开 IPv4 转发。
+2. `iptables -I FORWARD -i wg0 -o wg0 -j ACCEPT` —— 放行同一 wg 接口上 peer 间 /
+   站点间互转发。**装了 Docker 的主机 `FORWARD` 链默认 `DROP`**，不放行则站点间
+   流量被静默丢弃，这是最常见的「能握手不能通」故障点。
+3. （可选）`VPN_NAT=1` 时对 `VPN_SUBNET` 出口网卡做
+   `iptables -t nat -A POSTROUTING -s <VPN_SUBNET> -o <出口网卡> -j MASQUERADE`，
+   用于全隧道客户端 / 站点经服务端出公网。出口网卡取 `VPN_NAT_EGRESS`，缺省自动
+   探测默认路由网卡。
+
+脚本特性：幂等（先 `iptables -C` 检测再 `-I/-A`）、best-effort（缺工具或权限不足
+仅告警、不拖垮服务启动）；teardown 删除自身插入的规则但**不关闭** `ip_forward`
+（系统级开关，可能被其他服务依赖）。
+
+补充说明：
+
+- peer 的 `routed_subnets` 对应的 `ip route add <subnet> dev wg0` 由**应用本身**在
+  运行时负责，打包脚手架不处理。
+- **站点网关侧**（即各站点本地用来连入 VPN 的网关主机）若要让本站点 LAN 设备访问
+  对端，还需在该网关上自行配置进本地 LAN 的 `MASQUERADE` / 路由（取决于对端是否
+  有回程路由），本服务端脚本只处理服务端这一跳。
+- 需真机验证：`sysctl` / `iptables` 实际生效、Docker 主机 `FORWARD DROP` 场景下的
+  站点互通、`MASQUERADE` 出公网、`CAP_NET_ADMIN` 下非 root 创建 wg 接口与改 sysctl。
+  开发机（macOS）仅做 `sh -n` 语法自检与 YAML 合法性检查。
 
 ---
 

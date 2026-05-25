@@ -86,6 +86,13 @@ pub struct AdminPeerView {
     pub routed_subnets: Vec<String>,
 }
 
+/// 更新 peer 路由网段请求（PATCH /admin/peers/:id）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePeerRoutesRequest {
+    /// 该节点背后路由的 LAN 网段（CIDR 列表）。空数组表示清空。
+    pub routed_subnets: Vec<String>,
+}
+
 /// admin peer 列表查询参数（GET /admin/peers）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminPeerQuery {

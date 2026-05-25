@@ -186,6 +186,7 @@ pub async fn connect_once(
     api: &ApiClient,
     keypair: &vpn_wireguard::WgKeypair,
     device_name: &str,
+    routed_subnets: &[String],
 ) -> CliResult<TunnelParams> {
     // 1) 确保有可用 access token：优先用 refresh。
     if api.access_token().is_none() {
@@ -197,8 +198,8 @@ pub async fn connect_once(
         wg_public_key: keypair.public_key.clone(),
         device_name: device_name.to_string(),
         os_info: Some(detect_os_info()),
-        // 站点网关模式（声明背后 LAN 网段）后续由 CLI 参数提供；普通客户端为空。
-        routed_subnets: Vec::new(),
+        // 站点网关模式：登录时 `--route` 声明的 LAN 网段（经 DaemonConfig 传入）。
+        routed_subnets: routed_subnets.to_vec(),
     };
     let resp = api.register_peer(&req).await?;
 
@@ -339,7 +340,9 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
         match msg {
             ControlMsg::Connect => {
                 state.set_state(ConnState::Connecting, now_unix()).await;
-                match connect_once(&api, &keypair, &config.device_name).await {
+                match connect_once(&api, &keypair, &config.device_name, &config.routed_subnets)
+                    .await
+                {
                     Ok(params) => {
                         state.set_vpn_ip(Some(params.vpn_ip.clone())).await;
                         state.set_state(ConnState::Connected, now_unix()).await;

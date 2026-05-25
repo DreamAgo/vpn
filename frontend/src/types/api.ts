@@ -169,6 +169,10 @@ export interface AdminPeerView {
   routedSubnets?: string[];
 }
 
+export interface UpdatePeerRoutesRequest {
+  routedSubnets: string[];
+}
+
 export interface AdminPeerQuery {
   page?: number;
   pageSize?: number;

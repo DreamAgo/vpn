@@ -253,6 +253,20 @@ impl SqlitePeerRepository {
         Ok(row.map(PeerRow::from))
     }
 
+    /// 更新指定 peer 的 routed_subnets（异地组网网段编辑）。返回受影响行数。
+    pub async fn update_routed_subnets(&self, id: &str, routed_subnets: &str) -> Result<u64> {
+        let now = Utc::now().timestamp_millis();
+        let result =
+            sqlx::query("UPDATE peers SET routed_subnets = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(routed_subnets)
+                .bind(now)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(result.rows_affected())
+    }
+
     /// Story 5.5：把指定 peer 标记为 'force_removed'。返回受影响行数。
     pub async fn mark_force_removed(&self, id: &str) -> Result<u64> {
         let now = Utc::now().timestamp_millis();
