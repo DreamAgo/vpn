@@ -16,6 +16,7 @@ import {
   FileTextOutlined,
   SettingOutlined,
   LogoutOutlined,
+  LinkOutlined,
 } from '@ant-design/icons';
 
 import { useAuthStore } from '@/stores/authStore';
@@ -27,6 +28,7 @@ const route: ProLayoutProps['route'] = {
     { path: '/users', name: '用户', icon: <UserOutlined /> },
     { path: '/peers', name: '节点', icon: <ApiOutlined /> },
     { path: '/audit-logs', name: '日志', icon: <FileTextOutlined /> },
+    { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
   ],
 };
 

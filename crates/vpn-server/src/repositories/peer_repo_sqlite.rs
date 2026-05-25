@@ -1,7 +1,7 @@
 //! SQLite 实现的 PeerRepository（Epic 4：节点注册 / 心跳 / 注销 / 离线扫描）。
 
 use chrono::Utc;
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use vpn_core::{AppError, Result};
 
 /// 数据库行（peers 表）。
@@ -221,6 +221,162 @@ impl SqlitePeerRepository {
         .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(result.rows_affected())
     }
+
+    /// 按 id 查询 peer（Story 5.5：admin 强制下线前定位）。
+    pub async fn find_by_id(&self, id: &str) -> Result<Option<PeerRow>> {
+        let sql = format!("SELECT {SELECT_COLUMNS} FROM peers WHERE id = ?1");
+        let row: Option<PeerRowTuple> = sqlx::query_as(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(row.map(PeerRow::from))
+    }
+
+    /// Story 5.5：把指定 peer 标记为 'force_removed'。返回受影响行数。
+    pub async fn mark_force_removed(&self, id: &str) -> Result<u64> {
+        let now = Utc::now().timestamp_millis();
+        let result =
+            sqlx::query("UPDATE peers SET status = 'force_removed', updated_at = ?1 WHERE id = ?2")
+                .bind(now)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Story 5.5：admin peer 列表（JOIN users 取 username/email）。
+    /// 按 last_seen_at desc（NULL 最后），search 模糊匹配 username/device_name，status 精确筛选。
+    pub async fn list_admin(&self, filter: &AdminPeerFilter) -> Result<Vec<AdminPeerRow>> {
+        let page = filter.page.max(1);
+        let page_size = filter.page_size.max(1);
+        let offset = (page - 1) as i64 * page_size as i64;
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            r#"SELECT p.id, p.user_id, u.username, u.email, p.device_name, p.wg_public_key,
+                      p.vpn_ip, p.endpoint, p.os_info, p.last_seen_at, p.status, p.created_at
+               FROM peers p JOIN users u ON p.user_id = u.id"#,
+        );
+        Self::push_admin_where(&mut qb, filter);
+        // NULL last_seen_at 排最后：先按 IS NULL 升序，再按值降序。
+        qb.push(" ORDER BY (p.last_seen_at IS NULL) ASC, p.last_seen_at DESC LIMIT ");
+        qb.push_bind(page_size as i64);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+
+        let rows: Vec<AdminPeerRowTuple> = qb
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(rows.into_iter().map(AdminPeerRow::from).collect())
+    }
+
+    /// admin peer 列表总数（用于分页 total）。
+    pub async fn count_admin(&self, filter: &AdminPeerFilter) -> Result<i64> {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT COUNT(*) FROM peers p JOIN users u ON p.user_id = u.id");
+        Self::push_admin_where(&mut qb, filter);
+        let count: (i64,) = qb
+            .build_query_as()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(count.0)
+    }
+
+    /// 拼接 admin 列表 WHERE 子句（search / status）；绑定值用占位符防注入。
+    fn push_admin_where(qb: &mut QueryBuilder<Sqlite>, filter: &AdminPeerFilter) {
+        let mut first = true;
+        let mut clause = |qb: &mut QueryBuilder<Sqlite>| {
+            if first {
+                qb.push(" WHERE ");
+                first = false;
+            } else {
+                qb.push(" AND ");
+            }
+        };
+
+        if let Some(search) = filter.search.as_deref().filter(|s| !s.is_empty()) {
+            clause(qb);
+            let pattern = format!("%{}%", search);
+            qb.push("(u.username LIKE ");
+            qb.push_bind(pattern.clone());
+            qb.push(" OR p.device_name LIKE ");
+            qb.push_bind(pattern);
+            qb.push(")");
+        }
+
+        if let Some(status) = filter.status.as_deref().filter(|s| !s.is_empty()) {
+            clause(qb);
+            qb.push("p.status = ");
+            qb.push_bind(status.to_string());
+        }
+    }
+}
+
+/// admin peer 列表过滤条件（已归一化：page/page_size 已套默认值）。
+#[derive(Debug, Clone)]
+pub struct AdminPeerFilter {
+    /// 模糊匹配 username / device_name（None 表示不过滤）
+    pub search: Option<String>,
+    /// 状态精确筛选（None 表示不过滤）
+    pub status: Option<String>,
+    pub page: u32,
+    pub page_size: u32,
+}
+
+/// admin peer 列表行（peers JOIN users）。
+#[derive(Debug, Clone)]
+pub struct AdminPeerRow {
+    pub id: String,
+    pub user_id: String,
+    pub username: String,
+    pub email: String,
+    pub device_name: String,
+    pub wg_public_key: String,
+    pub vpn_ip: String,
+    pub endpoint: Option<String>,
+    pub os_info: Option<String>,
+    pub last_seen_at: Option<i64>,
+    pub status: String,
+    pub created_at: i64,
+}
+
+/// admin 列表行元组（与 SELECT 列顺序一致）。
+type AdminPeerRowTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
+    i64,
+);
+
+impl From<AdminPeerRowTuple> for AdminPeerRow {
+    fn from(r: AdminPeerRowTuple) -> Self {
+        AdminPeerRow {
+            id: r.0,
+            user_id: r.1,
+            username: r.2,
+            email: r.3,
+            device_name: r.4,
+            wg_public_key: r.5,
+            vpn_ip: r.6,
+            endpoint: r.7,
+            os_info: r.8,
+            last_seen_at: r.9,
+            status: r.10,
+            created_at: r.11,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,5 +546,110 @@ mod tests {
         assert_eq!(marked, 0);
         let row = repo.find_active_by_user("user-1").await.unwrap().unwrap();
         assert_eq!(row.status, "online");
+    }
+
+    #[tokio::test]
+    async fn find_by_id_and_mark_force_removed() {
+        let repo = SqlitePeerRepository::new(setup_pool().await);
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+            .await
+            .unwrap();
+        let found = repo.find_by_id("p1").await.unwrap().unwrap();
+        assert_eq!(found.wg_public_key, "PK1");
+        assert!(repo.find_by_id("missing").await.unwrap().is_none());
+
+        let affected = repo.mark_force_removed("p1").await.unwrap();
+        assert_eq!(affected, 1);
+        let row = repo.find_by_id("p1").await.unwrap().unwrap();
+        assert_eq!(row.status, "force_removed");
+        // find_active_by_user 仅排除 'deleted'，force_removed 仍可被查到——
+        // 这是 heartbeat_checked 据以拒绝心跳的依据。
+        let active = repo.find_active_by_user("user-1").await.unwrap().unwrap();
+        assert_eq!(active.status, "force_removed");
+    }
+
+    fn admin_filter_default() -> AdminPeerFilter {
+        AdminPeerFilter {
+            search: None,
+            status: None,
+            page: 1,
+            page_size: 20,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_admin_joins_username_and_email() {
+        let repo = SqlitePeerRepository::new(setup_pool().await);
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+            .await
+            .unwrap();
+        let rows = repo.list_admin(&admin_filter_default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].username, "alice");
+        assert_eq!(rows[0].email, "a@e.com");
+        assert_eq!(rows[0].device_name, "MBP");
+        assert_eq!(repo.count_admin(&admin_filter_default()).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_admin_search_and_status_filter() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"INSERT INTO users (id, username, email, password_hash, role, status, must_change_password, created_at, updated_at)
+               VALUES ('user-2', 'bob', 'b@e.com', 'h', 'user', 'active', 0, 0, 0)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = SqlitePeerRepository::new(pool);
+        repo.insert("p1", "user-1", "Laptop", "PK1", "10.8.0.2", None)
+            .await
+            .unwrap();
+        repo.insert("p2", "user-2", "Phone", "PK2", "10.8.0.3", None)
+            .await
+            .unwrap();
+
+        // search by username
+        let mut f = admin_filter_default();
+        f.search = Some("alice".to_string());
+        assert_eq!(repo.count_admin(&f).await.unwrap(), 1);
+
+        // search by device_name
+        let mut f = admin_filter_default();
+        f.search = Some("Phone".to_string());
+        let rows = repo.list_admin(&f).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].username, "bob");
+
+        // status filter
+        repo.mark_force_removed("p1").await.unwrap();
+        let mut f = admin_filter_default();
+        f.status = Some("force_removed".to_string());
+        assert_eq!(repo.count_admin(&f).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_admin_orders_null_last_seen_last() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"INSERT INTO users (id, username, email, password_hash, role, status, must_change_password, created_at, updated_at)
+               VALUES ('user-2', 'bob', 'b@e.com', 'h', 'user', 'active', 0, 0, 0)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = SqlitePeerRepository::new(pool);
+        // p1: no heartbeat (NULL last_seen), p2: has heartbeat
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+            .await
+            .unwrap();
+        repo.insert("p2", "user-2", "Phone", "PK2", "10.8.0.3", None)
+            .await
+            .unwrap();
+        repo.touch_heartbeat("user-2", None, 5000).await.unwrap();
+        let rows = repo.list_admin(&admin_filter_default()).await.unwrap();
+        // p2 (has last_seen) 排前，p1 (NULL) 排后
+        assert_eq!(rows[0].id, "p2");
+        assert_eq!(rows[1].id, "p1");
     }
 }

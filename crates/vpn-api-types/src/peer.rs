@@ -51,7 +51,39 @@ pub struct PeerDto {
     pub endpoint: Option<String>,
     pub os_info: Option<String>,
     pub last_seen_at: Option<i64>,
-    /// "online" | "offline" | "deleted"
+    /// "online" | "offline" | "deleted" | "force_removed"
     pub status: String,
     pub created_at: i64,
+}
+
+/// admin peer 列表项：节点信息 + 所属用户（Story 5.5）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminPeerView {
+    pub id: String,
+    pub user_id: String,
+    pub username: String,
+    pub email: String,
+    pub device_name: String,
+    pub wg_public_key: String,
+    pub vpn_ip: String,
+    pub endpoint: Option<String>,
+    pub os_info: Option<String>,
+    pub last_seen_at: Option<i64>,
+    pub status: String,
+    pub created_at: i64,
+}
+
+/// admin peer 列表查询参数（GET /admin/peers）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminPeerQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    /// 模糊匹配 username / device_name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    /// 按状态筛选
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }

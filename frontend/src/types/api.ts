@@ -149,6 +149,53 @@ export interface PeerDto {
   createdAt: number;
 }
 
+// ===== Admin peer / audit DTOs (Epic 5) =====
+
+export interface AdminPeerView {
+  id: string;
+  userId: string;
+  username: string;
+  email: string;
+  deviceName: string;
+  wgPublicKey: string;
+  vpnIp: string;
+  endpoint: string | null;
+  osInfo: string | null;
+  lastSeenAt: number | null;
+  status: string; // online | offline | deleted | force_removed
+  createdAt: number;
+}
+
+export interface AdminPeerQuery {
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  status?: string;
+}
+
+export interface AuditLogDto {
+  id: string;
+  userId: string | null;
+  username: string | null;
+  action: string;
+  resource: string;
+  ipAddr: string | null;
+  userAgent: string | null;
+  metadata: string | null;
+  statusCode: number | null;
+  createdAt: number;
+}
+
+export interface AuditLogQuery {
+  from?: number;
+  to?: number;
+  userId?: string;
+  username?: string;
+  action?: string;
+  page?: number;
+  pageSize?: number;
+}
+
 /** 业务错误码（与 vpn-api-types::error_codes 对齐）。 */
 export const ErrorCodes = {
   InvalidCredentials: 1001,

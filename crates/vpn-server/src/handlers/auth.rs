@@ -80,9 +80,34 @@ pub async fn login(
 ) -> Result<Json<ApiResponse<LoginResponse>>, ApiError> {
     let svc = state.auth_service()?;
     let (ip, ua) = extract_client_info(&headers);
-    let outcome = svc
+    let result = svc
         .login(&body.username, &body.password, ip.as_deref(), ua.as_deref())
-        .await?;
+        .await;
+
+    // Story 5.2：登录成功/失败均写审计（尽力而为，不阻塞）。
+    if let Ok(audit) = state.audit_service() {
+        let now = state.clock.now_unix_ms();
+        match &result {
+            Ok(_) => {
+                audit
+                    .log_login_attempt(&body.username, true, None, ip.as_deref(), now)
+                    .await
+            }
+            Err(e) => {
+                audit
+                    .log_login_attempt(
+                        &body.username,
+                        false,
+                        Some(&e.to_string()),
+                        ip.as_deref(),
+                        now,
+                    )
+                    .await
+            }
+        }
+    }
+
+    let outcome = result?;
     Ok(success(
         &state,
         LoginResponse {

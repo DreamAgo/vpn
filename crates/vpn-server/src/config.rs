@@ -28,6 +28,8 @@ pub struct ServerConfig {
     /// 若未显式设置 `VPN_ENDPOINT`，则用 `VPN_DOMAIN:vpn_listen_port`（若有域名），
     /// 否则回退占位 `127.0.0.1:vpn_listen_port`（开发用）。
     pub vpn_endpoint: String,
+    /// 审计日志保留天数（Story 5.3 清理任务）。默认 180。
+    pub audit_retention_days: u32,
 }
 
 impl ServerConfig {
@@ -59,6 +61,11 @@ impl ServerConfig {
             format!("{host}:{vpn_listen_port}")
         });
 
+        let audit_retention_days = env::var("VPN_AUDIT_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(180);
+
         Ok(Self {
             bind_addr,
             database_url,
@@ -68,6 +75,7 @@ impl ServerConfig {
             vpn_subnet,
             vpn_listen_port,
             vpn_endpoint,
+            audit_retention_days,
         })
     }
 }
@@ -88,6 +96,7 @@ mod tests {
             env::remove_var("VPN_SUBNET");
             env::remove_var("VPN_LISTEN_PORT");
             env::remove_var("VPN_ENDPOINT");
+            env::remove_var("VPN_AUDIT_RETENTION_DAYS");
         }
         let cfg = ServerConfig::from_env().unwrap();
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");
@@ -95,5 +104,6 @@ mod tests {
         assert_eq!(cfg.vpn_subnet, "10.8.0.0/24");
         assert_eq!(cfg.vpn_listen_port, 51820);
         assert_eq!(cfg.vpn_endpoint, "127.0.0.1:51820");
+        assert_eq!(cfg.audit_retention_days, 180);
     }
 }
