@@ -9,8 +9,13 @@ use tracing_subscriber::EnvFilter;
 use vpn_server::{
     build_router,
     ratelimit::LoginAttempts,
-    repositories::{SqliteSessionRepository, SqliteUserRepository},
-    services::{Argon2Hasher, AuthService, JwtTokenIssuer, UserService},
+    repositories::{
+        SqlitePeerRepository, SqliteSessionRepository, SqliteSystemConfigRepository,
+        SqliteUserRepository,
+    },
+    services::{
+        build_peer_service, Argon2Hasher, AuthService, JwtTokenIssuer, PeerService, UserService,
+    },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
 };
@@ -47,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 初始化业务服务
     let user_repo = SqliteUserRepository::new(pool.clone());
-    let session_repo = SqliteSessionRepository::new(pool);
+    let session_repo = SqliteSessionRepository::new(pool.clone());
     let hasher: Arc<dyn vpn_core::service::PasswordHasher> = Arc::new(Argon2Hasher::new());
     let issuer = JwtTokenIssuer::load_or_generate(&PathBuf::from(&config.data_dir))
         .context("加载/生成 JWT 密钥失败")?;
@@ -64,10 +69,33 @@ async fn main() -> anyhow::Result<()> {
         login_attempts: LoginAttempts::new(),
     });
 
+    // Epic 4：装配 PeerService（load-or-generate 服务端 WG 密钥 + IpPool 回填 + Noop control）
+    let peer_repo = SqlitePeerRepository::new(pool.clone());
+    let config_repo = SqliteSystemConfigRepository::new(pool.clone());
+    let subnet: ipnet::Ipv4Net = config
+        .vpn_subnet
+        .parse()
+        .with_context(|| format!("VPN_SUBNET 非法 CIDR：{}", config.vpn_subnet))?;
+    let peer_service = Arc::new(
+        build_peer_service(peer_repo, &config_repo, subnet, config.vpn_endpoint.clone())
+            .await
+            .context("装配 PeerService 失败")?,
+    );
+    tracing::info!(
+        server_public_key = %peer_service.server_public_key_string(),
+        endpoint = %config.vpn_endpoint,
+        subnet = %config.vpn_subnet,
+        "服务端 WireGuard 状态已就绪"
+    );
+
+    // Story 4.6：后台离线检测任务（每 30s 扫描；panic/错误不影响主进程）
+    spawn_offline_scanner(peer_service.clone());
+
     // 构造 AppState + Router
     let state = AppState::new()
         .with_auth_service(auth_service)
-        .with_user_service(user_service);
+        .with_user_service(user_service)
+        .with_peer_service(peer_service);
     let app = build_router(state);
 
     // 监听端口
@@ -85,4 +113,27 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("vpn-server stopped");
     Ok(())
+}
+
+/// Story 4.6：每 30s 扫描一次，把心跳超时的 online peer 标记为 offline。
+///
+/// 任务独立运行，单次扫描出错仅记录日志不退出循环；进程退出时随 runtime 一并终止。
+fn spawn_offline_scanner(peer_service: Arc<PeerService>) {
+    const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SCAN_INTERVAL);
+        // 首个 tick 立即返回；跳过它，让首次扫描发生在一个周期后。
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let now = chrono::Utc::now().timestamp_millis();
+            match peer_service.scan_offline(now).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(marked_offline = n, "离线检测：标记节点为 offline")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = ?e, "离线检测扫描失败"),
+            }
+        }
+    });
 }

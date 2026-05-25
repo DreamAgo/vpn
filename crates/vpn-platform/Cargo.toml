@@ -7,3 +7,39 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+# === 异步 / 错误 / 日志（走 workspace 版本）===
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# === 跨平台 TUN 设备（三平台统一）===
+tun-rs = { version = "2.8", default-features = false, features = ["async_tokio"] }
+
+# === 凭证存储主路径（跨平台 keyring，后端按 target 段门控）===
+# 用 keyring v3（经典 Entry API）；v4 已拆分为 keyring-core + 独立后端 crate，
+# 注册式 API 在当前无桌面会话的 CI 主机难以验证，故选稳定的 v3。
+keyring = { version = "3", default-features = false }
+
+# === 文件降级凭证存储：加密 / KDF / 目录定位 ===
+# xsalsa20poly1305 即 NaCl crypto_secretbox（XSalsa20Poly1305）的稳定实现
+xsalsa20poly1305 = "0.9"
+sha2 = { workspace = true }
+dirs = "6"
+base64 = { workspace = true }
+
+# === macOS：keyring 走 Keychain (apple-native，内部即 security-framework) ===
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+# === Linux：keyring 走 libsecret (Secret Service)，crypto-rust 提供纯 Rust 加密 ===
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+# === Windows：keyring 走 Windows Credential Manager ===
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

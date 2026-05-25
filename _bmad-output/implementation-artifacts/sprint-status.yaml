@@ -1,5 +1,5 @@
 # generated: 2026-05-22
-# last_updated: 2026-05-25 (Epic 3 全部 10 个 Story 实施完成，待 review)
+# last_updated: 2026-05-25 (Epic 4 第一轮：服务端 peer 数据平面 + 客户端平台抽象层 实施完成，待 review)
 # project: vpn
 # project_key: NOKEY
 # tracking_system: file-system
@@ -96,17 +96,18 @@ development_status:
   # ============================================================
   # Epic 4: VPN Tunnel & Client Connectivity (18 stories)
   # ============================================================
-  epic-4: backlog
-  4-1-implement-wireguard-api-and-keys: backlog
-  4-2-implement-ip-pool-management: backlog
-  4-3-implement-server-wireguard-interface-and-recovery: backlog
+  epic-4: in-progress
+  # 可测核心已实现并通过测试；真实 boringtun 转发 / wg0 接口 / 真机系统集成留桩，待目标平台真机验证
+  4-1-implement-wireguard-api-and-keys: review
+  4-2-implement-ip-pool-management: review
+  4-3-implement-server-wireguard-interface-and-recovery: review
   4-4-implement-boringtun-timer-task: backlog
-  4-5-implement-peer-register-api: backlog
-  4-6-implement-peer-heartbeat-and-offline-detection: backlog
-  4-7-implement-peer-logout-and-config-download: backlog
-  4-8-implement-tun-device-cross-platform: backlog
-  4-9-implement-credential-store-cross-platform: backlog
-  4-10-implement-daemon-runtime-cross-platform: backlog
+  4-5-implement-peer-register-api: review
+  4-6-implement-peer-heartbeat-and-offline-detection: review
+  4-7-implement-peer-logout-and-config-download: review
+  4-8-implement-tun-device-cross-platform: review
+  4-9-implement-credential-store-cross-platform: review
+  4-10-implement-daemon-runtime-cross-platform: review
   4-11-implement-cli-daemon-ipc: backlog
   4-12-implement-cli-api-client: backlog
   4-13-implement-cli-login-command: backlog

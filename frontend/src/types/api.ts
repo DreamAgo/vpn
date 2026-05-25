@@ -117,6 +117,38 @@ export interface ResetPasswordResponse {
   newPassword: string;
 }
 
+// ===== Peer DTOs (与 vpn-api-types::peer 对齐, Epic 4) =====
+
+export interface PeerRegisterRequest {
+  wgPublicKey: string;
+  deviceName: string;
+  osInfo?: string;
+}
+
+export interface PeerRegisterResponse {
+  vpnIp: string;
+  serverPublicKey: string;
+  serverEndpoint: string;
+  vpnSubnet: string;
+}
+
+export interface PeerHeartbeatRequest {
+  endpoint?: string;
+}
+
+export interface PeerDto {
+  id: string;
+  userId: string;
+  deviceName: string;
+  wgPublicKey: string;
+  vpnIp: string;
+  endpoint: string | null;
+  osInfo: string | null;
+  lastSeenAt: number | null;
+  status: string; // "online" | "offline" | "deleted"
+  createdAt: number;
+}
+
 /** 业务错误码（与 vpn-api-types::error_codes 对齐）。 */
 export const ErrorCodes = {
   InvalidCredentials: 1001,

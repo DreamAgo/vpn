@@ -10,6 +10,7 @@
 pub mod auth;
 pub mod envelope;
 pub mod error_codes;
+pub mod peer;
 pub mod system;
 pub mod user;
 

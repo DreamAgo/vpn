@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use vpn_core::time::{Clock, SystemClock};
 
-use crate::services::{AuthService, UserService};
+use crate::services::{AuthService, PeerService, UserService};
 
 /// AppState 持有所有跨 handler 共享的资源。
 ///
@@ -13,6 +13,7 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub auth_service: Option<Arc<AuthService>>,
     pub user_service: Option<Arc<UserService>>,
+    pub peer_service: Option<Arc<PeerService>>,
 }
 
 impl AppState {
@@ -22,6 +23,7 @@ impl AppState {
             clock: Arc::new(SystemClock),
             auth_service: None,
             user_service: None,
+            peer_service: None,
         }
     }
 
@@ -32,6 +34,11 @@ impl AppState {
 
     pub fn with_user_service(mut self, svc: Arc<UserService>) -> Self {
         self.user_service = Some(svc);
+        self
+    }
+
+    pub fn with_peer_service(mut self, svc: Arc<PeerService>) -> Self {
+        self.peer_service = Some(svc);
         self
     }
 
@@ -47,6 +54,13 @@ impl AppState {
         self.user_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("user_service 未初始化".to_string()))
+    }
+
+    /// 获取 PeerService，未初始化则返回错误（启动顺序问题）。
+    pub fn peer_service(&self) -> Result<Arc<PeerService>, vpn_core::AppError> {
+        self.peer_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("peer_service 未初始化".to_string()))
     }
 }
 
