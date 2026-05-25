@@ -214,6 +214,77 @@ impl PeerService {
         self.peer_repo.mark_stale_offline(cutoff).await
     }
 
+    /// Story 5.5：心跳（admin 视角）。同 `heartbeat`，但若 peer 已被强制下线则拒绝。
+    ///
+    /// 强制下线后客户端下次心跳应失败，提示重新登录。
+    pub async fn heartbeat_checked(
+        &self,
+        user_id: &str,
+        endpoint: Option<&str>,
+        now_ms: i64,
+    ) -> Result<()> {
+        // touch_heartbeat 的 SQL 排除 status='deleted'，但 force_removed 仍会被更新；
+        // 故先显式检查活跃 peer 状态。
+        if let Some(peer) = self.peer_repo.find_active_by_user(user_id).await? {
+            if peer.status == "force_removed" {
+                // 复用 TokenExpired（401）→ 客户端据此提示重新登录。
+                return Err(AppError::TokenExpired);
+            }
+        }
+        self.heartbeat(user_id, endpoint, now_ms).await
+    }
+
+    /// Story 5.5：admin 强制下线指定 peer。
+    ///
+    /// 从 WireGuard runtime 移除 + 把 peers.status 置为 'force_removed'。
+    /// peer 不存在 → PeerNotFound。
+    pub async fn force_remove(&self, peer_id: &str) -> Result<()> {
+        let peer = self
+            .peer_repo
+            .find_by_id(peer_id)
+            .await?
+            .ok_or(AppError::PeerNotFound)?;
+        self.control.remove_peer(&peer.wg_public_key).await?;
+        self.peer_repo.mark_force_removed(peer_id).await?;
+        Ok(())
+    }
+
+    /// Story 5.5：admin peer 列表（JOIN users）。
+    pub async fn list_admin_peers(
+        &self,
+        query: &vpn_api_types::peer::AdminPeerQuery,
+    ) -> Result<vpn_api_types::Page<vpn_api_types::peer::AdminPeerView>> {
+        use crate::repositories::peer_repo_sqlite::AdminPeerFilter;
+        let page = query.page.unwrap_or(1).max(1);
+        let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+        let filter = AdminPeerFilter {
+            search: query.search.clone(),
+            status: query.status.clone(),
+            page,
+            page_size,
+        };
+        let total = self.peer_repo.count_admin(&filter).await? as u64;
+        let rows = self.peer_repo.list_admin(&filter).await?;
+        let items = rows
+            .into_iter()
+            .map(|r| vpn_api_types::peer::AdminPeerView {
+                id: r.id,
+                user_id: r.user_id,
+                username: r.username,
+                email: r.email,
+                device_name: r.device_name,
+                wg_public_key: r.wg_public_key,
+                vpn_ip: r.vpn_ip,
+                endpoint: r.endpoint,
+                os_info: r.os_info,
+                last_seen_at: r.last_seen_at,
+                status: r.status,
+                created_at: r.created_at,
+            })
+            .collect();
+        Ok(vpn_api_types::Page::new(items, total, page, page_size))
+    }
+
     /// 服务端公钥（供 system_info 等只读展示用）。
     pub fn server_public_key_string(&self) -> String {
         self.server_public_key().to_string()
@@ -503,6 +574,70 @@ mod tests {
         // 新注册（user-2）应跳过已占用的 .2，拿到 .3
         let resp = svc.register("user-2", &reg("PK2")).await.unwrap();
         assert_eq!(resp.vpn_ip, "10.8.0.3");
+    }
+
+    #[tokio::test]
+    async fn force_remove_marks_force_removed_and_blocks_heartbeat() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        svc.force_remove(&peer.id).await.unwrap();
+        // 已从 control 移除
+        assert!(svc.control.list_peers().await.unwrap().is_empty());
+        // 状态为 force_removed
+        let row = svc.peer_repo.find_by_id(&peer.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "force_removed");
+
+        // 心跳被拒（TokenExpired → 401）
+        let err = svc
+            .heartbeat_checked("user-1", None, 1000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::TokenExpired));
+    }
+
+    #[tokio::test]
+    async fn force_remove_unknown_returns_peer_not_found() {
+        let svc = service(setup_pool().await);
+        let err = svc.force_remove("missing").await.unwrap_err();
+        assert!(matches!(err, AppError::PeerNotFound));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_checked_ok_for_normal_peer() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        svc.heartbeat_checked("user-1", Some("1.2.3.4:99"), 1000)
+            .await
+            .unwrap();
+        let row = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "online");
+    }
+
+    #[tokio::test]
+    async fn list_admin_peers_returns_username() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        let query = vpn_api_types::peer::AdminPeerQuery {
+            page: None,
+            page_size: None,
+            search: None,
+            status: None,
+        };
+        let page = svc.list_admin_peers(&query).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].username, "alice");
     }
 
     #[tokio::test]

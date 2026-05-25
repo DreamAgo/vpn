@@ -7,17 +7,24 @@
 //! - GET    /api/v1/peers/me/config  下载客户端配置文件（Story 4.7）
 
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use vpn_api_types::{
-    peer::{PeerHeartbeatRequest, PeerRegisterRequest, PeerRegisterResponse},
-    ApiResponse,
+    peer::{
+        AdminPeerQuery, AdminPeerView, PeerHeartbeatRequest, PeerRegisterRequest,
+        PeerRegisterResponse,
+    },
+    ApiResponse, Page,
 };
 
-use crate::{auth::CurrentUser, error::ApiError, state::AppState};
+use crate::{
+    auth::{CurrentUser, RequireAdmin},
+    error::ApiError,
+    state::AppState,
+};
 
 fn success<T: serde::Serialize>(state: &AppState, data: T) -> Json<ApiResponse<T>> {
     Json(ApiResponse::success(
@@ -47,7 +54,8 @@ pub async fn heartbeat(
     Json(body): Json<PeerHeartbeatRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.peer_service()?;
-    svc.heartbeat(
+    // Story 5.5：若该 peer 已被 admin 强制下线，心跳被拒（TokenExpired → 401，提示重新登录）。
+    svc.heartbeat_checked(
         &current.user_id,
         body.endpoint.as_deref(),
         state.clock.now_unix_ms(),
@@ -91,4 +99,28 @@ pub async fn download_config(
     )
         .into_response();
     Ok(response)
+}
+
+/// Story 5.5：GET /api/v1/admin/peers（需 admin）
+#[tracing::instrument(skip(state))]
+pub async fn list_admin_peers(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+    Query(query): Query<AdminPeerQuery>,
+) -> Result<Json<ApiResponse<Page<AdminPeerView>>>, ApiError> {
+    let svc = state.peer_service()?;
+    let page = svc.list_admin_peers(&query).await?;
+    Ok(success(&state, page))
+}
+
+/// Story 5.5：DELETE /api/v1/admin/peers/:id（需 admin，强制下线）
+#[tracing::instrument(skip(state))]
+pub async fn force_remove_peer(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let svc = state.peer_service()?;
+    svc.force_remove(&id).await?;
+    Ok(success(&state, ()))
 }

@@ -1,5 +1,5 @@
 # generated: 2026-05-22
-# last_updated: 2026-05-25 (Epic 4 第一轮：服务端 peer 数据平面 + 客户端平台抽象层 实施完成，待 review)
+# last_updated: 2026-05-25 (Epic 4 完整[CLI+向导] + Epic 5 前后端 实施完成，待 review；真实 WG 数据面留桩)
 # project: vpn
 # project_key: NOKEY
 # tracking_system: file-system
@@ -108,29 +108,29 @@ development_status:
   4-8-implement-tun-device-cross-platform: review
   4-9-implement-credential-store-cross-platform: review
   4-10-implement-daemon-runtime-cross-platform: review
-  4-11-implement-cli-daemon-ipc: backlog
-  4-12-implement-cli-api-client: backlog
-  4-13-implement-cli-login-command: backlog
-  4-14-implement-cli-daemon-main-loop: backlog
-  4-15-implement-cli-control-commands: backlog
-  4-16-implement-client-auto-reconnect: backlog
-  4-17-implement-client-network-change-detection: backlog
-  4-18-implement-connection-guide-page: backlog
+  4-11-implement-cli-daemon-ipc: review
+  4-12-implement-cli-api-client: review
+  4-13-implement-cli-login-command: review
+  4-14-implement-cli-daemon-main-loop: review
+  4-15-implement-cli-control-commands: review
+  4-16-implement-client-auto-reconnect: review
+  4-17-implement-client-network-change-detection: review
+  4-18-implement-connection-guide-page: review
   epic-4-retrospective: optional
 
   # ============================================================
   # Epic 5: Peer Monitoring & Audit Visibility (9 stories)
   # ============================================================
-  epic-5: backlog
-  5-1-audit-logs-schema: backlog
-  5-2-implement-audit-service-and-middleware: backlog
-  5-3-implement-audit-log-cleanup: backlog
-  5-4-implement-audit-log-query-api: backlog
-  5-5-implement-admin-peer-apis: backlog
-  5-6-implement-node-status-dot: backlog
-  5-7-implement-peers-page: backlog
-  5-8-implement-audit-logs-page: backlog
-  5-9-complete-dashboard-kpis-and-alerts: backlog
+  epic-5: in-progress
+  5-1-audit-logs-schema: review
+  5-2-implement-audit-service-and-middleware: review
+  5-3-implement-audit-log-cleanup: review
+  5-4-implement-audit-log-query-api: review
+  5-5-implement-admin-peer-apis: review
+  5-6-implement-node-status-dot: review
+  5-7-implement-peers-page: review
+  5-8-implement-audit-logs-page: review
+  5-9-complete-dashboard-kpis-and-alerts: review
   epic-5-retrospective: optional
 
   # ============================================================

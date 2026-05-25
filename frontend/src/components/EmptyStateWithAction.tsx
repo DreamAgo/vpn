@@ -9,9 +9,11 @@
  */
 import type { ReactNode } from 'react';
 import { Button, Empty, Typography } from 'antd';
-import { UsergroupAddOutlined, SearchOutlined } from '@ant-design/icons';
+import { UsergroupAddOutlined, SearchOutlined, ApiOutlined } from '@ant-design/icons';
 
 const { Text } = Typography;
+
+type Variant = 'users-empty' | 'search-empty' | 'peers-empty';
 
 interface VariantConfig {
   icon: ReactNode;
@@ -20,7 +22,7 @@ interface VariantConfig {
   actionLabel: string;
 }
 
-const VARIANTS: Record<'users-empty' | 'search-empty', VariantConfig> = {
+const VARIANTS: Record<Variant, VariantConfig> = {
   'users-empty': {
     icon: <UsergroupAddOutlined style={{ fontSize: 56, color: '#bfbfbf' }} />,
     title: '还没有用户',
@@ -32,10 +34,16 @@ const VARIANTS: Record<'users-empty' | 'search-empty', VariantConfig> = {
     title: '没找到匹配的内容，试试其他关键词',
     actionLabel: '清除搜索',
   },
+  'peers-empty': {
+    icon: <ApiOutlined style={{ fontSize: 56, color: '#bfbfbf' }} />,
+    title: '还没有节点接入',
+    description: '用户使用 CLI 客户端登录并接入后，节点会显示在这里',
+    actionLabel: '查看接入指南',
+  },
 };
 
 interface Props {
-  variant?: 'users-empty' | 'search-empty';
+  variant?: Variant;
   title?: string;
   description?: string;
   /** 覆盖默认按钮（传入完整 ReactNode）；不传则渲染默认主按钮并在点击时调用 onAction。 */
@@ -55,14 +63,15 @@ export function EmptyStateWithAction({
   const resolvedTitle = title ?? cfg.title;
   const resolvedDesc = description ?? cfg.description;
 
-  const defaultButton =
+  const defaultButton = onAction ? (
     variant === 'users-empty' ? (
       <Button type="primary" onClick={onAction}>
         {cfg.actionLabel}
       </Button>
     ) : (
       <Button onClick={onAction}>{cfg.actionLabel}</Button>
-    );
+    )
+  ) : null;
 
   return (
     <div

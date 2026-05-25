@@ -7,6 +7,7 @@
 //!
 //! 本 crate 不依赖任何 IO crate（无 sqlx / axum / reqwest），仅 serde。
 
+pub mod audit;
 pub mod auth;
 pub mod envelope;
 pub mod error_codes;

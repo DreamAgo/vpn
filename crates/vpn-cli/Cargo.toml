@@ -10,7 +10,24 @@ publish = false
 vpn-api-types = { workspace = true }
 vpn-core = { workspace = true }
 vpn-platform = { workspace = true }
+vpn-wireguard = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+
+# CLI 解析与交互（本 crate 私有依赖）
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

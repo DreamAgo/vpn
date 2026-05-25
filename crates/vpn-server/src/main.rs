@@ -10,11 +10,12 @@ use vpn_server::{
     build_router,
     ratelimit::LoginAttempts,
     repositories::{
-        SqlitePeerRepository, SqliteSessionRepository, SqliteSystemConfigRepository,
-        SqliteUserRepository,
+        SqliteAuditLogRepository, SqlitePeerRepository, SqliteSessionRepository,
+        SqliteSystemConfigRepository, SqliteUserRepository,
     },
     services::{
-        build_peer_service, Argon2Hasher, AuthService, JwtTokenIssuer, PeerService, UserService,
+        build_peer_service, Argon2Hasher, AuditService, AuthService, JwtTokenIssuer, PeerService,
+        UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -88,14 +89,22 @@ async fn main() -> anyhow::Result<()> {
         "服务端 WireGuard 状态已就绪"
     );
 
+    // Epic 5：审计服务 + 清理任务
+    let audit_repo = SqliteAuditLogRepository::new(pool.clone());
+    let audit_service = Arc::new(AuditService::new(audit_repo));
+
     // Story 4.6：后台离线检测任务（每 30s 扫描；panic/错误不影响主进程）
     spawn_offline_scanner(peer_service.clone());
+
+    // Story 5.3：审计日志清理任务（每 24h 删除超过保留期的日志）
+    spawn_audit_cleanup(audit_service.clone(), config.audit_retention_days);
 
     // 构造 AppState + Router
     let state = AppState::new()
         .with_auth_service(auth_service)
         .with_user_service(user_service)
-        .with_peer_service(peer_service);
+        .with_peer_service(peer_service)
+        .with_audit_service(audit_service);
     let app = build_router(state);
 
     // 监听端口
@@ -133,6 +142,26 @@ fn spawn_offline_scanner(peer_service: Arc<PeerService>) {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::error!(error = ?e, "离线检测扫描失败"),
+            }
+        }
+    });
+}
+
+/// Story 5.3：审计日志清理任务。每 24h 执行一次，删除 created_at < now - retention_days 的日志。
+///
+/// 任务独立运行，单次出错仅记录日志不退出循环；进程退出时随 runtime 一并终止。
+fn spawn_audit_cleanup(audit_service: Arc<AuditService>, retention_days: u32) {
+    const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let retention_ms = retention_days as i64 * 24 * 60 * 60 * 1000;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CLEANUP_INTERVAL);
+        loop {
+            // 首个 tick 立即返回：启动后立刻清理一次旧日志，之后每 24h 一次。
+            ticker.tick().await;
+            let cutoff = chrono::Utc::now().timestamp_millis() - retention_ms;
+            match audit_service.purge_older_than(cutoff).await {
+                Ok(n) => tracing::info!(purged = n, retention_days, "审计日志清理完成"),
+                Err(e) => tracing::error!(error = ?e, "审计日志清理失败"),
             }
         }
     });

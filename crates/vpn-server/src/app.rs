@@ -84,6 +84,20 @@ pub fn build_router(state: AppState) -> Router {
                 "/api/v1/peers/me/config",
                 get(handlers::peers::download_config),
             )
+            .route(
+                "/api/v1/admin/audit-logs",
+                get(handlers::audit::list_audit_logs),
+            )
+            .route(
+                "/api/v1/admin/peers",
+                get(handlers::peers::list_admin_peers),
+            )
+            .route(
+                "/api/v1/admin/peers/{id}",
+                delete(handlers::peers::force_remove_peer),
+            )
+            // 审计中间件（内层）：在 require_auth 之后运行，故 extensions 已含 CurrentUser。
+            .layer(from_fn_with_state(state.clone(), middleware::audit_layer))
             .layer(from_fn_with_state(issuer, middleware::auth::require_auth))
     } else {
         // AuthService 未初始化（如健康检查测试场景）：不注册认证路由
