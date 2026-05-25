@@ -33,6 +33,28 @@ const PERSISTENT_KEEPALIVE: u16 = 25;
 /// 离线判定阈值：心跳超过该毫秒数未更新视为离线。
 pub const OFFLINE_THRESHOLD_MS: i64 = 90_000;
 
+/// 校验并归一化客户端声明的 LAN 网段。
+///
+/// 每项必须是合法 IPv4 CIDR；归一化为网络地址形式（如 `192.168.10.5/24` → `192.168.10.0/24`）。
+/// 非法项返回 [`AppError::Config`]。
+fn normalize_subnets(subnets: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for s in subnets {
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let net: Ipv4Net = s
+            .parse()
+            .map_err(|_| AppError::Config(format!("非法的 LAN 网段 CIDR：{s}")))?;
+        let normalized = format!("{}/{}", net.network(), net.prefix_len());
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
 /// 已渲染的配置文件下载内容。
 #[derive(Debug, Clone)]
 pub struct PeerConfigDownload {
@@ -84,6 +106,10 @@ impl PeerService {
         user_id: &str,
         req: &PeerRegisterRequest,
     ) -> Result<PeerRegisterResponse> {
+        // 校验并归一化客户端声明的 LAN 网段（站点网关）。
+        let subnets = normalize_subnets(&req.routed_subnets)?;
+        let subnets_csv = subnets.join(",");
+
         let existing = self.peer_repo.find_active_by_user(user_id).await?;
 
         let vpn_ip: String = match existing {
@@ -95,6 +121,7 @@ impl PeerService {
                         &req.device_name,
                         &req.wg_public_key,
                         req.os_info.as_deref(),
+                        &subnets_csv,
                     )
                     .await?;
                 peer.vpn_ip
@@ -115,6 +142,7 @@ impl PeerService {
                         &req.wg_public_key,
                         &ip_str,
                         req.os_info.as_deref(),
+                        &subnets_csv,
                     )
                     .await
                 {
@@ -136,6 +164,7 @@ impl PeerService {
                 public_key: req.wg_public_key.clone(),
                 vpn_ip: vpn_ip_parsed,
                 endpoint: None,
+                allowed_subnets: subnets.clone(),
             })
             .await?;
 
@@ -144,7 +173,23 @@ impl PeerService {
             server_public_key: self.server_public_key().to_string(),
             server_endpoint: self.server_endpoint.clone(),
             vpn_subnet: self.subnet_cidr(),
+            // 客户端应路由：VPN 子网 + 其他站点的 LAN 网段（不含自己声明的）。
+            allowed_routes: self.compute_allowed_routes(&subnets).await?,
         })
+    }
+
+    /// 计算客户端应导入隧道的网段：VPN 子网 + 所有 peer 的 LAN 网段（去重，排除本机自报的）。
+    async fn compute_allowed_routes(&self, own_subnets: &[String]) -> Result<Vec<String>> {
+        let mut routes = vec![self.subnet_cidr()];
+        for (_pk, _ip, csv) in self.peer_repo.list_active_peer_keys().await? {
+            for s in csv.split(',').filter(|s| !s.is_empty()) {
+                let s = s.to_string();
+                if !own_subnets.contains(&s) && !routes.contains(&s) {
+                    routes.push(s);
+                }
+            }
+        }
+        Ok(routes)
     }
 
     /// Story 4.6：心跳。无活跃 peer → PeerNotFound。
@@ -193,6 +238,14 @@ impl PeerService {
             .next()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "10.8.0.1".to_string());
+        // 分隧道：路由 VPN 子网 + 其他站点 LAN 网段（排除本机自报的）。
+        let own = peer
+            .routed_subnets
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let allowed_ips = self.compute_allowed_routes(&own).await?;
         let content = render_client_config(
             CLIENT_PRIVATE_KEY_PLACEHOLDER,
             client_ip,
@@ -201,6 +254,7 @@ impl PeerService {
             self.server_public_key(),
             &self.server_endpoint,
             PERSISTENT_KEEPALIVE,
+            &allowed_ips,
         );
         Ok(PeerConfigDownload {
             filename: "vpn.conf".to_string(),
@@ -280,6 +334,12 @@ impl PeerService {
                 last_seen_at: r.last_seen_at,
                 status: r.status,
                 created_at: r.created_at,
+                routed_subnets: r
+                    .routed_subnets
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect(),
             })
             .collect();
         Ok(vpn_api_types::Page::new(items, total, page, page_size))
@@ -367,12 +427,17 @@ pub async fn build_peer_service_with_backend(
         )
         .await?;
         // 启动恢复：把已存在的 active peers 重新下发到内核接口
-        for (pubkey, ip_str) in peer_repo.list_active_peer_keys().await? {
+        for (pubkey, ip_str, subnets_csv) in peer_repo.list_active_peer_keys().await? {
             if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
                 let cfg = WgPeerConfig {
                     public_key: pubkey,
                     vpn_ip: ip,
                     endpoint: None,
+                    allowed_subnets: subnets_csv
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect(),
                 };
                 if let Err(e) = kc.configure_peer(&cfg).await {
                     tracing::warn!(error = %e, "启动恢复 peer 配置失败");
@@ -442,7 +507,46 @@ mod tests {
             wg_public_key: pk.to_string(),
             device_name: "MBP".to_string(),
             os_info: Some("macOS".to_string()),
+            routed_subnets: Vec::new(),
         }
+    }
+
+    fn reg_with_subnets(pk: &str, subnets: &[&str]) -> PeerRegisterRequest {
+        PeerRegisterRequest {
+            wg_public_key: pk.to_string(),
+            device_name: "GW".to_string(),
+            os_info: None,
+            routed_subnets: subnets.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_invalid_subnet() {
+        let svc = service(setup_pool().await);
+        let err = svc
+            .register("user-1", &reg_with_subnets("PK1", &["not-a-cidr"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn site_to_site_routes_propagate_to_other_peers() {
+        let svc = service(setup_pool().await);
+        // 站点网关 B 声明 LAN 192.168.20.0/24（会被归一化）。
+        svc.register("user-2", &reg_with_subnets("PKB", &["192.168.20.5/24"]))
+            .await
+            .unwrap();
+        // 客户端 A 注册：其 allowed_routes 应包含 VPN 子网 + B 的 LAN 网段。
+        let resp_a = svc.register("user-1", &reg("PKA")).await.unwrap();
+        assert!(resp_a.allowed_routes.contains(&"10.8.0.0/24".to_string()));
+        assert!(resp_a
+            .allowed_routes
+            .contains(&"192.168.20.0/24".to_string()));
+        // B 的下载配置不应把自己的 LAN 再路由进隧道（排除自报）。
+        let conf_b = svc.render_config("user-2").await.unwrap();
+        assert!(conf_b.content.contains("10.8.0.0/24"));
+        assert!(!conf_b.content.contains("192.168.20.0/24"));
     }
 
     #[tokio::test]
@@ -613,7 +717,7 @@ mod tests {
         let peer_repo = SqlitePeerRepository::new(pool.clone());
         // 预置一个占用 10.8.0.2 的 peer
         peer_repo
-            .insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+            .insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         let subnet: Ipv4Net = "10.8.0.0/24".parse().unwrap();

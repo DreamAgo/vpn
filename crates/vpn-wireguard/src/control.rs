@@ -79,6 +79,7 @@ mod tests {
             public_key: pk.to_string(),
             vpn_ip: ip.parse().unwrap(),
             endpoint: None,
+            allowed_subnets: Vec::new(),
         }
     }
 

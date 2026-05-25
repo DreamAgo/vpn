@@ -18,6 +18,8 @@ pub struct PeerRow {
     pub status: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 逗号分隔的 LAN 网段 CIDR（站点网关路由的内网），空串表示无。
+    pub routed_subnets: String,
 }
 
 /// 数据库行元组（与 SELECT 列顺序一致），仅用于内部反序列化。
@@ -33,6 +35,7 @@ type PeerRowTuple = (
     String,
     i64,
     i64,
+    String,
 );
 
 impl From<PeerRowTuple> for PeerRow {
@@ -49,12 +52,13 @@ impl From<PeerRowTuple> for PeerRow {
             status: r.8,
             created_at: r.9,
             updated_at: r.10,
+            routed_subnets: r.11,
         }
     }
 }
 
 const SELECT_COLUMNS: &str = r#"id, user_id, device_name, wg_public_key, vpn_ip, endpoint,
-                                os_info, last_seen_at, status, created_at, updated_at"#;
+                                os_info, last_seen_at, status, created_at, updated_at, routed_subnets"#;
 
 #[derive(Debug, Clone)]
 pub struct SqlitePeerRepository {
@@ -89,10 +93,10 @@ impl SqlitePeerRepository {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
-    /// 列出活跃 peer 的 (wg_public_key, vpn_ip)，用于启动时向内核接口恢复配置。
-    pub async fn list_active_peer_keys(&self) -> Result<Vec<(String, String)>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT wg_public_key, vpn_ip FROM peers WHERE status NOT IN ('deleted', 'force_removed')",
+    /// 列出活跃 peer 的 (wg_public_key, vpn_ip, routed_subnets)，用于启动时向内核接口恢复配置。
+    pub async fn list_active_peer_keys(&self) -> Result<Vec<(String, String, String)>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT wg_public_key, vpn_ip, routed_subnets FROM peers WHERE status NOT IN ('deleted', 'force_removed')",
         )
         .fetch_all(&self.pool)
         .await
@@ -110,11 +114,12 @@ impl SqlitePeerRepository {
         wg_public_key: &str,
         vpn_ip: &str,
         os_info: Option<&str>,
+        routed_subnets: &str,
     ) -> Result<PeerRow> {
         let now = Utc::now().timestamp_millis();
         let result = sqlx::query(
-            r#"INSERT INTO peers (id, user_id, device_name, wg_public_key, vpn_ip, os_info, status, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'offline', ?7, ?7)"#,
+            r#"INSERT INTO peers (id, user_id, device_name, wg_public_key, vpn_ip, os_info, routed_subnets, status, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'offline', ?8, ?8)"#,
         )
         .bind(id)
         .bind(user_id)
@@ -122,6 +127,7 @@ impl SqlitePeerRepository {
         .bind(wg_public_key)
         .bind(vpn_ip)
         .bind(os_info)
+        .bind(routed_subnets)
         .bind(now)
         .execute(&self.pool)
         .await;
@@ -139,6 +145,7 @@ impl SqlitePeerRepository {
                 status: "offline".to_string(),
                 created_at: now,
                 updated_at: now,
+                routed_subnets: routed_subnets.to_string(),
             }),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => Err(
                 AppError::DuplicateResource("WireGuard 公钥或 VPN IP".to_string()),
@@ -155,15 +162,17 @@ impl SqlitePeerRepository {
         device_name: &str,
         wg_public_key: &str,
         os_info: Option<&str>,
+        routed_subnets: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         let result = sqlx::query(
-            r#"UPDATE peers SET device_name = ?1, wg_public_key = ?2, os_info = ?3, updated_at = ?4
-               WHERE id = ?5"#,
+            r#"UPDATE peers SET device_name = ?1, wg_public_key = ?2, os_info = ?3, routed_subnets = ?4, updated_at = ?5
+               WHERE id = ?6"#,
         )
         .bind(device_name)
         .bind(wg_public_key)
         .bind(os_info)
+        .bind(routed_subnets)
         .bind(now)
         .bind(id)
         .execute(&self.pool)
@@ -266,7 +275,7 @@ impl SqlitePeerRepository {
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"SELECT p.id, p.user_id, u.username, u.email, p.device_name, p.wg_public_key,
-                      p.vpn_ip, p.endpoint, p.os_info, p.last_seen_at, p.status, p.created_at
+                      p.vpn_ip, p.endpoint, p.os_info, p.last_seen_at, p.status, p.created_at, p.routed_subnets
                FROM peers p JOIN users u ON p.user_id = u.id"#,
         );
         Self::push_admin_where(&mut qb, filter);
@@ -353,6 +362,7 @@ pub struct AdminPeerRow {
     pub last_seen_at: Option<i64>,
     pub status: String,
     pub created_at: i64,
+    pub routed_subnets: String,
 }
 
 /// admin 列表行元组（与 SELECT 列顺序一致）。
@@ -369,6 +379,7 @@ type AdminPeerRowTuple = (
     Option<i64>,
     String,
     i64,
+    String,
 );
 
 impl From<AdminPeerRowTuple> for AdminPeerRow {
@@ -386,6 +397,7 @@ impl From<AdminPeerRowTuple> for AdminPeerRow {
             last_seen_at: r.9,
             status: r.10,
             created_at: r.11,
+            routed_subnets: r.12,
         }
     }
 }
@@ -423,7 +435,7 @@ mod tests {
     async fn insert_and_find_active_by_user() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
         let row = repo
-            .insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", Some("macOS"))
+            .insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", Some("macOS"), "")
             .await
             .unwrap();
         assert_eq!(row.status, "offline");
@@ -436,11 +448,11 @@ mod tests {
     #[tokio::test]
     async fn duplicate_public_key_returns_error() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         let err = repo
-            .insert("p2", "user-1", "Other", "PK1", "10.8.0.3", None)
+            .insert("p2", "user-1", "Other", "PK1", "10.8.0.3", None, "")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::DuplicateResource(_)));
@@ -449,11 +461,11 @@ mod tests {
     #[tokio::test]
     async fn duplicate_vpn_ip_returns_error() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         let err = repo
-            .insert("p2", "user-1", "Other", "PK2", "10.8.0.2", None)
+            .insert("p2", "user-1", "Other", "PK2", "10.8.0.2", None, "")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::DuplicateResource(_)));
@@ -462,10 +474,10 @@ mod tests {
     #[tokio::test]
     async fn update_registration_preserves_ip() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
-        repo.update_registration("p1", "MBP2", "PK2", Some("linux"))
+        repo.update_registration("p1", "MBP2", "PK2", Some("linux"), "")
             .await
             .unwrap();
         let row = repo.find_active_by_user("user-1").await.unwrap().unwrap();
@@ -478,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn list_active_vpn_ips_excludes_deleted() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         repo.mark_deleted_by_user("user-1").await.unwrap();
@@ -488,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_sets_online_and_endpoint() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         let affected = repo
@@ -518,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn mark_deleted_removes_from_active() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         let affected = repo.mark_deleted_by_user("user-1").await.unwrap();
@@ -529,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stale_offline_only_old_online_peers() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         // last_seen_at = 100 (old), online
@@ -548,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stale_offline_skips_recent_peers() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         repo.touch_heartbeat("user-1", None, 5000).await.unwrap();
@@ -562,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn find_by_id_and_mark_force_removed() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         let found = repo.find_by_id("p1").await.unwrap().unwrap();
@@ -591,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn list_admin_joins_username_and_email() {
         let repo = SqlitePeerRepository::new(setup_pool().await);
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
         let rows = repo.list_admin(&admin_filter_default()).await.unwrap();
@@ -613,10 +625,10 @@ mod tests {
         .await
         .unwrap();
         let repo = SqlitePeerRepository::new(pool);
-        repo.insert("p1", "user-1", "Laptop", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "Laptop", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
-        repo.insert("p2", "user-2", "Phone", "PK2", "10.8.0.3", None)
+        repo.insert("p2", "user-2", "Phone", "PK2", "10.8.0.3", None, "")
             .await
             .unwrap();
 
@@ -651,10 +663,10 @@ mod tests {
         .unwrap();
         let repo = SqlitePeerRepository::new(pool);
         // p1: no heartbeat (NULL last_seen), p2: has heartbeat
-        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None)
+        repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
             .await
             .unwrap();
-        repo.insert("p2", "user-2", "Phone", "PK2", "10.8.0.3", None)
+        repo.insert("p2", "user-2", "Phone", "PK2", "10.8.0.3", None, "")
             .await
             .unwrap();
         repo.touch_heartbeat("user-2", None, 5000).await.unwrap();

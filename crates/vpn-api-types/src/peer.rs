@@ -17,6 +17,10 @@ pub struct PeerRegisterRequest {
     /// 可选：操作系统信息（如 "macOS 15.4 arm64"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_info: Option<String>,
+    /// 可选：该节点背后路由的 LAN 网段（站点内网 CIDR，如 "192.168.10.0/24"）。
+    /// 作为站点网关时声明，服务端会把这些网段路由到本节点。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routed_subnets: Vec<String>,
 }
 
 /// 注册节点响应：客户端据此组装本地 WireGuard 隧道。
@@ -30,6 +34,10 @@ pub struct PeerRegisterResponse {
     pub server_endpoint: String,
     /// VPN 子网（CIDR，如 10.8.0.0/24）
     pub vpn_subnet: String,
+    /// 客户端应路由进隧道的网段（AllowedIPs）：VPN 子网 + 其他站点的 LAN 网段。
+    /// 客户端据此实现分隧道（只把这些网段导入 VPN，普通上网走本地）。
+    #[serde(default)]
+    pub allowed_routes: Vec<String>,
 }
 
 /// 心跳请求（POST /api/v1/peers/heartbeat），每 30s 一次。
@@ -54,6 +62,9 @@ pub struct PeerDto {
     /// "online" | "offline" | "deleted" | "force_removed"
     pub status: String,
     pub created_at: i64,
+    /// 该节点背后路由的 LAN 网段（CIDR 列表）。
+    #[serde(default)]
+    pub routed_subnets: Vec<String>,
 }
 
 /// admin peer 列表项：节点信息 + 所属用户（Story 5.5）。
@@ -71,6 +82,8 @@ pub struct AdminPeerView {
     pub last_seen_at: Option<i64>,
     pub status: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub routed_subnets: Vec<String>,
 }
 
 /// admin peer 列表查询参数（GET /admin/peers）。

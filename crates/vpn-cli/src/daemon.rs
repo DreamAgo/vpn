@@ -197,6 +197,8 @@ pub async fn connect_once(
         wg_public_key: keypair.public_key.clone(),
         device_name: device_name.to_string(),
         os_info: Some(detect_os_info()),
+        // 站点网关模式（声明背后 LAN 网段）后续由 CLI 参数提供；普通客户端为空。
+        routed_subnets: Vec::new(),
     };
     let resp = api.register_peer(&req).await?;
 
