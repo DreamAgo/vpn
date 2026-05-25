@@ -20,7 +20,11 @@
 - [ ] 客户端 `vpn-cli` daemon 数据面：当前 `run_data_plane` 为骨架。两条路线任选——
   (a) 客户端也用内核/`wg-quick`（Linux/macOS 有 wg 工具时最简单，可复用 `GET /peers/me/config` 下载的 .conf）；
   (b) 用户态 boringtun（需先解决 `boringtun 0.6` 要求 `x25519-dalek =2.0.0-rc.3` 的冲突：workspace 锁版本，或客户端独立 crate 隔离依赖）。
-- [ ] **异地组网（站点互通）**：两个客户端经服务端互 ping，需 `net.ipv4.ip_forward=1` + 服务端在 peers 间转发（allowed-ips 已覆盖整个子网，开转发即可，待验证）。
+- [x] **异地组网（站点互通）已真机验证（2026-05-25）**：两个不同用户的客户端经服务端 wg0 互 ping，4/4 0% 丢包，`ttl=63`（经服务端转发 -1）。需要的服务端配置：
+  - `sysctl -w net.ipv4.ip_forward=1`
+  - `iptables -I FORWARD -i wg0 -o wg0 -j ACCEPT` —— **关键**：装了 Docker 的主机 `FORWARD` 链默认策略是 `DROP`，不加这条规则 peer 间转发会被全部丢弃（排查耗时点）。
+  - 若客户端需访问公网/内网（全隧道），还需对出口网卡做 MASQUERADE：`iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o <eth> -j MASQUERADE`。
+  - 生产建议：把这些规则放进部署脚本 / systemd `ExecStartPost`（见 `packaging/linux`），或由运维固化；应用本身不擅自改主机防火墙。
 - [ ] Story 4.4 boringtun timer task：仅当选用户态后端时需要；内核后端不涉及。
 - [ ] 容器化部署内核后端：容器需 `--cap-add NET_ADMIN` + host 内核 WireGuard；UDP 端口建议 `network_mode: host` 避免 NAT 破坏握手。
 
