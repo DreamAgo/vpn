@@ -18,6 +18,7 @@ import {
   Typography,
   Drawer,
   Descriptions,
+  Tag,
 } from 'antd';
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components';
 import dayjs from 'dayjs';
@@ -31,6 +32,7 @@ import { ErrorCodes } from '@/types/api';
 import type { AdminPeerView } from '@/types/api';
 import { NodeStatusDot } from '@/components/NodeStatusDot';
 import { EmptyStateWithAction } from '@/components/EmptyStateWithAction';
+import { EditPeerRoutesModal } from '@/components/EditPeerRoutesModal';
 
 dayjs.extend(relativeTime);
 dayjs.locale('zh-cn');
@@ -63,6 +65,7 @@ export function PeersPage() {
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [detail, setDetail] = useState<AdminPeerView | null>(null);
+  const [editRoutes, setEditRoutes] = useState<AdminPeerView | null>(null);
 
   const reload = useCallback(() => actionRef.current?.reload(), []);
 
@@ -143,11 +146,14 @@ export function PeersPage() {
       {
         title: '操作',
         key: 'action',
-        width: 150,
+        width: 210,
         render: (_, record) => (
           <Space size="small">
             <Button type="link" size="small" onClick={() => setDetail(record)}>
               详情
+            </Button>
+            <Button type="link" size="small" onClick={() => setEditRoutes(record)}>
+              编辑路由
             </Button>
             <Popconfirm
               title="强制下线"
@@ -263,6 +269,29 @@ export function PeersPage() {
               {detail.endpoint ?? '—'}
             </Descriptions.Item>
             <Descriptions.Item label="操作系统">{detail.osInfo ?? '—'}</Descriptions.Item>
+            <Descriptions.Item label="站点 LAN 网段">
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <div>
+                  {detail.routedSubnets && detail.routedSubnets.length > 0 ? (
+                    detail.routedSubnets.map((cidr) => (
+                      <Tag key={cidr} style={{ marginBottom: 4 }}>
+                        <Text code>{cidr}</Text>
+                      </Tag>
+                    ))
+                  ) : (
+                    <Text type="secondary">无</Text>
+                  )}
+                </div>
+                <Button
+                  type="link"
+                  size="small"
+                  style={{ padding: 0 }}
+                  onClick={() => setEditRoutes(detail)}
+                >
+                  编辑路由
+                </Button>
+              </Space>
+            </Descriptions.Item>
             <Descriptions.Item label="WireGuard 公钥">
               <Text code copyable={{ text: detail.wgPublicKey }} style={{ wordBreak: 'break-all' }}>
                 {detail.wgPublicKey}
@@ -281,6 +310,15 @@ export function PeersPage() {
           </Descriptions>
         )}
       </Drawer>
+
+      {editRoutes && (
+        <EditPeerRoutesModal
+          open={editRoutes !== null}
+          peer={editRoutes}
+          onClose={() => setEditRoutes(null)}
+          onSaved={reload}
+        />
+      )}
     </div>
   );
 }

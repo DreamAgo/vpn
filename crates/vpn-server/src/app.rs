@@ -94,7 +94,8 @@ pub fn build_router(state: AppState) -> Router {
             )
             .route(
                 "/api/v1/admin/peers/{id}",
-                delete(handlers::peers::force_remove_peer),
+                delete(handlers::peers::force_remove_peer)
+                    .patch(handlers::peers::update_peer_routes),
             )
             // 审计中间件（内层）：在 require_auth 之后运行，故 extensions 已含 CurrentUser。
             .layer(from_fn_with_state(state.clone(), middleware::audit_layer))

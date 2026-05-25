@@ -15,7 +15,7 @@ use axum::{
 use vpn_api_types::{
     peer::{
         AdminPeerQuery, AdminPeerView, PeerHeartbeatRequest, PeerRegisterRequest,
-        PeerRegisterResponse,
+        PeerRegisterResponse, UpdatePeerRoutesRequest,
     },
     ApiResponse, Page,
 };
@@ -111,6 +111,19 @@ pub async fn list_admin_peers(
     let svc = state.peer_service()?;
     let page = svc.list_admin_peers(&query).await?;
     Ok(success(&state, page))
+}
+
+/// PATCH /api/v1/admin/peers/:id（需 admin，编辑路由网段 / 异地组网）
+#[tracing::instrument(skip(state, body))]
+pub async fn update_peer_routes(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+    Path(id): Path<String>,
+    Json(body): Json<UpdatePeerRoutesRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let svc = state.peer_service()?;
+    svc.update_peer_routes(&id, &body.routed_subnets).await?;
+    Ok(success(&state, ()))
 }
 
 /// Story 5.5：DELETE /api/v1/admin/peers/:id（需 admin，强制下线）

@@ -16,7 +16,16 @@ ExecStart=/usr/bin/vpn-server
 Restart=on-failure
 RestartSec=5
 
-# 创建 WireGuard TUN 设备 / 配置路由需要 CAP_NET_ADMIN（无需完整 root）。
+# 异地组网/站点互通：kernel 后端启动后开启 IPv4 转发并放行 wg0 互转发，
+# 停止后清理 iptables 规则（脚本读取本单元注入的 env，幂等 + best-effort）。
+# noop 后端下脚本会自行跳过。两个 ExecStartPost/ExecStopPost 需 root 能力，
+# 这里以 root 权限运行（见下方 PermissionsStartOnly / 单元未降权前缀），
+# 子进程不继承 User= 降权由 "+" 前缀保证。
+ExecStartPost=+/usr/lib/vpn-server/wg-forward-setup.sh
+ExecStopPost=+/usr/lib/vpn-server/wg-forward-teardown.sh
+
+# 创建 WireGuard 接口 / 配置路由 / 改 sysctl 与 iptables 需要 CAP_NET_ADMIN。
+# 注意：sysctl net.ipv4.ip_forward 写入需要 CAP_NET_ADMIN（且不能被 ProtectKernelTunables 阻断）。
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 

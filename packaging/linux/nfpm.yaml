@@ -45,6 +45,16 @@ contents:
     file_info:
       mode: 0644
 
+  # === 异地组网转发/防火墙脚本（由 service 的 ExecStartPost/ExecStopPost 调用）===
+  - src: ./scripts/wg-forward-setup.sh
+    dst: /usr/lib/vpn-server/wg-forward-setup.sh
+    file_info:
+      mode: 0755
+  - src: ./scripts/wg-forward-teardown.sh
+    dst: /usr/lib/vpn-server/wg-forward-teardown.sh
+    file_info:
+      mode: 0755
+
   # === 默认环境配置（标记为 config，升级不覆盖管理员修改）===
   - src: ./vpn-server.env.example
     dst: /etc/vpn-server/vpn-server.env

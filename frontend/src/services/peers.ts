@@ -15,4 +15,8 @@ export const peersApi = {
   async forceRemovePeer(id: string): Promise<void> {
     await http.delete(`/admin/peers/${id}`);
   },
+
+  async updatePeerRoutes(id: string, routedSubnets: string[]): Promise<void> {
+    await http.patch(`/admin/peers/${id}`, { routedSubnets });
+  },
 };

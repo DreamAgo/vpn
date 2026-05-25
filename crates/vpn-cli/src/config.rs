@@ -16,6 +16,8 @@ pub const KEY_SERVER_URL: &str = "server_url";
 pub const KEY_REFRESH_TOKEN: &str = "refresh_token";
 /// 凭证 key：登录用户名（可选，便于复用）。
 pub const KEY_USERNAME: &str = "username";
+/// 凭证 key：本机作为站点网关时声明的 LAN 网段（逗号分隔 CIDR）。
+pub const KEY_ROUTES: &str = "routed_subnets";
 
 /// daemon 运行配置。
 #[derive(Debug, Clone)]
@@ -28,6 +30,8 @@ pub struct DaemonConfig {
     pub device_name: String,
     /// IPC socket 路径。
     pub socket_path: PathBuf,
+    /// 本机背后路由的 LAN 网段（站点网关模式，register 上送）。
+    pub routed_subnets: Vec<String>,
 }
 
 /// 凭证仓库：封装底层 [`CredentialStore`]，提供 server_url / refresh_token 读写。
@@ -66,6 +70,30 @@ impl CredentialRepo {
         Ok(())
     }
 
+    /// 保存站点网关路由网段（逗号分隔）。空则清除。
+    pub fn save_routes(&self, routes: &[String]) -> CliResult<()> {
+        if routes.is_empty() {
+            let _ = self.store.delete(KEY_ROUTES);
+        } else {
+            self.store.save(KEY_ROUTES, &routes.join(","))?;
+        }
+        Ok(())
+    }
+
+    /// 读取已保存的路由网段。
+    pub fn routes(&self) -> CliResult<Vec<String>> {
+        Ok(self
+            .store
+            .load(KEY_ROUTES)?
+            .map(|s| {
+                s.split(',')
+                    .filter(|x| !x.is_empty())
+                    .map(|x| x.to_string())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// 读取已保存的 server_url。
     pub fn server_url(&self) -> CliResult<Option<String>> {
         Ok(self.store.load(KEY_SERVER_URL)?)
@@ -86,6 +114,7 @@ impl CredentialRepo {
         self.store.delete(KEY_REFRESH_TOKEN)?;
         self.store.delete(KEY_SERVER_URL)?;
         self.store.delete(KEY_USERNAME)?;
+        let _ = self.store.delete(KEY_ROUTES);
         Ok(())
     }
 
@@ -105,6 +134,7 @@ impl CredentialRepo {
             refresh_token,
             device_name,
             socket_path,
+            routed_subnets: self.routes()?,
         })
     }
 }

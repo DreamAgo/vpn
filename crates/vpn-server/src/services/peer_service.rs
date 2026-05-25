@@ -303,6 +303,36 @@ impl PeerService {
         Ok(())
     }
 
+    /// admin 编辑指定 peer 的路由网段（异地组网）。
+    ///
+    /// 校验/归一化 CIDR → 持久化 → 重新下发 WireGuard 配置（更新 allowed-ips 与路由）。
+    /// peer 不存在 → PeerNotFound；非法 CIDR → Config。
+    pub async fn update_peer_routes(&self, peer_id: &str, subnets: &[String]) -> Result<()> {
+        let peer = self
+            .peer_repo
+            .find_by_id(peer_id)
+            .await?
+            .ok_or(AppError::PeerNotFound)?;
+        let normalized = normalize_subnets(subnets)?;
+        self.peer_repo
+            .update_routed_subnets(peer_id, &normalized.join(","))
+            .await?;
+        // 重新下发到 WireGuard（仅对未删除/未强制下线的 peer 生效）。
+        if peer.status != "deleted" && peer.status != "force_removed" {
+            if let Ok(ip) = peer.vpn_ip.parse::<Ipv4Addr>() {
+                self.control
+                    .configure_peer(&WgPeerConfig {
+                        public_key: peer.wg_public_key,
+                        vpn_ip: ip,
+                        endpoint: None,
+                        allowed_subnets: normalized,
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Story 5.5：admin peer 列表（JOIN users）。
     pub async fn list_admin_peers(
         &self,
@@ -764,6 +794,33 @@ mod tests {
     async fn force_remove_unknown_returns_peer_not_found() {
         let svc = service(setup_pool().await);
         let err = svc.force_remove("missing").await.unwrap_err();
+        assert!(matches!(err, AppError::PeerNotFound));
+    }
+
+    #[tokio::test]
+    async fn update_peer_routes_persists_and_validates() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        // 合法网段（带归一化）。
+        svc.update_peer_routes(&peer.id, &["192.168.10.5/24".to_string()])
+            .await
+            .unwrap();
+        let updated = svc.peer_repo.find_by_id(&peer.id).await.unwrap().unwrap();
+        assert_eq!(updated.routed_subnets, "192.168.10.0/24");
+        // 非法网段被拒。
+        let err = svc
+            .update_peer_routes(&peer.id, &["bad".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+        // 未知 peer。
+        let err = svc.update_peer_routes("missing", &[]).await.unwrap_err();
         assert!(matches!(err, AppError::PeerNotFound));
     }
 
