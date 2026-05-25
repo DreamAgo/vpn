@@ -1,5 +1,5 @@
 # generated: 2026-05-22
-# last_updated: 2026-05-25 (Epic 2 全部 13 个 Story 实施完成，待 review)
+# last_updated: 2026-05-25 (Epic 3 全部 10 个 Story 实施完成，待 review)
 # project: vpn
 # project_key: NOKEY
 # tracking_system: file-system
@@ -80,17 +80,17 @@ development_status:
   # ============================================================
   # Epic 3: User Account Management (10 stories)
   # ============================================================
-  epic-3: backlog
-  3-1-implement-create-user-api: backlog
-  3-2-implement-user-list-api-and-search: backlog
-  3-3-implement-user-disable-enable-api: backlog
-  3-4-implement-reset-password-api: backlog
-  3-5-implement-delete-user-api-with-cascade: backlog
-  3-6-implement-users-page: backlog
-  3-7-implement-create-user-modal: backlog
-  3-8-implement-share-link-and-copy-link: backlog
-  3-9-implement-reset-password-modal: backlog
-  3-10-implement-empty-state-with-action: backlog
+  epic-3: in-progress
+  3-1-implement-create-user-api: review
+  3-2-implement-user-list-api-and-search: review
+  3-3-implement-user-disable-enable-api: review
+  3-4-implement-reset-password-api: review
+  3-5-implement-delete-user-api-with-cascade: review
+  3-6-implement-users-page: review
+  3-7-implement-create-user-modal: review
+  3-8-implement-share-link-and-copy-link: review
+  3-9-implement-reset-password-modal: review
+  3-10-implement-empty-state-with-action: review
   epic-3-retrospective: optional
 
   # ============================================================

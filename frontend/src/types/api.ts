@@ -77,6 +77,46 @@ export interface SystemInfo {
   startedAt: number;
 }
 
+// ===== User management DTOs (与 vpn-api-types::user 对齐, Epic 3) =====
+
+export interface UserDto {
+  id: string;
+  username: string;
+  email: string;
+  role: string; // "admin" | "user"
+  status: string; // "active" | "disabled"
+  mustChangePassword: boolean;
+  lastLoginAt: number | null;
+  createdAt: number;
+}
+
+export interface CreateUserRequest {
+  username: string;
+  email: string;
+  password?: string;
+}
+
+export interface CreateUserResponse {
+  user: UserDto;
+  initialPassword: string;
+}
+
+export interface ListUsersQuery {
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  status?: string;
+  orderBy?: string;
+}
+
+export interface UpdateUserRequest {
+  status?: string; // "active" | "disabled"
+}
+
+export interface ResetPasswordResponse {
+  newPassword: string;
+}
+
 /** 业务错误码（与 vpn-api-types::error_codes 对齐）。 */
 export const ErrorCodes = {
   InvalidCredentials: 1001,

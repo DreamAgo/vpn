@@ -13,6 +13,7 @@ import { LoginPage } from './pages/LoginPage';
 import { SetupWizardPage } from './pages/SetupWizardPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { AccountSettingsPage } from './pages/AccountSettingsPage';
+import { UsersPage } from './pages/UsersPage';
 import { useAuthStore } from './stores/authStore';
 
 const queryClient = new QueryClient({
@@ -53,7 +54,7 @@ function App() {
                   <Route path="/dashboard" element={<DashboardPage />} />
                   <Route path="/account" element={<AccountSettingsPage />} />
                   <Route path="/account/password" element={<AccountSettingsPage />} />
-                  <Route path="/users" element={<PlaceholderPage name="用户管理" />} />
+                  <Route path="/users" element={<UsersPage />} />
                   <Route path="/peers" element={<PlaceholderPage name="节点管理" />} />
                   <Route path="/audit-logs" element={<PlaceholderPage name="审计日志" />} />
                 </Route>

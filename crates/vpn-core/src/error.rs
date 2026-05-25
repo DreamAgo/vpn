@@ -41,6 +41,9 @@ pub enum AppError {
     #[error("无权访问该资源")]
     NoAccess,
 
+    #[error("{0}")]
+    NoAccessReason(String),
+
     // ===== 3xxx 资源 =====
     #[error("用户不存在")]
     UserNotFound,
@@ -94,6 +97,7 @@ impl AppError {
             AppError::MissingAuth => error_codes::MISSING_AUTH,
             AppError::RequireAdmin => error_codes::REQUIRE_ADMIN,
             AppError::NoAccess => error_codes::NO_ACCESS,
+            AppError::NoAccessReason(_) => error_codes::NO_ACCESS,
             AppError::UserNotFound => error_codes::USER_NOT_FOUND,
             AppError::PeerNotFound => error_codes::PEER_NOT_FOUND,
             AppError::DuplicateResource(_) => error_codes::DUPLICATE_RESOURCE,
