@@ -19,6 +19,15 @@ pub struct ServerConfig {
     pub domain: Option<String>,
     /// 数据目录（用于密钥、ACME 证书缓存）。
     pub data_dir: String,
+    /// VPN 虚拟子网（CIDR）。默认 `10.8.0.0/24`。
+    pub vpn_subnet: String,
+    /// WireGuard 监听 UDP 端口。默认 `51820`。
+    pub vpn_listen_port: u16,
+    /// 服务端 WireGuard endpoint（host:port），客户端据此连接。
+    ///
+    /// 若未显式设置 `VPN_ENDPOINT`，则用 `VPN_DOMAIN:vpn_listen_port`（若有域名），
+    /// 否则回退占位 `127.0.0.1:vpn_listen_port`（开发用）。
+    pub vpn_endpoint: String,
 }
 
 impl ServerConfig {
@@ -40,12 +49,25 @@ impl ServerConfig {
             anyhow::bail!("启用 HTTPS (VPN_HTTPS=true) 需要 VPN_DOMAIN 环境变量");
         }
 
+        let vpn_subnet = env::var("VPN_SUBNET").unwrap_or_else(|_| "10.8.0.0/24".to_string());
+        let vpn_listen_port = env::var("VPN_LISTEN_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(51820);
+        let vpn_endpoint = env::var("VPN_ENDPOINT").ok().unwrap_or_else(|| {
+            let host = domain.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+            format!("{host}:{vpn_listen_port}")
+        });
+
         Ok(Self {
             bind_addr,
             database_url,
             enable_https,
             domain,
             data_dir,
+            vpn_subnet,
+            vpn_listen_port,
+            vpn_endpoint,
         })
     }
 }
@@ -63,9 +85,15 @@ mod tests {
             env::remove_var("DATABASE_URL");
             env::remove_var("VPN_DOMAIN");
             env::remove_var("VPN_DATA_DIR");
+            env::remove_var("VPN_SUBNET");
+            env::remove_var("VPN_LISTEN_PORT");
+            env::remove_var("VPN_ENDPOINT");
         }
         let cfg = ServerConfig::from_env().unwrap();
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");
         assert!(!cfg.enable_https);
+        assert_eq!(cfg.vpn_subnet, "10.8.0.0/24");
+        assert_eq!(cfg.vpn_listen_port, 51820);
+        assert_eq!(cfg.vpn_endpoint, "127.0.0.1:51820");
     }
 }
