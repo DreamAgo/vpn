@@ -69,6 +69,8 @@ pub struct PeerService {
     ip_pool: Arc<Mutex<IpPool>>,
     subnet: Ipv4Net,
     server_endpoint: String,
+    /// 服务端自身网关的网段（如所在 Docker 网络），下发给客户端的 allowed_routes。
+    server_routes: Vec<String>,
 }
 
 impl PeerService {
@@ -78,6 +80,7 @@ impl PeerService {
         control: Arc<dyn WireGuardControl>,
         ip_pool: IpPool,
         server_endpoint: String,
+        server_routes: Vec<String>,
     ) -> Self {
         let subnet = ip_pool.subnet();
         Self {
@@ -86,6 +89,7 @@ impl PeerService {
             ip_pool: Arc::new(Mutex::new(ip_pool)),
             subnet,
             server_endpoint,
+            server_routes,
         }
     }
 
@@ -181,6 +185,12 @@ impl PeerService {
     /// 计算客户端应导入隧道的网段：VPN 子网 + 所有 peer 的 LAN 网段（去重，排除本机自报的）。
     async fn compute_allowed_routes(&self, own_subnets: &[String]) -> Result<Vec<String>> {
         let mut routes = vec![self.subnet_cidr()];
+        // 服务端自身网关的网段（如 Docker 网络）。
+        for s in &self.server_routes {
+            if !own_subnets.contains(s) && !routes.contains(s) {
+                routes.push(s.clone());
+            }
+        }
         for (_pk, _ip, csv) in self.peer_repo.list_active_peer_keys().await? {
             for s in csv.split(',').filter(|s| !s.is_empty()) {
                 let s = s.to_string();
@@ -396,6 +406,7 @@ pub async fn build_peer_service(
         "noop",
         "wg0",
         51820,
+        Vec::new(),
     )
     .await
 }
@@ -404,6 +415,7 @@ pub async fn build_peer_service(
 ///
 /// `backend`：`"kernel"` 使用 Linux 内核 WireGuard（需 root/CAP_NET_ADMIN + `wg` 工具），
 /// 其余值（含 `"noop"`）使用无副作用的记账实现。
+#[allow(clippy::too_many_arguments)]
 pub async fn build_peer_service_with_backend(
     peer_repo: SqlitePeerRepository,
     config_repo: &SqliteSystemConfigRepository,
@@ -412,6 +424,7 @@ pub async fn build_peer_service_with_backend(
     backend: &str,
     iface: &str,
     listen_port: u16,
+    server_routes: Vec<String>,
 ) -> Result<PeerService> {
     // 1. load-or-generate 服务端 WG 密钥（私钥 + 公钥都需要）
     let (private_key, public_key) = match config_repo.get(KEY_SERVER_WG_PRIVATE).await? {
@@ -486,6 +499,7 @@ pub async fn build_peer_service_with_backend(
         control,
         ip_pool,
         server_endpoint,
+        server_routes,
     ))
 }
 
@@ -529,7 +543,28 @@ mod tests {
             control,
             ip_pool,
             "vpn.example.com:51820".to_string(),
+            Vec::new(),
         )
+    }
+
+    fn service_with_server_routes(pool: SqlitePool, routes: Vec<String>) -> PeerService {
+        let ip_pool = IpPool::new("10.8.0.0/24".parse().unwrap());
+        PeerService::new(
+            SqlitePeerRepository::new(pool),
+            Arc::new(NoopWireGuardControl::new("SERVER_PUB")),
+            ip_pool,
+            "vpn.example.com:51820".to_string(),
+            routes,
+        )
+    }
+
+    #[tokio::test]
+    async fn server_routes_propagate_to_client_allowed_routes() {
+        let svc =
+            service_with_server_routes(setup_pool().await, vec!["172.31.100.0/24".to_string()]);
+        let resp = svc.register("user-1", &reg("PK1")).await.unwrap();
+        assert!(resp.allowed_routes.contains(&"10.8.0.0/24".to_string()));
+        assert!(resp.allowed_routes.contains(&"172.31.100.0/24".to_string()));
     }
 
     fn reg(pk: &str) -> PeerRegisterRequest {
