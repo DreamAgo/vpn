@@ -123,6 +123,7 @@ export interface PeerRegisterRequest {
   wgPublicKey: string;
   deviceName: string;
   osInfo?: string;
+  routedSubnets?: string[];
 }
 
 export interface PeerRegisterResponse {
@@ -130,6 +131,7 @@ export interface PeerRegisterResponse {
   serverPublicKey: string;
   serverEndpoint: string;
   vpnSubnet: string;
+  allowedRoutes?: string[];
 }
 
 export interface PeerHeartbeatRequest {
@@ -164,6 +166,7 @@ export interface AdminPeerView {
   lastSeenAt: number | null;
   status: string; // online | offline | deleted | force_removed
   createdAt: number;
+  routedSubnets?: string[];
 }
 
 export interface AdminPeerQuery {

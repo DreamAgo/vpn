@@ -80,7 +80,8 @@ impl KernelWireGuardControl {
 #[async_trait]
 impl WireGuardControl for KernelWireGuardControl {
     async fn configure_peer(&self, cfg: &WgPeerConfig) -> Result<()> {
-        let allowed = format!("{}/32", cfg.vpn_ip);
+        // allowed-ips = <vpn_ip>/32 + 各 LAN 网段（逗号分隔，cryptokey routing）
+        let allowed = cfg.allowed_ips().join(",");
         run(
             "wg",
             &[
@@ -93,7 +94,12 @@ impl WireGuardControl for KernelWireGuardControl {
             ],
         )
         .await?;
-        tracing::debug!(public_key = %cfg.public_key, vpn_ip = %cfg.vpn_ip, "内核 configure_peer");
+        // 站点 LAN 网段需在 OS 路由表加 `<subnet> dev <iface>`，否则内核不会把发往该网段的包送进 wg 接口
+        // （`wg set` 只配 cryptokey routing，不像 `wg-quick` 自动加路由）。peer 自己的 /32 在接口子网内无需额外路由。
+        for subnet in &cfg.allowed_subnets {
+            run("ip", &["route", "replace", subnet, "dev", &self.iface]).await?;
+        }
+        tracing::debug!(public_key = %cfg.public_key, vpn_ip = %cfg.vpn_ip, allowed = %allowed, "内核 configure_peer");
         Ok(())
     }
 

@@ -25,6 +25,8 @@
   - `iptables -I FORWARD -i wg0 -o wg0 -j ACCEPT` —— **关键**：装了 Docker 的主机 `FORWARD` 链默认策略是 `DROP`，不加这条规则 peer 间转发会被全部丢弃（排查耗时点）。
   - 若客户端需访问公网/内网（全隧道），还需对出口网卡做 MASQUERADE：`iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o <eth> -j MASQUERADE`。
   - 生产建议：把这些规则放进部署脚本 / systemd `ExecStartPost`（见 `packaging/linux`），或由运维固化；应用本身不擅自改主机防火墙。
+- [x] **站点 LAN 网段路由（可配置路由，非全转发）已真机验证（2026-05-25）**：peer 注册时 `routed_subnets` 声明背后 LAN（如 `192.168.20.0/24`），服务端 `KernelWireGuardControl` 自动把网段加入该 peer 的 allowed-ips **并加 `ip route <subnet> dev wg0`**（`wg set` 不像 `wg-quick` 自动加路由，这是关键）。客户端从注册响应的 `allowed_routes` 获知应路由的网段（VPN 子网 + 各站点 LAN），实现分隧道。验证：clientA 经服务端中转 + 站点网关 B 转发，ping 通 B 内网主机 192.168.20.1，0% 丢包。
+  - 站点网关侧仍需自行开 `ip_forward` 并把 VPN 流量转发/MASQUERADE 进其本地 LAN。
 - [ ] Story 4.4 boringtun timer task：仅当选用户态后端时需要；内核后端不涉及。
 - [ ] 容器化部署内核后端：容器需 `--cap-add NET_ADMIN` + host 内核 WireGuard；UDP 端口建议 `network_mode: host` 避免 NAT 破坏握手。
 

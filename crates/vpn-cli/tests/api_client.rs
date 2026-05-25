@@ -80,6 +80,7 @@ async fn register_peer_succeeds_with_bearer() {
                 server_public_key: "spk".into(),
                 server_endpoint: "vpn.example.com:51820".into(),
                 vpn_subnet: "10.8.0.0/24".into(),
+                allowed_routes: vec!["10.8.0.0/24".into()],
             })),
         )
         .mount(&server)
@@ -105,6 +106,7 @@ async fn register_peer_succeeds_with_bearer() {
         wg_public_key: "pk".into(),
         device_name: "dev".into(),
         os_info: None,
+        routed_subnets: Vec::new(),
     };
     let resp = client.register_peer(&req).await.unwrap();
     assert_eq!(resp.vpn_ip, "10.8.0.5");
@@ -145,6 +147,7 @@ async fn expired_access_token_triggers_refresh_and_retry() {
                 server_public_key: "spk".into(),
                 server_endpoint: "ep:51820".into(),
                 vpn_subnet: "10.8.0.0/24".into(),
+                allowed_routes: vec!["10.8.0.0/24".into()],
             })),
         )
         .mount(&server)
@@ -174,6 +177,7 @@ async fn expired_access_token_triggers_refresh_and_retry() {
         wg_public_key: "pk".into(),
         device_name: "dev".into(),
         os_info: None,
+        routed_subnets: Vec::new(),
     };
     let resp = client.register_peer(&req).await.unwrap();
     assert_eq!(resp.vpn_ip, "10.8.0.9");
