@@ -1,0 +1,74 @@
+# nfpm 配置：用单一描述同时产出 .deb 与 .rpm。
+#
+# 前置：安装 nfpm（https://nfpm.goreleaser.com/install/）。
+# 构建产物前提：已在仓库根执行 `cargo build --release --workspace`，
+# 生成 target/release/vpn-server 与 target/release/vpn-cli。
+#
+# 推荐从仓库根执行（相对路径以仓库根为基准）：
+#   nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/
+#   nfpm package -f packaging/linux/nfpm.yaml -p rpm -t dist/
+#
+# 注意：本目录为脚手架，需在 Linux CI 或真机上构建验证。
+
+name: "vpn-server"
+arch: "amd64"            # 交叉构建 arm64 时改为 arm64，并相应调整二进制来源。
+platform: "linux"
+version: "v0.1.0"        # 与 workspace 版本保持一致；CI 可用 ${GIT_TAG} 注入。
+section: "net"
+priority: "optional"
+maintainer: "Shangguanjunjie"
+description: |
+  VPN 服务端（vpn-server）与客户端 CLI（vpn-cli）。
+  服务端以 systemd system 服务运行，需要 CAP_NET_ADMIN 管理 WireGuard 数据平面。
+vendor: "Shangguanjunjie"
+homepage: "https://github.com/Shangguanjunjie/vpn"
+license: "MIT"
+
+# .deb / .rpm 的运行期依赖（按真机环境可增删；wireguard-tools 便于排障）。
+depends:
+  - wireguard-tools
+
+contents:
+  # === 二进制 ===
+  - src: ../../target/release/vpn-server
+    dst: /usr/bin/vpn-server
+    file_info:
+      mode: 0755
+  - src: ../../target/release/vpn-cli
+    dst: /usr/bin/vpn-cli
+    file_info:
+      mode: 0755
+
+  # === systemd system 服务单元 ===
+  - src: ./systemd/vpn-server.service
+    dst: /lib/systemd/system/vpn-server.service
+    file_info:
+      mode: 0644
+
+  # === 默认环境配置（标记为 config，升级不覆盖管理员修改）===
+  - src: ./vpn-server.env.example
+    dst: /etc/vpn-server/vpn-server.env
+    type: config|noreplace
+    file_info:
+      mode: 0640
+
+  # === 数据目录（空目录，归属在 postinstall 修正）===
+  - dst: /var/lib/vpn-server
+    type: dir
+    file_info:
+      mode: 0750
+      owner: vpn-server
+      group: vpn-server
+
+scripts:
+  postinstall: ./scripts/postinstall.sh
+  preremove: ./scripts/preremove.sh
+
+# deb 专属：建议配置（仅提示，不强制依赖）。
+deb:
+  fields:
+    Recommends: wireguard-tools
+
+# rpm 专属：标记 config 文件已通过 type: config 处理。
+rpm:
+  group: "Applications/Internet"
