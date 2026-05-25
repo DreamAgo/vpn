@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware::from_fn_with_state,
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use tower::ServiceBuilder;
@@ -64,6 +64,18 @@ pub fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/admin/system/info",
                 get(handlers::system::system_info),
+            )
+            .route(
+                "/api/v1/admin/users",
+                post(handlers::users::create_user).get(handlers::users::list_users),
+            )
+            .route(
+                "/api/v1/admin/users/{id}",
+                patch(handlers::users::update_user).delete(handlers::users::delete_user),
+            )
+            .route(
+                "/api/v1/admin/users/{id}/reset-password",
+                post(handlers::users::reset_password),
             )
             .layer(from_fn_with_state(issuer, middleware::auth::require_auth))
     } else {

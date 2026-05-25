@@ -11,5 +11,6 @@ pub mod auth;
 pub mod envelope;
 pub mod error_codes;
 pub mod system;
+pub mod user;
 
 pub use envelope::{ApiResponse, Page};

@@ -3,7 +3,9 @@
 pub mod auth_service;
 pub mod password_hasher;
 pub mod token_issuer;
+pub mod user_service;
 
 pub use auth_service::{AuthService, LoginOutcome};
 pub use password_hasher::Argon2Hasher;
 pub use token_issuer::{JwtTokenIssuer, TokenIssuerError};
+pub use user_service::UserService;

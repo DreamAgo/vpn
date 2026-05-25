@@ -10,7 +10,7 @@ use vpn_server::{
     build_router,
     ratelimit::LoginAttempts,
     repositories::{SqliteSessionRepository, SqliteUserRepository},
-    services::{Argon2Hasher, AuthService, JwtTokenIssuer},
+    services::{Argon2Hasher, AuthService, JwtTokenIssuer, UserService},
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
 };
@@ -51,6 +51,11 @@ async fn main() -> anyhow::Result<()> {
     let hasher: Arc<dyn vpn_core::service::PasswordHasher> = Arc::new(Argon2Hasher::new());
     let issuer = JwtTokenIssuer::load_or_generate(&PathBuf::from(&config.data_dir))
         .context("加载/生成 JWT 密钥失败")?;
+    let user_service = Arc::new(UserService::new(
+        user_repo.clone(),
+        session_repo.clone(),
+        hasher.clone(),
+    ));
     let auth_service = Arc::new(AuthService {
         user_repo,
         session_repo,
@@ -60,7 +65,9 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 构造 AppState + Router
-    let state = AppState::new().with_auth_service(auth_service);
+    let state = AppState::new()
+        .with_auth_service(auth_service)
+        .with_user_service(user_service);
     let app = build_router(state);
 
     // 监听端口
