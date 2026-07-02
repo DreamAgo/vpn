@@ -69,7 +69,9 @@ async fn main() -> anyhow::Result<()> {
         user_repo.clone(),
     ));
     // 网段目录服务:集中维护命名网段,供各处下拉选择。
-    let subnet_service = Arc::new(SubnetService::new(SqliteSubnetRepository::new(pool.clone())));
+    let subnet_service = Arc::new(SubnetService::new(SqliteSubnetRepository::new(
+        pool.clone(),
+    )));
     let auth_service = Arc::new(AuthService {
         user_repo,
         session_repo,

@@ -6,7 +6,7 @@
  * - 用户名/邮箱重复（DuplicateResource 3003）：在用户名字段下方报错，保留已填密码。
  */
 import { useState } from 'react';
-import { Modal, Form, Input, Button, App, Typography, Space } from 'antd';
+import { Modal, Form, Input, InputNumber, Button, App, Typography, Space } from 'antd';
 import { useMutation } from '@tanstack/react-query';
 
 import { usersApi } from '@/services/users';
@@ -22,6 +22,7 @@ interface FormValues {
   username: string;
   email: string;
   password: string;
+  maxDevices: number;
 }
 
 interface Props {
@@ -62,6 +63,7 @@ export function CreateUserModal({ open, onClose, onCreated }: Props) {
         username: values.username,
         email: values.email,
         password: values.password,
+        maxDevices: values.maxDevices,
       }),
     onSuccess: (data: CreateUserResponse) => {
       onCreated();
@@ -143,6 +145,16 @@ export function CreateUserModal({ open, onClose, onCreated }: Props) {
             ]}
           >
             <Input placeholder="user@example.com" />
+          </Form.Item>
+
+          <Form.Item
+            name="maxDevices"
+            label="终端数量上限"
+            initialValue={1}
+            rules={[{ required: true, message: '请输入终端数量上限' }]}
+            extra="该用户可同时注册的终端（设备）数量，默认 1"
+          >
+            <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
           </Form.Item>
 
           <Form.Item label="初始密码" required style={{ marginBottom: 0 }}>

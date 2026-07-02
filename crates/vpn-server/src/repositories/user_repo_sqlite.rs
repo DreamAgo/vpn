@@ -59,6 +59,7 @@ type UserRowTuple = (
     Option<i64>,
     i64,
     i64,
+    i64,
     Option<String>,
 );
 
@@ -75,9 +76,10 @@ impl From<UserRowTuple> for UserRow {
             last_login_at: r.7,
             created_at: r.8,
             updated_at: r.9,
+            max_devices: r.10,
             // group_concat 结果：CSV 或 NULL（无任何组）→ 解析为 Vec。
             group_ids: r
-                .10
+                .11
                 .map(|csv| {
                     csv.split(',')
                         .filter(|s| !s.is_empty())
@@ -101,6 +103,8 @@ pub struct UserRow {
     pub last_login_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 允许同时注册的终端数量上限（≥1，默认 1）。
+    pub max_devices: i64,
     /// 所属用户组 id 列表（可属多个组；未分组为空）。
     pub group_ids: Vec<String>,
 }
@@ -126,7 +130,7 @@ impl SqliteUserRepository {
     pub async fn find_by_username(&self, username: &str) -> Result<Option<UserRow>> {
         let row: Option<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                          last_login_at, created_at, updated_at,
+                          last_login_at, created_at, updated_at, max_devices,
                       (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                    FROM users WHERE username = ?1"#,
         )
@@ -140,7 +144,7 @@ impl SqliteUserRepository {
     pub async fn find_by_id(&self, id: &str) -> Result<Option<UserRow>> {
         let row: Option<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                          last_login_at, created_at, updated_at,
+                          last_login_at, created_at, updated_at, max_devices,
                       (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                    FROM users WHERE id = ?1"#,
         )
@@ -161,12 +165,13 @@ impl SqliteUserRepository {
         password_hash: &str,
         role: &str,
         must_change_password: bool,
+        max_devices: i64,
     ) -> Result<UserRow> {
         let now = Utc::now().timestamp_millis();
         let must_change = if must_change_password { 1 } else { 0 };
         let result = sqlx::query(
-            r#"INSERT INTO users (id, username, email, password_hash, role, status, must_change_password, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7)"#,
+            r#"INSERT INTO users (id, username, email, password_hash, role, status, must_change_password, max_devices, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?8)"#,
         )
         .bind(id)
         .bind(username)
@@ -174,6 +179,7 @@ impl SqliteUserRepository {
         .bind(password_hash)
         .bind(role)
         .bind(must_change)
+        .bind(max_devices)
         .bind(now)
         .execute(&self.pool)
         .await;
@@ -190,6 +196,7 @@ impl SqliteUserRepository {
                 last_login_at: None,
                 created_at: now,
                 updated_at: now,
+                max_devices,
                 group_ids: Vec::new(),
             }),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
@@ -239,6 +246,20 @@ impl SqliteUserRepository {
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(c.0 > 0)
+    }
+
+    /// 更新终端数量上限。返回受影响行数（0 表示用户不存在）。
+    pub async fn update_max_devices(&self, id: &str, max_devices: i64) -> Result<u64> {
+        let now = Utc::now().timestamp_millis();
+        let result =
+            sqlx::query("UPDATE users SET max_devices = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(max_devices)
+                .bind(now)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(result.rows_affected())
     }
 
     /// 更新用户状态（"active" | "disabled"）。返回受影响行数（0 表示用户不存在）。
@@ -304,7 +325,7 @@ impl SqliteUserRepository {
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                      last_login_at, created_at, updated_at,
+                      last_login_at, created_at, updated_at, max_devices,
                       (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                FROM users"#,
         );
@@ -396,6 +417,7 @@ mod tests {
                 "$argon2id$dummy",
                 "admin",
                 false,
+                1,
             )
             .await
             .unwrap();
@@ -412,11 +434,11 @@ mod tests {
     async fn duplicate_username_returns_error() {
         let pool = setup_pool().await;
         let repo = SqliteUserRepository::new(pool);
-        repo.insert("u1", "alice", "a@e.com", "h", "admin", false)
+        repo.insert("u1", "alice", "a@e.com", "h", "admin", false, 1)
             .await
             .unwrap();
         let err = repo
-            .insert("u2", "alice", "b@e.com", "h", "user", false)
+            .insert("u2", "alice", "b@e.com", "h", "user", false, 1)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::DuplicateResource(_)));
@@ -426,7 +448,7 @@ mod tests {
     async fn update_password_clears_must_change_flag() {
         let pool = setup_pool().await;
         let repo = SqliteUserRepository::new(pool);
-        repo.insert("u1", "alice", "a@e.com", "old", "user", true)
+        repo.insert("u1", "alice", "a@e.com", "old", "user", true, 1)
             .await
             .unwrap();
         let user = repo.find_by_id("u1").await.unwrap().unwrap();
@@ -474,7 +496,7 @@ mod tests {
     async fn update_status_disables_user() {
         let pool = setup_pool().await;
         let repo = SqliteUserRepository::new(pool);
-        repo.insert("u1", "alice", "a@e.com", "h", "user", false)
+        repo.insert("u1", "alice", "a@e.com", "h", "user", false, 1)
             .await
             .unwrap();
         let affected = repo.update_status("u1", "disabled").await.unwrap();
@@ -495,7 +517,7 @@ mod tests {
     async fn delete_with_sessions_removes_user_and_sessions() {
         let pool = setup_pool().await;
         let repo = SqliteUserRepository::new(pool.clone());
-        repo.insert("u1", "alice", "a@e.com", "h", "user", false)
+        repo.insert("u1", "alice", "a@e.com", "h", "user", false, 1)
             .await
             .unwrap();
         sqlx::query(
@@ -529,13 +551,13 @@ mod tests {
     async fn list_and_count_with_search_and_status() {
         let pool = setup_pool().await;
         let repo = SqliteUserRepository::new(pool);
-        repo.insert("u1", "alice", "alice@example.com", "h", "user", false)
+        repo.insert("u1", "alice", "alice@example.com", "h", "user", false, 1)
             .await
             .unwrap();
-        repo.insert("u2", "bob", "bob@example.com", "h", "user", false)
+        repo.insert("u2", "bob", "bob@example.com", "h", "user", false, 1)
             .await
             .unwrap();
-        repo.insert("u3", "carol", "carol@other.com", "h", "user", false)
+        repo.insert("u3", "carol", "carol@other.com", "h", "user", false, 1)
             .await
             .unwrap();
         repo.update_status("u3", "disabled").await.unwrap();
@@ -575,6 +597,7 @@ mod tests {
                 "h",
                 "user",
                 false,
+                1,
             )
             .await
             .unwrap();

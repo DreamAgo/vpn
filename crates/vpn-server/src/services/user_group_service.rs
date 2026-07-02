@@ -167,7 +167,10 @@ mod tests {
     async fn create_normalizes_routes() {
         let svc = setup().await;
         let g = svc
-            .create("ops", &["172.31.100.5/24".to_string(), "10.0.0.0/8".to_string()])
+            .create(
+                "ops",
+                &["172.31.100.5/24".to_string(), "10.0.0.0/8".to_string()],
+            )
             .await
             .unwrap();
         assert_eq!(g.name, "ops");
@@ -207,11 +210,13 @@ mod tests {
         ));
         // 建用户后,引用不存在的组 → Config
         svc.user_repo
-            .insert("u1", "alice", "a@e.com", "h", "user", false)
+            .insert("u1", "alice", "a@e.com", "h", "user", false, 1)
             .await
             .unwrap();
         assert!(matches!(
-            svc.set_user_groups("u1", &["nope".to_string()]).await.unwrap_err(),
+            svc.set_user_groups("u1", &["nope".to_string()])
+                .await
+                .unwrap_err(),
             AppError::ResourceNotFound(_)
         ));
         // 正常分配两个组(多组)

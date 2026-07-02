@@ -33,6 +33,7 @@ import type { UserDto } from '@/types/api';
 import { CreateUserModal } from '@/components/CreateUserModal';
 import { ResetPasswordModal } from '@/components/ResetPasswordModal';
 import { AssignGroupModal } from '@/components/AssignGroupModal';
+import { SetMaxDevicesModal } from '@/components/SetMaxDevicesModal';
 import { EmptyStateWithAction } from '@/components/EmptyStateWithAction';
 
 /** 渲染某用户所属的多个组名（从 groups 查询缓存解析）。 */
@@ -89,6 +90,7 @@ export function UsersPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [resetPwd, setResetPwd] = useState<string | null>(null);
   const [assignUser, setAssignUser] = useState<UserDto | null>(null);
+  const [maxDevUser, setMaxDevUser] = useState<UserDto | null>(null);
 
   const reload = useCallback(() => actionRef.current?.reload(), []);
 
@@ -171,6 +173,14 @@ export function UsersPage() {
         render: (_, record) => <GroupTags groupIds={record.groupIds} />,
       },
       {
+        title: '终端上限',
+        dataIndex: 'maxDevices',
+        width: 90,
+        render: (_, record) => (
+          <Tag color={record.maxDevices > 1 ? 'blue' : 'default'}>{record.maxDevices}</Tag>
+        ),
+      },
+      {
         title: '最后登录',
         dataIndex: 'lastLoginAt',
         width: 140,
@@ -223,6 +233,10 @@ export function UsersPage() {
                   {
                     key: 'assign-group',
                     label: <span onClick={() => setAssignUser(record)}>分配用户组</span>,
+                  },
+                  {
+                    key: 'max-devices',
+                    label: <span onClick={() => setMaxDevUser(record)}>设置终端上限</span>,
                   },
                   {
                     key: 'toggle',
@@ -358,6 +372,13 @@ export function UsersPage() {
         open={assignUser !== null}
         user={assignUser}
         onClose={() => setAssignUser(null)}
+        onSaved={reload}
+      />
+
+      <SetMaxDevicesModal
+        open={maxDevUser !== null}
+        user={maxDevUser}
+        onClose={() => setMaxDevUser(null)}
         onSaved={reload}
       />
     </div>

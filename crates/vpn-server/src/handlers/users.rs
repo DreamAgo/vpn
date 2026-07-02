@@ -40,7 +40,12 @@ pub async fn create_user(
 ) -> Result<Json<ApiResponse<CreateUserResponse>>, ApiError> {
     let svc = state.user_service()?;
     let resp = svc
-        .create_user(&body.username, &body.email, body.password.as_deref())
+        .create_user(
+            &body.username,
+            &body.email,
+            body.password.as_deref(),
+            body.max_devices,
+        )
         .await?;
     Ok(success(&state, resp))
 }
@@ -58,6 +63,8 @@ pub async fn list_users(
 }
 
 /// Story 3.3：PATCH /api/v1/admin/users/:id
+///
+/// 支持更新 status（启用/禁用）与 max_devices（终端数量上限），至少携带其一。
 #[tracing::instrument(skip(state, body))]
 pub async fn update_user(
     State(state): State<AppState>,
@@ -66,18 +73,24 @@ pub async fn update_user(
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<ApiResponse<UserDto>>, ApiError> {
     let svc = state.user_service()?;
-    let status = body
-        .status
-        .ok_or_else(|| AppError::Config("缺少 status 字段".to_string()))?;
-    let dto = svc.update_status(&id, &status).await?;
-    // 禁用即踢隧道:强制下线其节点(摘除 WG peer + 标记 force_removed,可恢复)。
-    // peer_service 未装配(如纯用户管理测试场景)则跳过这一联动副作用。
-    if status == "disabled" {
-        if let Ok(ps) = state.peer_service() {
-            ps.force_remove_by_user(&id).await?;
+    if body.status.is_none() && body.max_devices.is_none() {
+        return Err(AppError::Config("缺少 status / max_devices 字段".to_string()).into());
+    }
+    let mut dto = None;
+    if let Some(max_devices) = body.max_devices {
+        dto = Some(svc.update_max_devices(&id, max_devices).await?);
+    }
+    if let Some(status) = &body.status {
+        dto = Some(svc.update_status(&id, status).await?);
+        // 禁用即踢隧道:强制下线其节点(摘除 WG peer + 标记 force_removed,可恢复)。
+        // peer_service 未装配(如纯用户管理测试场景)则跳过这一联动副作用。
+        if status == "disabled" {
+            if let Ok(ps) = state.peer_service() {
+                ps.force_remove_by_user(&id).await?;
+            }
         }
     }
-    Ok(success(&state, dto))
+    Ok(success(&state, dto.expect("至少一个字段已校验")))
 }
 
 /// Story 3.4：POST /api/v1/admin/users/:id/reset-password
