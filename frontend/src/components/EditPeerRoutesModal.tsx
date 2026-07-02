@@ -1,5 +1,5 @@
 /**
- * 编辑节点「站点 LAN 网段（routed_subnets）」弹窗。
+ * 设置节点「站点网关（routed_subnets）」弹窗。
  *
  * - 表单用 Select mode="tags" 自由输入多个 IPv4 CIDR。
  * - 前端做基本 CIDR 校验（a.b.c.d/n，n 0-32）即时反馈。
@@ -39,7 +39,7 @@ export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
         values.routedSubnets.map((s) => s.trim()).filter((s) => s.length > 0)
       ),
     onSuccess: () => {
-      message.success('路由网段已保存');
+      message.success('站点网关设置已保存');
       onSaved();
       onClose();
     },
@@ -53,7 +53,7 @@ export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
           message.error('节点不存在或已被移除');
           return;
         }
-        message.error(err.message || '保存路由网段失败');
+        message.error(err.message || '保存站点网关设置失败');
         return;
       }
       message.error('网络异常，请稍后再试');
@@ -69,7 +69,7 @@ export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
     <Modal
       open={open}
       onCancel={handleCancel}
-      title="编辑路由网段"
+      title="设置站点网关"
       maskClosable={false}
       confirmLoading={mutation.isPending}
       okText="保存"
@@ -81,8 +81,8 @@ export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
         type="info"
         showIcon
         style={{ marginBottom: 16 }}
-        message="站点 LAN 网段"
-        description="该节点作为站点网关时背后的内网网段，保存后其他节点可经 VPN 访问这些网段。"
+        message="指定该节点可转发的站点网段"
+        description="填写网段后，该节点会作为这些 LAN 网段的站点网关；其他节点将通过安全链路访问这些网段。网关主机仍需在本机开启 IP 转发，并按现场网络配置路由或 NAT。"
       />
       <Form<FormValues>
         form={form}
@@ -95,7 +95,7 @@ export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
         <CidrRoutesSelect
           name="routedSubnets"
           label="LAN 网段（CIDR）"
-          extra="格式示例：192.168.10.0/24、10.0.0.0/8。可添加多个，留空表示无路由网段。"
+          extra="格式示例：192.168.10.0/24、10.0.0.0/8。可添加多个；留空表示该节点不作为站点网关。"
         />
       </Form>
     </Modal>

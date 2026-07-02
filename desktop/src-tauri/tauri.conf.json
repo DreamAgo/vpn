@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "VPN Client",
+  "productName": "易链",
   "version": "0.1.0",
   "identifier": "com.vpn.desktop",
   "build": {
@@ -14,13 +14,13 @@
     "windows": [
       {
         "label": "main",
-        "title": "VPN Client",
-        "width": 340,
-        "height": 500,
-        "minWidth": 340,
-        "minHeight": 500,
-        "maxWidth": 340,
-        "maxHeight": 500,
+        "title": "易链",
+        "width": 360,
+        "height": 560,
+        "minWidth": 360,
+        "minHeight": 560,
+        "maxWidth": 360,
+        "maxHeight": 560,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -38,6 +38,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -47,6 +48,14 @@
     ],
     "macOS": {
       "minimumSystemVersion": "10.15"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERBMUE1MDYxNENCRjVDNkEKUldScVhMOU1ZVkFhMnV5OHhjTmJ3TFdhcGtvdVZGRFVXemVISDQwWWZwQjRwVnI1U1laR2JDcXEK",
+      "endpoints": [
+        "https://github.com/DreamAgo/vpn/releases/latest/download/latest.json"
+      ]
     }
   }
 }

@@ -3,53 +3,100 @@ import {
   ConnState,
   StatusResponse,
   changePassword,
+  checkForUpdate,
   connect,
   disconnect,
+  getLaunchOnStartup,
   getStatus,
+  hideWindow,
+  installPendingUpdate,
   isLoggedIn,
   login,
   logout,
   notify,
   quitApp,
   savedServer,
+  setLaunchOnStartup,
+  syncTrayState,
 } from "./api";
 import { formatBytes, formatDuration } from "./format";
 
 const POLL_MS = 2500;
 
-// 仪表用语：每个状态一个简短的"信道"措辞 + 副标题。颜色由 CSS 的 [data-state] 驱动。
-const STATE_META: Record<ConnState, { word: string; sub: string }> = {
-  connected: { word: "SECURED", sub: "信道已加密" },
-  connecting: { word: "LINKING", sub: "正在协商握手" },
-  reconnecting: { word: "RELINKING", sub: "隧道保持 · 重连中" },
-  disconnected: { word: "OFFLINE", sub: "无活动信道" },
-  error: { word: "FAULT", sub: "信道已中断" },
+const STATE_META: Record<ConnState, { label: string; detail: string }> = {
+  connected: { label: "已连接", detail: "流量正在通过安全链路转发" },
+  connecting: { label: "连接中", detail: "正在建立安全隧道" },
+  reconnecting: { label: "重连中", detail: "网络波动,隧道正在恢复" },
+  disconnected: { label: "未连接", detail: "当前没有活动安全链路" },
+  error: { label: "连接异常", detail: "需要处理后重新连接" },
 };
+
+type SettingsTab = "connection" | "updates" | "account";
+type ActivityEntry = {
+  id: number;
+  time: string;
+  title: string;
+  detail?: string;
+};
+
+async function copyText(value: string | null | undefined): Promise<void> {
+  const text = value?.trim();
+  if (!text || text === "--") return;
+  await navigator.clipboard?.writeText(text).catch(() => {});
+}
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
+  const [server, setServer] = useState<string>("");
   const [busy, setBusy] = useState(false);
-  const [tick, setTick] = useState(0); // drives the live duration counter
+  const [tick, setTick] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("connection");
   const [showChangePwd, setShowChangePwd] = useState(false);
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [updateBody, setUpdateBody] = useState<string | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<string | null>(null);
+  const [launchOnStartup, setLaunchOnStartupState] = useState(false);
+  const [startupBusy, setStartupBusy] = useState(false);
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [toast, setToast] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
-  // 上一次的连接状态，用于检测跃迁(只在真正切换时发原生通知，避免刷屏)。
   const prevStateRef = useRef<ConnState | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+
+  const addActivity = useCallback((title: string, detail?: string) => {
+    setActivity((items) => [
+      {
+        id: Date.now(),
+        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        title,
+        detail,
+      },
+      ...items,
+    ].slice(0, 5));
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
-      const li = await isLoggedIn();
+      const [li, saved] = await Promise.all([isLoggedIn(), savedServer()]);
+      setServer(saved ?? "");
       if (!li) {
+        void syncTrayState("disconnected");
         setLoggedIn(false);
         return;
       }
+
       const s = await getStatus();
       const prev = prevStateRef.current;
+      void syncTrayState(s.state);
 
-      // 被管理员强制下线:清凭证、回登录页并发原生通知。
       if (s.state === "error" && (s.last_error ?? "").includes("强制下线")) {
         prevStateRef.current = null;
+        void syncTrayState("disconnected");
         await logout().catch(() => {});
         setStatus(null);
         setLoggedIn(false);
@@ -57,14 +104,24 @@ export default function App() {
         return;
       }
 
-      // 状态跃迁 → 原生通知(仅在真正切换时,避免每次轮询刷屏)。
       if (prev && prev !== s.state) {
         if (s.state === "reconnecting") {
-          void notify("连接中断", "网络异常,正在自动重连…");
+          addActivity("网络波动", "正在自动重连");
+          void notify("连接中断", "网络异常,正在自动重连。");
         } else if (s.state === "connected" && prev === "reconnecting") {
-          void notify("已重新连接", "VPN 连接已恢复。");
+          setLastError(null);
+          addActivity("已重新连接", "安全链路已恢复");
+          void notify("已重新连接", "安全链路已恢复。");
         } else if (s.state === "error") {
-          void notify("连接出错", s.last_error ?? "连接已断开。");
+          const detail = s.last_error ?? "连接已断开。";
+          setLastError(detail);
+          addActivity("连接异常", detail);
+          void notify("连接出错", detail);
+        } else if (s.state === "connected") {
+          setLastError(null);
+          addActivity("已连接");
+        } else if (s.state === "disconnected") {
+          addActivity("已断开连接");
         }
       }
       prevStateRef.current = s.state;
@@ -72,29 +129,76 @@ export default function App() {
       setStatus(s);
       setLoggedIn(true);
     } catch {
-      // Backend unreachable: stay on whatever we have, don't crash.
+      // Keep the previous UI state if the backend command temporarily fails.
     }
-  }, []);
+  }, [addActivity]);
 
   useEffect(() => {
     refresh();
     pollRef.current = window.setInterval(refresh, POLL_MS);
-    const t = window.setInterval(() => setTick((x) => x + 1), 1000);
+    const timer = window.setInterval(() => setTick((x) => x + 1), 1000);
     return () => {
       if (pollRef.current) window.clearInterval(pollRef.current);
-      window.clearInterval(t);
+      window.clearInterval(timer);
     };
   }, [refresh]);
 
-  // touch tick so the duration re-renders every second
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    getLaunchOnStartup()
+      .then(setLaunchOnStartupState)
+      .catch(() => setLaunchOnStartupState(false));
+  }, []);
+
+  const checkUpdates = useCallback(async (manual = false) => {
+    setUpdateBusy(true);
+    setUpdateMessage(null);
+    setUpdateProgress(null);
+    try {
+      const result = await checkForUpdate();
+      if (result.available && result.version) {
+        setUpdateVersion(result.version);
+        setUpdateBody(result.body);
+        setUpdateMessage(`发现新版本 ${result.version}`);
+        if (!manual) void notify("发现新版本", `易链 ${result.version} 可更新。`);
+      } else {
+        setUpdateVersion(null);
+        setUpdateBody(null);
+        setUpdateMessage("当前已是最新版本");
+        if (manual) void notify("已是最新版本", "易链当前无需更新。");
+      }
+    } catch (e) {
+      setUpdateMessage(`检查更新失败: ${String(e)}`);
+    } finally {
+      setUpdateBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void checkUpdates(false);
+    }, 3500);
+    return () => window.clearTimeout(timer);
+  }, [checkUpdates]);
+
   void tick;
 
   const onConnect = async () => {
     setBusy(true);
+    addActivity("开始连接");
     try {
       await connect();
+      setLastError(null);
     } catch (e) {
-      void notify("连接失败", String(e));
+      const detail = String(e);
+      setLastError(detail);
+      addActivity("连接失败", detail);
+      void notify("连接失败", detail);
     } finally {
       setBusy(false);
       refresh();
@@ -103,10 +207,15 @@ export default function App() {
 
   const onDisconnect = async () => {
     setBusy(true);
+    addActivity("正在断开连接");
     try {
       await disconnect();
+      addActivity("已断开连接");
     } catch (e) {
-      void notify("断开失败", String(e));
+      const detail = String(e);
+      setLastError(detail);
+      addActivity("断开失败", detail);
+      void notify("断开失败", detail);
     } finally {
       setBusy(false);
       refresh();
@@ -117,6 +226,7 @@ export default function App() {
     setBusy(true);
     try {
       await logout();
+      addActivity("已登出账号");
       setShowSettings(false);
       setLoggedIn(false);
       setStatus(null);
@@ -127,14 +237,63 @@ export default function App() {
     }
   };
 
+  const onToggleLaunchOnStartup = async (enabled: boolean) => {
+    setStartupBusy(true);
+    try {
+      await setLaunchOnStartup(enabled);
+      setLaunchOnStartupState(enabled);
+      addActivity(enabled ? "已启用开机自启" : "已关闭开机自启");
+    } catch (e) {
+      const detail = String(e);
+      setLastError(detail);
+      addActivity("开机自启设置失败", detail);
+      void notify("开机自启设置失败", detail);
+    } finally {
+      setStartupBusy(false);
+    }
+  };
+
+  const onQuit = () => {
+    const currentState = status?.state ?? "disconnected";
+    const hasActiveLink =
+      currentState === "connected" ||
+      currentState === "connecting" ||
+      currentState === "reconnecting";
+    if (hasActiveLink || busy) {
+      const ok = window.confirm("当前安全链路可能仍在运行。退出易链会停止托盘进程，确定退出吗？");
+      if (!ok) return;
+    }
+    void quitApp();
+  };
+
+  const onCopy = (value: string | null | undefined, label: string) => {
+    void copyText(value).then(() => {
+      setToast(`已复制${label}`);
+      if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = window.setTimeout(() => setToast(null), 1600);
+    });
+    addActivity(`已复制${label}`);
+  };
+
+  const onInstallUpdate = async () => {
+    setUpdateBusy(true);
+    setUpdateMessage("正在下载更新...");
+    try {
+      await installPendingUpdate(({ downloaded, total }) => {
+        if (total && total > 0) {
+          setUpdateProgress(`${Math.round((downloaded / total) * 100)}%`);
+        } else {
+          setUpdateProgress(formatBytes(downloaded));
+        }
+      });
+    } catch (e) {
+      setUpdateMessage(`安装更新失败: ${String(e)}`);
+      setUpdateBusy(false);
+    }
+  };
+
   if (loggedIn === null) {
-    return (
-      <div className="panel boot" data-state="disconnected" data-tauri-drag-region>
-        <Grain />
-        <span className="boot-dot" />
-        <span className="boot-text">INITIALIZING</span>
-      </div>
-    );
+    return <BootView />;
   }
 
   if (!loggedIn) {
@@ -152,105 +311,103 @@ export default function App() {
   const meta = STATE_META[state];
   const connected = state === "connected";
   const reconnecting = state === "reconnecting";
-  // 重连时隧道仍在(boringtun 自动重握手),允许手动断开;仅首次建连禁用按钮。
   const tunnelUp = connected || reconnecting;
   const connecting = state === "connecting";
 
   return (
-    <div className="panel" data-state={state} data-tauri-drag-region>
-      <Grain />
-
-      <header className="topbar" data-tauri-drag-region>
-        <div className="mark" data-tauri-drag-region>
-          <span className="mark-node" />
-          <span className="mark-name">CIPHER</span>
+    <div className="app-shell" data-state={state} data-tauri-drag-region>
+      <header className="appbar" data-tauri-drag-region>
+        <Brand />
+        <div className="top-actions">
+          <IconButton
+            title="设置"
+            onClick={() => setShowSettings(true)}
+            active={showSettings}
+          >
+            <SettingsIcon />
+          </IconButton>
+          <WindowControls />
         </div>
-        <button
-          className="gear"
-          title="设置"
-          aria-label="设置"
-          onClick={() => setShowSettings((v) => !v)}
-        >
-          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
-            <path
-              fill="currentColor"
-              d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm0 5.5a2 2 0 1 1 0-4 2 2 0 0 1 0 4Z"
-            />
-            <path
-              fill="currentColor"
-              d="m20.3 13.6-.1-1.6.1-1.6 1.6-1.3-1.6-2.8-2 .6-1.4-.8-.5-2H9.6l-.5 2-1.4.8-2-.6L4.1 9l1.6 1.3-.1 1.6.1 1.6L4.1 16l1.6 2.8 2-.6 1.4.8.5 2h2.8l.5-2 1.4-.8 2 .6 1.6-2.8-1.6-1.4Z"
-              opacity=".0"
-            />
-          </svg>
-        </button>
       </header>
 
-      <section className="stage">
-        <SignalOrb state={state} />
-        <div className="state-word">{meta.word}</div>
-        <div className="state-sub">
-          {state === "error" && status?.last_error
-            ? status.last_error
-            : meta.sub}
-        </div>
-      </section>
-
-      <div className="readouts">
-        <Readout label="ADDR" value={status?.vpn_ip ?? "—"} mono />
-        <Readout
-          label="UPTIME"
-          value={status?.since ? formatDuration(status.since) : "—"}
-          mono
-        />
-        <Readout label="↓ RECV" value={formatBytes(status?.bytes_rx ?? 0)} mono />
-        <Readout label="↑ SENT" value={formatBytes(status?.bytes_tx ?? 0)} mono />
-      </div>
-
-      {reconnecting && (
-        <div className="hint">网络异常,正在自动重连,隧道保持中…</div>
-      )}
-
-      <button
-        className={`exec ${tunnelUp ? "is-down" : "is-up"}`}
-        disabled={busy || connecting}
-        onClick={tunnelUp ? onDisconnect : onConnect}
-      >
-        {busy || connecting ? (
-          <span className="spinner" />
-        ) : (
-          <>
-            <span className="exec-bracket">[</span>
-            {tunnelUp ? "断开连接" : "建立连接"}
-            <span className="exec-bracket">]</span>
-          </>
-        )}
-      </button>
-
-      {showSettings && (
-        <>
-          <div className="sheet-scrim" onClick={() => setShowSettings(false)} />
-          <div className="sheet" role="dialog" aria-label="设置">
-            <div className="sheet-title">CONFIG</div>
-            <ServerSetting />
-            <button
-              className="ghost"
-              onClick={() => {
-                setShowSettings(false);
-                setShowChangePwd(true);
-              }}
-            >
-              修改密码
-            </button>
-            <div className="sheet-actions">
-              <button className="ghost" disabled={busy} onClick={onLogout}>
-                登出
-              </button>
-              <button className="ghost danger" onClick={() => quitApp()}>
-                退出 App
-              </button>
+      <main className="content">
+        <section className="status-card">
+          <div className="status-head">
+            <StatusGlyph state={state} />
+            <div className="status-copy">
+              <div className="status-kicker">链路状态</div>
+              <div className="status-title">{meta.label}</div>
+              <div className="status-detail">
+                {state === "error" && status?.last_error ? status.last_error : meta.detail}
+              </div>
             </div>
           </div>
-        </>
+
+          <button
+            className={`primary-action ${tunnelUp ? "disconnect" : "connect"}`}
+            disabled={busy || connecting}
+            onClick={tunnelUp ? onDisconnect : onConnect}
+          >
+            {busy || connecting ? <span className="spinner" /> : tunnelUp ? "断开连接" : "建立安全链路"}
+          </button>
+        </section>
+
+        {reconnecting && <div className="notice">网络异常,正在自动恢复连接。</div>}
+
+        <section className="metric-grid">
+          <Metric label="专属地址" value={status?.vpn_ip ?? "--"} onCopy={() => onCopy(status?.vpn_ip, "专属地址")} />
+          <Metric label="连接时长" value={status?.since ? formatDuration(status.since) : "--"} />
+          <Metric label="接收" value={formatBytes(status?.bytes_rx ?? 0)} />
+          <Metric label="发送" value={formatBytes(status?.bytes_tx ?? 0)} />
+        </section>
+
+        <section className="endpoint-card">
+          <div>
+            <div className="small-label">服务端</div>
+            <button className="copy-value endpoint-value" onClick={() => onCopy(server, "服务端地址")}>
+              {server || "--"}
+            </button>
+          </div>
+          <button
+            className="text-button"
+            onClick={() => {
+              setSettingsTab("connection");
+              setShowSettings(true);
+            }}
+          >
+            详情
+          </button>
+        </section>
+      </main>
+
+      {showSettings && (
+        <SettingsPanel
+          tab={settingsTab}
+          onTabChange={setSettingsTab}
+          onClose={() => setShowSettings(false)}
+          status={status}
+          server={server}
+          busy={busy}
+          updateBusy={updateBusy}
+          updateVersion={updateVersion}
+          updateBody={updateBody}
+          updateMessage={updateMessage}
+          updateProgress={updateProgress}
+          launchOnStartup={launchOnStartup}
+          startupBusy={startupBusy}
+          lastError={lastError}
+          activity={activity}
+          onRefresh={refresh}
+          onCheckUpdates={() => checkUpdates(true)}
+          onInstallUpdate={onInstallUpdate}
+          onToggleLaunchOnStartup={onToggleLaunchOnStartup}
+          onChangePassword={() => {
+            setShowSettings(false);
+            setShowChangePwd(true);
+          }}
+          onLogout={onLogout}
+          onQuit={onQuit}
+        />
       )}
 
       {showChangePwd && (
@@ -264,49 +421,274 @@ export default function App() {
           }}
         />
       )}
+
+      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }
 
-function SignalOrb({ state }: { state: ConnState }) {
+function Brand() {
   return (
-    <div className="orb" data-state={state} aria-hidden="true">
-      <span className="orb-ring r1" />
-      <span className="orb-ring r2" />
-      <span className="orb-ring r3" />
-      <span className="orb-sweep" />
-      <span className="orb-core" />
+    <div className="brand" data-tauri-drag-region>
+      <div className="brand-mark">易</div>
+      <div>
+        <div className="brand-name">易链</div>
+        <div className="brand-sub">安全接入中枢</div>
+      </div>
     </div>
   );
 }
 
-function Readout({
-  label,
-  value,
-  mono,
+function BootView() {
+  return (
+    <div className="app-shell boot" data-state="disconnected" data-tauri-drag-region>
+      <div className="boot-controls">
+        <WindowControls />
+      </div>
+      <div className="boot-card">
+        <div className="brand-mark">易</div>
+        <div className="boot-text">正在启动...</div>
+      </div>
+    </div>
+  );
+}
+
+function WindowControls() {
+  const hideToTray = () => {
+    void hideWindow();
+  };
+
+  return (
+    <div className="window-controls">
+      <IconButton title="最小化到托盘" onClick={hideToTray}>
+        <MinimizeIcon />
+      </IconButton>
+      <IconButton title="关闭到托盘" onClick={hideToTray}>
+        <CloseIcon />
+      </IconButton>
+    </div>
+  );
+}
+
+function StatusGlyph({ state }: { state: ConnState }) {
+  return (
+    <div className="status-glyph" data-state={state} aria-hidden="true">
+      <span className="glyph-ring" />
+      <span className="glyph-core" />
+      <span className="glyph-check" />
+    </div>
+  );
+}
+
+function Metric({ label, value, onCopy }: { label: string; value: string; onCopy?: () => void }) {
+  return (
+    <div className="metric">
+      <span className="small-label">{label}</span>
+      {onCopy ? (
+        <button className="copy-value metric-value" onClick={onCopy}>
+          {value}
+        </button>
+      ) : (
+        <span className="metric-value">{value}</span>
+      )}
+    </div>
+  );
+}
+
+function InfoRow({ label, value, onCopy }: { label: string; value: string; onCopy?: () => void }) {
+  return (
+    <div className="info-row">
+      <span>{label}</span>
+      {onCopy ? (
+        <button className="copy-value info-value" onClick={onCopy}>
+          {value}
+        </button>
+      ) : (
+        <strong>{value}</strong>
+      )}
+    </div>
+  );
+}
+
+function SettingsPanel({
+  tab,
+  onTabChange,
+  onClose,
+  status,
+  server,
+  busy,
+  updateBusy,
+  updateVersion,
+  updateBody,
+  updateMessage,
+  updateProgress,
+  launchOnStartup,
+  startupBusy,
+  lastError,
+  activity,
+  onRefresh,
+  onCheckUpdates,
+  onInstallUpdate,
+  onToggleLaunchOnStartup,
+  onChangePassword,
+  onLogout,
+  onQuit,
 }: {
-  label: string;
-  value: string;
-  mono?: boolean;
+  tab: SettingsTab;
+  onTabChange: (tab: SettingsTab) => void;
+  onClose: () => void;
+  status: StatusResponse | null;
+  server: string;
+  busy: boolean;
+  updateBusy: boolean;
+  updateVersion: string | null;
+  updateBody: string | null;
+  updateMessage: string | null;
+  updateProgress: string | null;
+  launchOnStartup: boolean;
+  startupBusy: boolean;
+  lastError: string | null;
+  activity: ActivityEntry[];
+  onRefresh: () => void;
+  onCheckUpdates: () => void;
+  onInstallUpdate: () => void;
+  onToggleLaunchOnStartup: (enabled: boolean) => void;
+  onChangePassword: () => void;
+  onLogout: () => void;
+  onQuit: () => void;
 }) {
-  return (
-    <div className="cell">
-      <span className="cell-label">{label}</span>
-      <span className={`cell-value${mono ? " mono" : ""}`}>{value}</span>
-    </div>
-  );
-}
+  const state = status?.state ?? "disconnected";
+  const stateLabel = STATE_META[state].label;
+  const copyDiagnostics = async () => {
+    const diagnostic = [
+      `产品: 易链`,
+      `状态: ${stateLabel}`,
+      `服务端: ${server || "--"}`,
+      `专属地址: ${status?.vpn_ip ?? "--"}`,
+      `最后错误: ${lastError ?? status?.last_error ?? "--"}`,
+      `时间: ${new Date().toISOString()}`,
+    ].join("\n");
+    await navigator.clipboard?.writeText(diagnostic).catch(() => {});
+  };
 
-function ServerSetting() {
-  const [server, setServer] = useState<string>("");
-  useEffect(() => {
-    savedServer().then((s) => setServer(s ?? ""));
-  }, []);
   return (
-    <div className="cell wide">
-      <span className="cell-label">ENDPOINT</span>
-      <span className="cell-value mono">{server || "—"}</span>
-    </div>
+    <>
+      <div className="scrim" onClick={onClose} />
+      <aside className="settings-panel" role="dialog" aria-label="设置">
+        <div className="panel-head">
+          <div>
+            <div className="panel-title">设置</div>
+            <div className="panel-sub">连接、更新与账号</div>
+          </div>
+          <IconButton title="关闭" onClick={onClose}>
+            <CloseIcon />
+          </IconButton>
+        </div>
+
+        <div className="tabs" role="tablist">
+          <button className={tab === "connection" ? "active" : ""} onClick={() => onTabChange("connection")}>
+            连接
+          </button>
+          <button className={tab === "updates" ? "active" : ""} onClick={() => onTabChange("updates")}>
+            更新
+          </button>
+          <button className={tab === "account" ? "active" : ""} onClick={() => onTabChange("account")}>
+            账号
+          </button>
+        </div>
+
+        <div className="tab-body">
+          {tab === "connection" && (
+            <div className="stack">
+              <div className="inline-card">
+                <div className="inline-title">权限提示</div>
+                <div className="inline-note">
+                  首次建立安全链路需要管理员权限来创建系统隧道。窗口关闭后会保留托盘运行，可从托盘重新打开。
+                </div>
+              </div>
+              <InfoRow label="状态" value={stateLabel} />
+              <InfoRow label="服务端" value={server || "--"} onCopy={() => void copyText(server)} />
+              <InfoRow label="专属地址" value={status?.vpn_ip ?? "--"} onCopy={() => void copyText(status?.vpn_ip)} />
+              <InfoRow label="连接时长" value={status?.since ? formatDuration(status.since) : "--"} />
+              {(lastError || status?.last_error) && (
+                <div className="inline-card error-card">
+                  <div className="inline-title">错误详情</div>
+                  <div className="inline-note">{lastError ?? status?.last_error}</div>
+                  <button className="secondary-action compact" onClick={copyDiagnostics}>
+                    复制诊断信息
+                  </button>
+                </div>
+              )}
+              <div className="inline-card">
+                <div className="inline-title">连接日志</div>
+                {activity.length > 0 ? (
+                  <div className="activity-list">
+                    {activity.map((item) => (
+                      <div className="activity-item" key={item.id}>
+                        <span>{item.time}</span>
+                        <strong>{item.title}</strong>
+                        {item.detail && <em>{item.detail}</em>}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="inline-note">暂无连接事件</div>
+                )}
+              </div>
+              <button className="secondary-action" onClick={onRefresh}>
+                刷新状态
+              </button>
+            </div>
+          )}
+
+          {tab === "updates" && (
+            <div className="stack">
+              <div className="update-card">
+                <div className="update-title">
+                  {updateVersion ? `发现新版本 ${updateVersion}` : updateMessage ?? "自动检查已启用"}
+                </div>
+                {updateBody && <div className="update-note">{updateBody}</div>}
+                {updateProgress && <div className="update-note">下载进度: {updateProgress}</div>}
+              </div>
+              <button className="secondary-action" disabled={updateBusy} onClick={onCheckUpdates}>
+                {updateBusy ? "检查中..." : "检查更新"}
+              </button>
+              {updateVersion && (
+                <button className="primary-action connect compact" disabled={updateBusy} onClick={onInstallUpdate}>
+                  {updateBusy ? "更新中..." : "安装并重启"}
+                </button>
+              )}
+            </div>
+          )}
+
+          {tab === "account" && (
+            <div className="stack">
+              <label className="toggle-row">
+                <span>
+                  <strong>开机自启</strong>
+                  <em>登录系统后自动启动易链并驻留托盘</em>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={launchOnStartup}
+                  disabled={startupBusy}
+                  onChange={(event) => onToggleLaunchOnStartup(event.target.checked)}
+                />
+              </label>
+              <button className="secondary-action" onClick={onChangePassword}>
+                修改密码
+              </button>
+              <button className="secondary-action" disabled={busy} onClick={onLogout}>
+                登出账号
+              </button>
+              <button className="secondary-action danger" onClick={onQuit}>
+                退出 App
+              </button>
+            </div>
+          )}
+        </div>
+      </aside>
+    </>
   );
 }
 
@@ -323,7 +705,6 @@ function ChangePasswordSheet({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // 与服务端口径一致:≥8 位 + 含字母 + 含数字。
   const strong = next.length >= 8 && /[a-zA-Z]/.test(next) && /[0-9]/.test(next);
   const valid = cur.length > 0 && strong && next === confirm;
 
@@ -348,59 +729,34 @@ function ChangePasswordSheet({
 
   return (
     <>
-      <div className="sheet-scrim" onClick={() => !busy && onClose()} />
-      <div className="sheet" role="dialog" aria-label="修改密码">
-        <div className="sheet-title">修改密码</div>
-        <form className="auth-form" onSubmit={submit} style={{ gap: 11 }}>
+      <div className="scrim" onClick={() => !busy && onClose()} />
+      <aside className="settings-panel password-panel" role="dialog" aria-label="修改密码">
+        <div className="panel-head">
+          <div>
+            <div className="panel-title">修改密码</div>
+            <div className="panel-sub">更新后需要重新登录</div>
+          </div>
+          <IconButton title="关闭" onClick={onClose} disabled={busy}>
+            <CloseIcon />
+          </IconButton>
+        </div>
+        <form className="form-stack" onSubmit={submit}>
           <Field label="当前密码">
-            <input
-              type="password"
-              value={cur}
-              autoFocus
-              onChange={(e) => setCur(e.target.value)}
-            />
+            <input type="password" value={cur} autoFocus onChange={(e) => setCur(e.target.value)} />
           </Field>
-          <Field label="新密码 · 至少 8 位且含字母与数字">
-            <input
-              type="password"
-              value={next}
-              onChange={(e) => setNext(e.target.value)}
-            />
+          <Field label="新密码">
+            <input type="password" value={next} onChange={(e) => setNext(e.target.value)} />
           </Field>
           <Field label="确认新密码">
-            <input
-              type="password"
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-            />
+            <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
           </Field>
-          {err && <div className="auth-err">{err}</div>}
-          <button
-            type="submit"
-            className="exec is-up"
-            disabled={busy || !valid}
-            style={{ marginTop: 4 }}
-          >
-            {busy ? (
-              <span className="spinner" />
-            ) : (
-              <>
-                <span className="exec-bracket">[</span>
-                确认修改
-                <span className="exec-bracket">]</span>
-              </>
-            )}
-          </button>
-          <button
-            type="button"
-            className="ghost"
-            disabled={busy}
-            onClick={onClose}
-          >
-            取消
+          {!strong && next.length > 0 && <div className="form-note">至少 8 位,且同时包含字母和数字。</div>}
+          {err && <div className="form-error">{err}</div>}
+          <button type="submit" className="primary-action connect compact" disabled={busy || !valid}>
+            {busy ? "提交中..." : "确认修改"}
           </button>
         </form>
-      </div>
+      </aside>
     </>
   );
 }
@@ -433,70 +789,53 @@ function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
   };
 
   return (
-    <div className="panel auth" data-state="disconnected" data-tauri-drag-region>
-      <Grain />
-      <header className="topbar" data-tauri-drag-region>
-        <div className="mark" data-tauri-drag-region>
-          <span className="mark-node" />
-          <span className="mark-name">CIPHER</span>
-        </div>
+    <div className="app-shell auth-shell" data-state="disconnected" data-tauri-drag-region>
+      <header className="appbar" data-tauri-drag-region>
+        <Brand />
+        <WindowControls />
       </header>
-
-      <div className="auth-head">
-        <div className="auth-title">ESTABLISH IDENTITY</div>
-        <div className="auth-tag">authenticate to open a secure channel</div>
-      </div>
-
-      <form className="auth-form" onSubmit={submit}>
-        <Field label="ENDPOINT">
-          <input
-            type="text"
-            value={server}
-            placeholder="https://vpn.example.com"
-            autoCapitalize="off"
-            autoCorrect="off"
-            spellCheck={false}
-            onChange={(e) => setServer(e.target.value)}
-          />
-        </Field>
-        <Field label="OPERATOR">
-          <input
-            type="text"
-            value={username}
-            placeholder="username"
-            autoCapitalize="off"
-            autoCorrect="off"
-            spellCheck={false}
-            onChange={(e) => setUsername(e.target.value)}
-          />
-        </Field>
-        <Field label="KEY">
-          <input
-            type="password"
-            value={password}
-            placeholder="••••••••"
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </Field>
-
-        {err && <div className="auth-err">{err}</div>}
-
-        <button
-          type="submit"
-          className="exec is-up"
-          disabled={busy || !server || !username || !password}
-        >
-          {busy ? (
-            <span className="spinner" />
-          ) : (
-            <>
-              <span className="exec-bracket">[</span>
-              登录
-              <span className="exec-bracket">]</span>
-            </>
-          )}
-        </button>
-      </form>
+      <main className="login-content">
+        <div className="login-copy">
+          <div className="login-title">登录客户端</div>
+          <div className="login-sub">连接到你的安全接入控制面</div>
+        </div>
+        <form className="form-stack" onSubmit={submit}>
+          <Field label="服务端地址">
+            <input
+              type="text"
+              value={server}
+              placeholder="https://access.example.com"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              onChange={(e) => setServer(e.target.value)}
+            />
+          </Field>
+          <Field label="用户名">
+            <input
+              type="text"
+              value={username}
+              placeholder="username"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </Field>
+          <Field label="密码">
+            <input
+              type="password"
+              value={password}
+              placeholder="password"
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </Field>
+          {err && <div className="form-error">{err}</div>}
+          <button className="primary-action connect" disabled={busy || !server || !username || !password}>
+            {busy ? "登录中..." : "登录"}
+          </button>
+        </form>
+      </main>
     </div>
   );
 }
@@ -511,11 +850,58 @@ function Field({
   return (
     <label className="field">
       <span className="field-label">{label}</span>
-      <div className="field-input">{children}</div>
+      {children}
     </label>
   );
 }
 
-function Grain() {
-  return <div className="grain" aria-hidden="true" />;
+function IconButton({
+  title,
+  children,
+  onClick,
+  disabled,
+  active,
+}: {
+  title: string;
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  active?: boolean;
+}) {
+  return (
+    <button
+      className={`icon-button${active ? " active" : ""}`}
+      title={title}
+      aria-label={title}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+function SettingsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <path fill="currentColor" d="M19.4 13.5c.1-.5.1-1 .1-1.5s0-1-.1-1.5l2-1.5-2-3.4-2.4 1a8 8 0 0 0-2.6-1.5L14 2.5h-4l-.4 2.6A8 8 0 0 0 7 6.6l-2.4-1-2 3.4 2 1.5a9 9 0 0 0 0 3l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 2.6 1.5l.4 2.6h4l.4-2.6a8 8 0 0 0 2.6-1.5l2.4 1 2-3.4zM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5z" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <path fill="currentColor" d="m6.4 5 12.6 12.6-1.4 1.4L5 6.4z" />
+      <path fill="currentColor" d="M17.6 5 5 17.6 6.4 19 19 6.4z" />
+    </svg>
+  );
+}
+
+function MinimizeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <path fill="currentColor" d="M5 11h14v2H5z" />
+    </svg>
+  );
 }

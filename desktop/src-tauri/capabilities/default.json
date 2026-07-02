@@ -13,6 +13,9 @@
     "core:event:default",
     "core:app:default",
     "shell:allow-open",
-    "notification:default"
+    "notification:default",
+    "process:default",
+    "updater:default",
+    "autostart:default"
   ]
 }
