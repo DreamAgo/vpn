@@ -148,7 +148,11 @@ impl UserspaceTunnel {
         let mut udp_connected: Option<(UdpSocket, SocketAddr)> = None;
         let mut last_err: Option<String> = None;
         for addr in &server_addrs {
-            let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+            let bind_addr = if addr.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
             match UdpSocket::bind(bind_addr).await {
                 Ok(sock) => match sock.connect(*addr).await {
                     Ok(()) => {
@@ -202,7 +206,16 @@ impl UserspaceTunnel {
 
         // 6) 后台转发任务。返回其 JoinHandle,供上层在重连时等待旧任务清完路由再建新隧道。
         let task = tokio::spawn(forward_loop(
-            device, udp, tunn, handle, added, ifindex, shutdown, shutdown_tx, traffic, routes_rx,
+            device,
+            udp,
+            tunn,
+            handle,
+            added,
+            ifindex,
+            shutdown,
+            shutdown_tx,
+            traffic,
+            routes_rx,
         ));
         Ok(task)
     }
