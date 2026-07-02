@@ -495,13 +495,15 @@ impl PeerService {
             return Ok(());
         }
         let news: Vec<Ipv4Net> = new_subnets.iter().filter_map(|s| s.parse().ok()).collect();
-        // 站点网段不得覆盖/重叠 VPN 子网本身。否则 configure_peer 会对该网段执行
-        // `ip route replace <subnet> dev wg0`,把服务端到 VPN 子网(乃至其超网,如 10.0.0.0/8)
-        // 的路由整段劫持进 wg 接口,断掉服务端对未分配 VPN IP / 同段其它主机的可达性。
+        // 站点网段不得**落在 VPN 子网内部或等于 VPN 子网**——那样它比 VPN 子网的连通路由
+        // 更具体,会真正劫持 VPN 子网内地址。若站点段是 VPN 子网的**超网**(如 10.0.0.0/8 ⊃
+        // 10.8.0.0/24)则放行:内核路由与 wg allowed-ips 均按**最长前缀匹配**,更具体的 VPN
+        // 子网(/24)及各客户端(/32)优先命中自身,VPN 子网可达性不受影响(仅未分配的 VPN IP 会
+        // 被导向该网关,无害)。据路由优先级判定,不再对超网一刀切拒绝。
         for n in &news {
-            if Self::nets_overlap(n, &self.subnet) {
+            if self.subnet.contains(n) {
                 return Err(AppError::Validation(format!(
-                    "站点网段 {n} 与 VPN 子网 {} 重叠,请改用不冲突的网段",
+                    "站点网段 {n} 落在 VPN 子网 {} 内,请改用 VPN 子网以外(或其超网)的网段",
                     self.subnet
                 )));
             }
@@ -2093,5 +2095,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "offline");
+    }
+
+    #[tokio::test]
+    async fn gateway_route_supernet_of_vpn_allowed_but_inside_rejected() {
+        // VPN 子网 = 10.8.0.0/24（见 service() helper）。
+        // 超网 10.0.0.0/8 ⊃ VPN 子网 → 放行（靠最长前缀保护 VPN 子网）。
+        let svc = service(setup_pool().await);
+        let mut r = reg("PKGW");
+        r.routed_subnets = vec!["10.0.0.0/8".to_string()];
+        let resp = svc.register("user-1", &r).await;
+        assert!(resp.is_ok(), "VPN 子网的超网应放行，实际: {:?}", resp.err());
+
+        // 落在 VPN 子网内部 10.8.0.128/25 ⊂ 10.8.0.0/24 → 拒绝（会用更具体路由劫持 VPN 子网）。
+        let svc2 = service(setup_pool().await);
+        let mut bad = reg("PKBAD");
+        bad.routed_subnets = vec!["10.8.0.128/25".to_string()];
+        let err = svc2.register("user-2", &bad).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "VPN 子网内应拒绝，实际: {err:?}");
     }
 }
