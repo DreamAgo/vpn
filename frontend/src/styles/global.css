@@ -1,0 +1,184 @@
+/* VPN Console 基础视觉:浅色中性底、清晰内容层级、克制的蓝色强调。 */
+
+:root {
+  --bg-0: #ffffff;
+  --bg-1: #f5f7fb;
+  --card: #ffffff;
+  --card-2: #f8fafc;
+  --ink: #111827;
+  --ink-soft: #4b5563;
+  --ink-faint: #9ca3af;
+  --line: #e8edf5;
+  --line-strong: #d8dee8;
+  --accent: #2563eb;
+  --accent-2: #1d4ed8;
+  --accent-deep: #1e40af;
+  --accent-glow: rgba(37, 99, 235, 0.14);
+  --accent-wash: #eff6ff;
+  --accent-rgb: 37, 99, 235;
+  --code-bg: #f1f5f9;
+  --code-border: #e2e8f0;
+  --code-text: #334155;
+  --surface-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --surface-shadow-secondary: 0 18px 45px rgba(15, 23, 42, 0.08);
+
+  --font-display: "Archivo", system-ui, sans-serif;
+  --font-ui: "Archivo", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+  background-clip: content-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-1);
+  color: var(--ink);
+  font-family: var(--font-ui);
+}
+
+::selection {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+code,
+.ant-typography code,
+kbd,
+.mono {
+  font-family: var(--font-mono) !important;
+}
+.ant-typography code,
+:where(.ant-typography) code {
+  background: var(--code-bg) !important;
+  border-color: var(--code-border) !important;
+  color: var(--code-text) !important;
+  border-radius: 4px;
+}
+
+.ant-statistic-content,
+.ant-statistic-content-value,
+.ant-statistic-content-prefix {
+  font-family: var(--font-mono) !important;
+}
+
+.bp-eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.bp-eyebrow::before {
+  content: "";
+  width: 16px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.bp-ticks {
+  border-radius: 8px;
+}
+.bp-ticks::before,
+.bp-ticks::after {
+  display: none;
+}
+
+.ant-card {
+  border-color: var(--line) !important;
+  background: var(--card) !important;
+  box-shadow: var(--surface-shadow);
+}
+.ant-card-head {
+  border-bottom-color: var(--line) !important;
+  min-height: 48px !important;
+}
+.ant-card-head-title {
+  font-weight: 600;
+}
+
+.ant-pro-card,
+.ant-pro-table .ant-pro-card {
+  border-radius: 8px !important;
+  background: var(--card) !important;
+}
+
+.ant-table-thead > tr > th {
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  color: var(--ink-soft) !important;
+  border-bottom-color: var(--line-strong) !important;
+}
+.ant-table-wrapper .ant-table-tbody > tr > td {
+  border-bottom-color: var(--line) !important;
+}
+
+.ant-table,
+.ant-table-container,
+.ant-table-cell,
+.ant-table-tbody > tr > td {
+  background: var(--card) !important;
+}
+
+.ant-table-thead > tr > th {
+  background: var(--card-2) !important;
+}
+
+.ant-pro-layout,
+.ant-layout,
+.ant-layout-content {
+  background: var(--bg-1) !important;
+}
+
+.ant-pro-layout .ant-pro-sider,
+.ant-pro-layout .ant-layout-sider,
+.ant-pro-layout .ant-pro-layout-header {
+  background: var(--card) !important;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+.ant-typography h1,
+.ant-typography h2,
+.ant-typography h3,
+.ant-typography h4 {
+  font-family: var(--font-display) !important;
+}
+
+.ant-btn-primary {
+  box-shadow: none !important;
+}
+
+.ant-pro-layout .ant-pro-layout-content {
+  margin: 0;
+}

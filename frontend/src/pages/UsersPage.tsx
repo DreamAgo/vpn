@@ -20,17 +20,39 @@ import {
 } from 'antd';
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components';
 import { MoreOutlined, PlusOutlined } from '@ant-design/icons';
+import { useQuery } from '@tanstack/react-query';
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import 'dayjs/locale/zh-cn';
 
 import { usersApi } from '@/services/users';
+import { groupsApi } from '@/services/groups';
 import { ApiError } from '@/services/http';
 import { ErrorCodes } from '@/types/api';
 import type { UserDto } from '@/types/api';
 import { CreateUserModal } from '@/components/CreateUserModal';
 import { ResetPasswordModal } from '@/components/ResetPasswordModal';
+import { AssignGroupModal } from '@/components/AssignGroupModal';
 import { EmptyStateWithAction } from '@/components/EmptyStateWithAction';
+
+/** 渲染某用户所属的多个组名（从 groups 查询缓存解析）。 */
+function GroupTags({ groupIds }: { groupIds: string[] }) {
+  const { data: groups } = useQuery({ queryKey: ['groups'], queryFn: groupsApi.listGroups });
+  if (!groupIds || groupIds.length === 0)
+    return <Typography.Text type="secondary">未分组</Typography.Text>;
+  return (
+    <Space size={[0, 4]} wrap>
+      {groupIds.map((id) => {
+        const g = groups?.find((x) => x.id === id);
+        return (
+          <Tag key={id} color="blue">
+            {g ? g.name : '未知组'}
+          </Tag>
+        );
+      })}
+    </Space>
+  );
+}
 
 dayjs.extend(relativeTime);
 dayjs.locale('zh-cn');
@@ -66,6 +88,7 @@ export function UsersPage() {
 
   const [createOpen, setCreateOpen] = useState(false);
   const [resetPwd, setResetPwd] = useState<string | null>(null);
+  const [assignUser, setAssignUser] = useState<UserDto | null>(null);
 
   const reload = useCallback(() => actionRef.current?.reload(), []);
 
@@ -142,6 +165,12 @@ export function UsersPage() {
           ),
       },
       {
+        title: '用户组',
+        dataIndex: 'groupIds',
+        width: 160,
+        render: (_, record) => <GroupTags groupIds={record.groupIds} />,
+      },
+      {
         title: '最后登录',
         dataIndex: 'lastLoginAt',
         width: 140,
@@ -192,6 +221,10 @@ export function UsersPage() {
                     ),
                   },
                   {
+                    key: 'assign-group',
+                    label: <span onClick={() => setAssignUser(record)}>分配用户组</span>,
+                  },
+                  {
                     key: 'toggle',
                     label: (
                       <span onClick={() => handleToggleStatus(record)}>
@@ -230,7 +263,7 @@ export function UsersPage() {
   );
 
   return (
-    <div style={{ padding: 24 }}>
+    <div>
       <Title level={4} style={{ marginBottom: 16 }}>
         用户管理
       </Title>
@@ -319,6 +352,13 @@ export function UsersPage() {
         open={resetPwd !== null}
         onClose={() => setResetPwd(null)}
         newPassword={resetPwd ?? ''}
+      />
+
+      <AssignGroupModal
+        open={assignUser !== null}
+        user={assignUser}
+        onClose={() => setAssignUser(null)}
+        onSaved={reload}
       />
     </div>
   );

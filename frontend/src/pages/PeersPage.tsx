@@ -95,6 +95,16 @@ export function PeersPage() {
     }
   };
 
+  const handlePurge = async (peer: AdminPeerView) => {
+    try {
+      await peersApi.purgePeer(peer.id);
+      message.success('已彻底删除节点并回收 IP');
+      reload();
+    } catch (err) {
+      message.error(describeError(err, '彻底删除失败'));
+    }
+  };
+
   const hasFilter = search.length > 0 || statusFilter !== undefined;
 
   const columns = useMemo<ProColumns<AdminPeerView>[]>(
@@ -146,7 +156,7 @@ export function PeersPage() {
       {
         title: '操作',
         key: 'action',
-        width: 210,
+        width: 280,
         render: (_, record) => (
           <Space size="small">
             <Button type="link" size="small" onClick={() => setDetail(record)}>
@@ -167,6 +177,18 @@ export function PeersPage() {
                 强制下线
               </Button>
             </Popconfirm>
+            <Popconfirm
+              title="彻底删除"
+              description="将摘除隧道、删除记录并回收 VPN IP，不可恢复。确定彻底删除？"
+              okText="彻底删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={() => handlePurge(record)}
+            >
+              <Button type="link" size="small" danger>
+                彻底删除
+              </Button>
+            </Popconfirm>
           </Space>
         ),
       },
@@ -176,7 +198,7 @@ export function PeersPage() {
   );
 
   return (
-    <div style={{ padding: 24 }}>
+    <div>
       <Title level={4} style={{ marginBottom: 16 }}>
         节点管理
       </Title>

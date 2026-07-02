@@ -8,7 +8,7 @@
  * - 错误码映射：1001 凭据错误、1003 账号锁定、1004 账号禁用
  */
 import { useEffect } from 'react';
-import { Card, Form, Input, Button, Typography, App } from 'antd';
+import { Form, Input, Button, App } from 'antd';
 import { LockOutlined, UserOutlined } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useMutation } from '@tanstack/react-query';
@@ -17,8 +17,6 @@ import { authApi } from '@/services/auth';
 import { useAuthStore } from '@/stores/authStore';
 import { ApiError } from '@/services/http';
 import { ErrorCodes } from '@/types/api';
-
-const { Title, Text } = Typography;
 
 interface FormValues {
   username: string;
@@ -84,49 +82,62 @@ export function LoginPage() {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'linear-gradient(135deg, #1f2a4a 0%, #2F54EB 100%)',
         padding: 24,
+        background: 'var(--bg-1)',
       }}
     >
-      <Card style={{ width: 400, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
-        <div style={{ textAlign: 'center', marginBottom: 24 }}>
-          <Title level={3} style={{ marginBottom: 4 }}>
-            vpn 管理后台
-          </Title>
-          <Text type="secondary">请使用管理员账号登录</Text>
-        </div>
-        <Form<FormValues>
-          layout="vertical"
-          autoComplete="off"
-          onFinish={(values) => mutation.mutate(values)}
-        >
-          <Form.Item
-            name="username"
-            label="用户名"
-            rules={[{ required: true, message: '请输入用户名' }]}
+      <div
+        style={{
+          width: 380,
+          background: 'var(--card)',
+          border: '1px solid var(--line)',
+          borderRadius: 10,
+          padding: '34px 34px 30px',
+          boxShadow: 'var(--surface-shadow-secondary)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+          <span
+            style={{
+              width: 32,
+              height: 32,
+              borderRadius: 7,
+              background: 'var(--accent)',
+              color: '#fff',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontWeight: 700,
+            }}
           >
+            V
+          </span>
+          <span style={{ fontWeight: 700, fontSize: 20, color: 'var(--ink)' }}>
+            VPN Console
+          </span>
+        </div>
+        <div className="bp-eyebrow" style={{ marginBottom: 26 }}>
+          安全接入管理
+        </div>
+
+        <Form<FormValues> layout="vertical" autoComplete="off" onFinish={(values) => mutation.mutate(values)}>
+          <Form.Item name="username" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
             <Input prefix={<UserOutlined />} placeholder="admin" size="large" autoFocus />
           </Form.Item>
-          <Form.Item
-            name="password"
-            label="密码"
-            rules={[{ required: true, message: '请输入密码' }]}
-          >
+          <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}>
             <Input.Password prefix={<LockOutlined />} placeholder="密码" size="large" />
           </Form.Item>
-          <Form.Item>
-            <Button
-              type="primary"
-              htmlType="submit"
-              block
-              size="large"
-              loading={mutation.isPending}
-            >
+          <Form.Item style={{ marginBottom: 8, marginTop: 24 }}>
+            <Button type="primary" htmlType="submit" block size="large" loading={mutation.isPending}>
               登录
             </Button>
           </Form.Item>
         </Form>
-      </Card>
+
+        <div style={{ fontSize: 12, color: 'var(--ink-faint)', marginTop: 18, textAlign: 'center' }}>
+          仅限授权管理员访问
+        </div>
+      </div>
     </div>
   );
 }
