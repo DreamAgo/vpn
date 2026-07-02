@@ -90,6 +90,7 @@ export interface UserDto {
   mustChangePassword: boolean;
   lastLoginAt: number | null;
   groupIds: string[]; // 所属用户组 id 列表（可属多个组；未分组为空）
+  maxDevices: number; // 终端数量上限（≥1，默认 1）
   createdAt: number;
 }
 
@@ -139,6 +140,7 @@ export interface CreateUserRequest {
   username: string;
   email: string;
   password?: string;
+  maxDevices?: number; // 终端数量上限（不传默认 1）
 }
 
 export interface CreateUserResponse {
@@ -156,6 +158,7 @@ export interface ListUsersQuery {
 
 export interface UpdateUserRequest {
   status?: string; // "active" | "disabled"
+  maxDevices?: number; // 终端数量上限（≥1）；调小不影响已注册终端
 }
 
 export interface ResetPasswordResponse {
@@ -212,6 +215,27 @@ export interface AdminPeerView {
   status: string; // online | offline | deleted | force_removed
   createdAt: number;
   routedSubnets?: string[];
+  onlineSince: number | null; // 本次转为在线的起始时刻（unix ms）；不在线为 null
+  rttMs: number | null; // 客户端最近上报的心跳往返延迟（毫秒）
+  lossPct: number | null; // 客户端最近上报的心跳丢包率（0-100）
+  clientVersion: string | null; // 客户端版本
+}
+
+/** 节点属性变更记录（OS / IP / Endpoint / 设备名 / 版本；节点健康监控）。 */
+export interface PeerEventView {
+  id: string;
+  peerId: string;
+  deviceName: string | null; // peer 已删除时为 null
+  username: string | null;
+  field: string; // 'os_info' | 'endpoint' | 'vpn_ip' | 'device_name' | 'client_version'
+  oldValue: string | null;
+  newValue: string | null;
+  createdAt: number;
+}
+
+export interface PeerEventQuery {
+  peerId?: string; // 只看某个节点；缺省为全部
+  limit?: number; // 默认 50，最多 200
 }
 
 export interface UpdatePeerRoutesRequest {

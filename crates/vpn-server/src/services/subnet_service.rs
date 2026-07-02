@@ -138,7 +138,10 @@ mod tests {
     async fn update_and_delete() {
         let s = svc().await;
         let d = s.create("a", "10.0.0.0/8").await.unwrap();
-        let u = s.update(&d.id, Some("b"), Some("172.16.0.0/12")).await.unwrap();
+        let u = s
+            .update(&d.id, Some("b"), Some("172.16.0.0/12"))
+            .await
+            .unwrap();
         assert_eq!(u.name, "b");
         assert_eq!(u.cidr, "172.16.0.0/12");
         s.delete(&d.id).await.unwrap();

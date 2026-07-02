@@ -133,6 +133,10 @@ pub fn build_router(state: AppState) -> Router {
                 "/api/v1/admin/peers/{id}/purge",
                 delete(handlers::peers::purge_peer),
             )
+            .route(
+                "/api/v1/admin/peer-events",
+                get(handlers::peers::list_peer_events),
+            )
             // 审计中间件（内层）：在 require_auth 之后运行，故 extensions 已含 CurrentUser。
             .layer(from_fn_with_state(state.clone(), middleware::audit_layer))
             .layer(from_fn_with_state(issuer, middleware::auth::require_auth))

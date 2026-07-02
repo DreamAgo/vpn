@@ -22,7 +22,15 @@ pub struct UserDto {
     /// 所属用户组 id 列表（可属多个组；未分组为空，前端用组列表解析名称）。
     #[serde(default)]
     pub group_ids: Vec<String>,
+    /// 允许同时注册的终端数量上限（≥1，默认 1）。
+    #[serde(default = "default_max_devices")]
+    pub max_devices: i64,
     pub created_at: i64,
+}
+
+/// max_devices 的默认值（兼容旧服务端响应缺省该字段）。
+fn default_max_devices() -> i64 {
+    1
 }
 
 /// 创建用户请求。password 不传则后端自动生成 12 位强密码。
@@ -32,6 +40,9 @@ pub struct CreateUserRequest {
     pub email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// 终端数量上限（不传默认 1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_devices: Option<i64>,
 }
 
 /// 创建用户响应。initial_password 为明文，仅此一次返回。
@@ -59,12 +70,16 @@ pub struct ListUsersQuery {
     pub order_by: Option<String>,
 }
 
-/// 更新用户请求（PATCH）。当前仅支持改 status（禁用/启用）。
+/// 更新用户请求（PATCH）。支持改 status（禁用/启用）与 max_devices（终端上限），
+/// 至少携带其一。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateUserRequest {
     /// "active" | "disabled"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// 终端数量上限（≥1）。调小不影响已注册终端，仅限制后续新终端注册。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_devices: Option<i64>,
 }
 
 /// 重置密码响应。new_password 为明文，仅此一次返回。

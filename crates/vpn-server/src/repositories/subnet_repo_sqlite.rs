@@ -38,11 +38,12 @@ impl SqliteSubnetRepository {
     }
 
     pub async fn list(&self) -> Result<Vec<SubnetRow>> {
-        let rows: Vec<SubnetTuple> =
-            sqlx::query_as("SELECT id, name, cidr, created_at, updated_at FROM subnets ORDER BY name ASC")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| AppError::Database(Box::new(e)))?;
+        let rows: Vec<SubnetTuple> = sqlx::query_as(
+            "SELECT id, name, cidr, created_at, updated_at FROM subnets ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(rows.into_iter().map(SubnetRow::from).collect())
     }
 
@@ -100,12 +101,13 @@ impl SqliteSubnetRepository {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<SubnetRow>> {
-        let row: Option<SubnetTuple> =
-            sqlx::query_as("SELECT id, name, cidr, created_at, updated_at FROM subnets WHERE id = ?1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| AppError::Database(Box::new(e)))?;
+        let row: Option<SubnetTuple> = sqlx::query_as(
+            "SELECT id, name, cidr, created_at, updated_at FROM subnets WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(row.map(SubnetRow::from))
     }
 

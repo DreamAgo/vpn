@@ -11,7 +11,7 @@ use std::sync::Arc;
 use ipnet::Ipv4Net;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
-use vpn_api_types::peer::{PeerRegisterRequest, PeerRegisterResponse};
+use vpn_api_types::peer::{PeerHeartbeatRequest, PeerRegisterRequest, PeerRegisterResponse};
 use vpn_core::{AppError, Result};
 use vpn_wireguard::{
     generate_keypair, public_key_from_private, render_client_config, IpPool,
@@ -19,8 +19,9 @@ use vpn_wireguard::{
 };
 
 use crate::repositories::{
-    peer_repo_sqlite::SqlitePeerRepository, system_config_repo_sqlite::SqliteSystemConfigRepository,
-    user_group_repo_sqlite::SqliteUserGroupRepository,
+    peer_event_repo_sqlite::SqlitePeerEventRepository, peer_repo_sqlite::SqlitePeerRepository,
+    system_config_repo_sqlite::SqliteSystemConfigRepository,
+    user_group_repo_sqlite::SqliteUserGroupRepository, user_repo_sqlite::SqliteUserRepository,
 };
 
 /// system_config 中存储服务端 WG 私钥/公钥的 key。
@@ -36,6 +37,8 @@ const CLIENT_PRIVATE_KEY_PLACEHOLDER: &str = "<在此填入客户端私钥>";
 const PERSISTENT_KEEPALIVE: u16 = 25;
 /// 离线判定阈值：心跳超过该毫秒数未更新视为离线。
 pub const OFFLINE_THRESHOLD_MS: i64 = 90_000;
+/// 节点变更记录保留期（毫秒）：30 天，随离线扫描任务定期清理。
+pub const EVENT_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
 
 /// 校验并归一化客户端声明的 LAN 网段。
 ///
@@ -113,6 +116,10 @@ pub struct PeerService {
     config_repo: SqliteSystemConfigRepository,
     /// 用户组仓库:注册时据此查成员所属组的可路由网段（访问控制）。
     user_group_repo: SqliteUserGroupRepository,
+    /// 用户仓库:注册时读取该用户的终端数量上限（多终端模式）。
+    user_repo: SqliteUserRepository,
+    /// 变更记录仓库:OS / IP / Endpoint 等变化历史（节点健康监控）。
+    pub event_repo: SqlitePeerEventRepository,
     control: Arc<dyn WireGuardControl>,
     ip_pool: Arc<Mutex<IpPool>>,
     subnet: Ipv4Net,
@@ -124,10 +131,13 @@ pub struct PeerService {
 
 impl PeerService {
     /// 构造 PeerService。`ip_pool` 应已由调用方用 peers 表中已占用 IP 回填。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         peer_repo: SqlitePeerRepository,
         config_repo: SqliteSystemConfigRepository,
         user_group_repo: SqliteUserGroupRepository,
+        user_repo: SqliteUserRepository,
+        event_repo: SqlitePeerEventRepository,
         control: Arc<dyn WireGuardControl>,
         ip_pool: IpPool,
         server_endpoint: String,
@@ -138,6 +148,8 @@ impl PeerService {
             peer_repo,
             config_repo,
             user_group_repo,
+            user_repo,
+            event_repo,
             control,
             ip_pool: Arc::new(Mutex::new(ip_pool)),
             subnet,
@@ -189,10 +201,14 @@ impl PeerService {
         self.subnet.to_string()
     }
 
-    /// Story 4.5：注册节点。
+    /// Story 4.5 / 多终端模式：注册终端。
     ///
-    /// 同一 user 已有非 deleted peer → 复用其 vpn_ip，更新公钥/设备名/os_info；
-    /// 否则分配新 IP 并插入。最后调 control.configure_peer。
+    /// 终端识别：先按 (user, wg_public_key) 匹配，再按 (user, device_name)（客户端
+    /// 每次启动重新生成密钥对，跨重启只能靠设备名识别同一终端）。
+    /// - 匹配到既有终端 → 复用其 vpn_ip，更新公钥/设备名/os_info；
+    /// - 新终端且活跃数 < 用户 max_devices → 分配新 IP 插入；
+    /// - 已达上限 → 接管**最久未活跃的不在线**终端（保持旧版"新设备顶掉旧设备"的
+    ///   自助语义）；全部在线则拒绝，提示先下线一台或提升上限。
     pub async fn register(
         &self,
         user_id: &str,
@@ -201,25 +217,59 @@ impl PeerService {
         // 校验并归一化客户端声明的 LAN 网段（站点网关）。
         let subnets = normalize_subnets(&req.routed_subnets)?;
         let subnets_csv = subnets.join(",");
+
+        let peers = self.peer_repo.list_active_by_user(user_id).await?;
+        // 终端匹配：公钥优先（同一运行内重连），其次设备名（重启后换了密钥对）。
+        let matched = peers
+            .iter()
+            .find(|p| p.wg_public_key == req.wg_public_key)
+            .or_else(|| peers.iter().find(|p| p.device_name == req.device_name));
+
+        // 复用槽位的目标终端：匹配到的既有终端，或达上限时被接管的离线终端。
+        let target = match matched {
+            Some(p) => Some(p.clone()),
+            None => {
+                let max_devices = self
+                    .user_repo
+                    .find_by_id(user_id)
+                    .await?
+                    .map(|u| u.max_devices)
+                    .unwrap_or(1);
+                if (peers.len() as i64) < max_devices {
+                    None // 未达上限 → 全新终端，走分配新 IP 分支
+                } else {
+                    // 已达上限：接管最久未活跃的不在线终端（从未心跳的按 updated_at
+                    // 计,保护刚注册还没打卡的终端）；全部在线则拒绝。
+                    let evict = peers
+                        .iter()
+                        .filter(|p| p.status != "online")
+                        .min_by_key(|p| p.last_seen_at.unwrap_or(p.updated_at));
+                    match evict {
+                        Some(p) => Some(p.clone()),
+                        None => {
+                            return Err(AppError::Validation(format!(
+                                "已达终端数量上限（{max_devices}）且均在线；请先下线一台终端或联系管理员提升上限"
+                            )))
+                        }
+                    }
+                }
+            }
+        };
+
         // 站点网段不得与其他节点重叠（否则 wg allowed-ips 互抢、站点静默不可达）。
-        self.ensure_no_subnet_collision(&subnets, None, Some(user_id))
+        // 多终端下同一用户的其他终端也算"其他节点"，仅排除本次复用的目标终端。
+        self.ensure_no_subnet_collision(&subnets, target.as_ref().map(|p| p.id.as_str()), None)
             .await?;
 
-        let existing = self.peer_repo.find_active_by_user(user_id).await?;
         // 重注册前留存旧公钥/旧网段：换公钥时摘除幽灵 peer、缩减网段时清理残留路由。
-        let old_pubkey = existing.as_ref().map(|p| p.wg_public_key.clone());
-        let old_routed: Vec<String> = existing
+        let target_id = target.as_ref().map(|p| p.id.clone());
+        let old_pubkey = target.as_ref().map(|p| p.wg_public_key.clone());
+        let old_routed: Vec<String> = target
             .as_ref()
-            .map(|p| {
-                p.routed_subnets
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
+            .map(|p| parse_csv_subnets(&p.routed_subnets))
             .unwrap_or_default();
 
-        let vpn_ip: String = match existing {
+        let vpn_ip: String = match target {
             Some(peer) => {
                 // 复用既有 IP，更新注册信息（公钥冲突会返回 DuplicateResource）。
                 self.peer_repo
@@ -228,9 +278,41 @@ impl PeerService {
                         &req.device_name,
                         &req.wg_public_key,
                         req.os_info.as_deref(),
+                        req.client_version.as_deref(),
                         &subnets_csv,
                     )
                     .await?;
+                // 变更记录（节点健康监控）：设备名（槽位接管/改名）、OS、客户端版本。
+                if peer.device_name != req.device_name {
+                    self.record_event(
+                        &peer.id,
+                        user_id,
+                        "device_name",
+                        Some(&peer.device_name),
+                        Some(&req.device_name),
+                    )
+                    .await;
+                }
+                if req.os_info.is_some() && peer.os_info != req.os_info {
+                    self.record_event(
+                        &peer.id,
+                        user_id,
+                        "os_info",
+                        peer.os_info.as_deref(),
+                        req.os_info.as_deref(),
+                    )
+                    .await;
+                }
+                if req.client_version.is_some() && peer.client_version != req.client_version {
+                    self.record_event(
+                        &peer.id,
+                        user_id,
+                        "client_version",
+                        peer.client_version.as_deref(),
+                        req.client_version.as_deref(),
+                    )
+                    .await;
+                }
                 peer.vpn_ip
             }
             None => {
@@ -249,11 +331,17 @@ impl PeerService {
                         &req.wg_public_key,
                         &ip_str,
                         req.os_info.as_deref(),
+                        req.client_version.as_deref(),
                         &subnets_csv,
                     )
                     .await
                 {
-                    Ok(_) => ip_str,
+                    Ok(_) => {
+                        // 新终端获得 VPN IP → 记一条 IP 记录（该终端 IP 历史的起点）。
+                        self.record_event(&id, user_id, "vpn_ip", None, Some(&ip_str))
+                            .await;
+                        ip_str
+                    }
                     Err(e) => {
                         // 插入失败（如公钥冲突）→ 归还刚分配的 IP，避免泄漏。
                         self.ip_pool.lock().await.release(ip);
@@ -288,7 +376,7 @@ impl PeerService {
             .filter(|s| !subnets.contains(s))
             .collect();
         let removed = self
-            .filter_releasable_routes(removed, None, Some(user_id))
+            .filter_releasable_routes(removed, target_id.as_deref(), None)
             .await?;
         if !removed.is_empty() {
             let _ = self.control.remove_routes(&removed).await;
@@ -454,7 +542,8 @@ impl PeerService {
             .await?
             .map(|p| parse_csv_subnets(&p.routed_subnets))
             .unwrap_or_default();
-        self.heartbeat_with_own(user_id, endpoint, now_ms, &own).await
+        self.heartbeat_with_own(user_id, endpoint, now_ms, &own)
+            .await
     }
 
     /// [`heartbeat`] / [`heartbeat_checked`] 的共用内核:打卡 + 据已知自报网段算 allowed_routes。
@@ -477,14 +566,15 @@ impl PeerService {
         self.compute_allowed_routes(user_id, own).await
     }
 
-    /// Story 4.7：注销当前 user 的 peer。无活跃 peer → PeerNotFound。
+    /// Story 4.7：注销当前 user 的全部终端。无活跃 peer → PeerNotFound。
     pub async fn delete_me(&self, user_id: &str) -> Result<()> {
-        let peer = self
-            .peer_repo
-            .find_active_by_user(user_id)
-            .await?
-            .ok_or(AppError::PeerNotFound)?;
-        self.control.remove_peer(&peer.wg_public_key).await?;
+        let peers = self.peer_repo.list_active_by_user(user_id).await?;
+        if peers.is_empty() {
+            return Err(AppError::PeerNotFound);
+        }
+        for peer in &peers {
+            self.control.remove_peer(&peer.wg_public_key).await?;
+        }
         self.peer_repo.mark_deleted_by_user(user_id).await?;
         Ok(())
     }
@@ -531,33 +621,125 @@ impl PeerService {
     }
 
     /// 离线检测：把心跳超过阈值的 online peer 标记为 offline。返回标记行数。
+    /// 顺带治理变更记录保留期（删除超期历史，best-effort）。
     pub async fn scan_offline(&self, now_ms: i64) -> Result<u64> {
         let cutoff = now_ms - OFFLINE_THRESHOLD_MS;
-        self.peer_repo.mark_stale_offline(cutoff).await
+        let marked = self.peer_repo.mark_stale_offline(cutoff).await?;
+        if let Err(e) = self
+            .event_repo
+            .prune_before(now_ms - EVENT_RETENTION_MS)
+            .await
+        {
+            tracing::warn!(error = %e, "变更记录保留期清理失败（忽略）");
+        }
+        Ok(marked)
+    }
+
+    /// 变更记录落库（best-effort：失败仅告警，不影响注册/心跳主流程）。
+    async fn record_event(
+        &self,
+        peer_id: &str,
+        user_id: &str,
+        field: &str,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+    ) {
+        if let Err(e) = self
+            .event_repo
+            .insert(peer_id, user_id, field, old_value, new_value)
+            .await
+        {
+            tracing::warn!(peer_id, field, error = %e, "变更记录写入失败（忽略）");
+        }
+    }
+
+    /// 节点变更记录查询（admin：节点健康监控）。
+    pub async fn list_events(
+        &self,
+        query: &vpn_api_types::peer::PeerEventQuery,
+    ) -> Result<Vec<vpn_api_types::peer::PeerEventView>> {
+        let limit = query.limit.unwrap_or(50).clamp(1, 200);
+        let rows = self
+            .event_repo
+            .list(query.peer_id.as_deref(), limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| vpn_api_types::peer::PeerEventView {
+                id: r.id,
+                peer_id: r.peer_id,
+                device_name: r.device_name,
+                username: r.username,
+                field: r.field,
+                old_value: r.old_value,
+                new_value: r.new_value,
+                created_at: r.created_at,
+            })
+            .collect())
     }
 
     /// Story 5.5：心跳（admin 视角）。同 `heartbeat`，但若 peer 已被强制下线则拒绝。
     ///
+    /// 多终端模式：请求带 `wg_public_key`（新客户端）时精确定位该终端打卡，并记录
+    /// 客户端上报的健康指标（RTT / 丢包）与 endpoint 变化；不带（旧客户端）时退回
+    /// 按用户打卡（该用户全部活跃终端一起打卡，单终端语义）。
     /// 强制下线后客户端下次心跳应失败，提示重新登录。
     pub async fn heartbeat_checked(
         &self,
         user_id: &str,
-        endpoint: Option<&str>,
+        req: &PeerHeartbeatRequest,
         now_ms: i64,
     ) -> Result<Vec<String>> {
+        let endpoint = req.endpoint.as_deref();
+        if let Some(pk) = req.wg_public_key.as_deref() {
+            let peer = self
+                .peer_repo
+                .find_active_by_user_and_pubkey(user_id, pk)
+                .await?
+                .ok_or(AppError::PeerNotFound)?;
+            if peer.status == "force_removed" {
+                // 复用 TokenExpired（401）→ 客户端据此提示重新登录。
+                return Err(AppError::TokenExpired);
+            }
+            // Endpoint 变化记录（漫游/出口切换；节点健康监控）。
+            if endpoint.is_some() && peer.endpoint.as_deref() != endpoint {
+                self.record_event(
+                    &peer.id,
+                    user_id,
+                    "endpoint",
+                    peer.endpoint.as_deref(),
+                    endpoint,
+                )
+                .await;
+            }
+            let affected = self
+                .peer_repo
+                .touch_heartbeat_by_id(&peer.id, endpoint, req.rtt_ms, req.loss_pct, now_ms)
+                .await?;
+            if affected == 0 {
+                return Err(AppError::PeerNotFound);
+            }
+            let own = parse_csv_subnets(&peer.routed_subnets);
+            return self.compute_allowed_routes(user_id, &own).await;
+        }
         // touch_heartbeat 的 SQL 排除 status='deleted'，但 force_removed 仍会被更新；
         // 故先显式检查活跃 peer 状态。这次查到的 peer 直接复用,避免 heartbeat 内再查一次。
         let peer = self.peer_repo.find_active_by_user(user_id).await?;
         if let Some(p) = &peer {
             if p.status == "force_removed" {
-                // 复用 TokenExpired（401）→ 客户端据此提示重新登录。
                 return Err(AppError::TokenExpired);
+            }
+            // 旧客户端单终端语义下也记录 endpoint 变化。
+            if endpoint.is_some() && p.endpoint.as_deref() != endpoint {
+                self.record_event(&p.id, user_id, "endpoint", p.endpoint.as_deref(), endpoint)
+                    .await;
             }
         }
         let own = peer
             .map(|p| parse_csv_subnets(&p.routed_subnets))
             .unwrap_or_default();
-        self.heartbeat_with_own(user_id, endpoint, now_ms, &own).await
+        self.heartbeat_with_own(user_id, endpoint, now_ms, &own)
+            .await
     }
 
     /// Story 5.5：admin 强制下线指定 peer。
@@ -600,8 +782,8 @@ impl PeerService {
     /// 用户被**删除**时联动清理其节点:摘除 WireGuard peer + 物理删库 + 回收 VPN IP。
     /// 无活跃 peer 则静默成功(用户可能从未接入)。
     pub async fn purge_by_user(&self, user_id: &str) -> Result<()> {
-        // 摘除活跃 peer 的 WireGuard runtime（best-effort，可能已不在 runtime）。
-        if let Some(peer) = self.peer_repo.find_active_by_user(user_id).await? {
+        // 摘除全部活跃 peer 的 WireGuard runtime（best-effort，可能已不在 runtime）。
+        for peer in self.peer_repo.list_active_by_user(user_id).await? {
             let _ = self.control.remove_peer(&peer.wg_public_key).await;
         }
         // 硬删该用户**全部** peer 行（含历史 'deleted' 软删行）并回收各自 IP。必须先于删除
@@ -614,7 +796,11 @@ impl PeerService {
                     pool.release(p);
                 }
             }
-            tracing::info!(user_id, count = freed.len(), "用户删除:已清除其全部节点并回收 IP");
+            tracing::info!(
+                user_id,
+                count = freed.len(),
+                "用户删除:已清除其全部节点并回收 IP"
+            );
         }
         Ok(())
     }
@@ -622,7 +808,7 @@ impl PeerService {
     /// 用户被**禁用**时联动踢隧道:摘除 WireGuard peer + 标记 force_removed(保留记录与 IP)。
     /// 重新启用并重连后 force_removed 会被清除而恢复。无活跃 peer 则静默成功。
     pub async fn force_remove_by_user(&self, user_id: &str) -> Result<()> {
-        if let Some(peer) = self.peer_repo.find_active_by_user(user_id).await? {
+        for peer in self.peer_repo.list_active_by_user(user_id).await? {
             // best-effort 摘除：用户已在 update_status 中被禁用并吊销会话，WireGuard 摘除
             // 失败（接口已 down/权限/runtime 无此 peer）不应让禁用接口整体返回 500、
             // 造成“库里已禁用、API 却报错”的不一致。与 purge_by_user 保持一致。
@@ -723,6 +909,10 @@ impl PeerService {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
                     .collect(),
+                online_since: r.online_since,
+                rtt_ms: r.rtt_ms,
+                loss_pct: r.loss_pct,
+                client_version: r.client_version,
             })
             .collect();
         Ok(vpn_api_types::Page::new(items, total, page, page_size))
@@ -890,11 +1080,15 @@ pub async fn build_peer_service_with_backend(
     };
 
     let user_group_repo = SqliteUserGroupRepository::new(config_repo.pool().clone());
+    let user_repo = SqliteUserRepository::new(config_repo.pool().clone());
+    let event_repo = SqlitePeerEventRepository::new(config_repo.pool().clone());
 
     Ok(PeerService::new(
         peer_repo,
         config_repo.clone(),
         user_group_repo,
+        user_repo,
+        event_repo,
         control,
         ip_pool,
         server_endpoint,
@@ -940,7 +1134,9 @@ mod tests {
         PeerService::new(
             SqlitePeerRepository::new(pool.clone()),
             SqliteSystemConfigRepository::new(pool.clone()),
-            SqliteUserGroupRepository::new(pool),
+            SqliteUserGroupRepository::new(pool.clone()),
+            SqliteUserRepository::new(pool.clone()),
+            SqlitePeerEventRepository::new(pool),
             control,
             ip_pool,
             "vpn.example.com:51820".to_string(),
@@ -953,12 +1149,24 @@ mod tests {
         PeerService::new(
             SqlitePeerRepository::new(pool.clone()),
             SqliteSystemConfigRepository::new(pool.clone()),
-            SqliteUserGroupRepository::new(pool),
+            SqliteUserGroupRepository::new(pool.clone()),
+            SqliteUserRepository::new(pool.clone()),
+            SqlitePeerEventRepository::new(pool),
             Arc::new(NoopWireGuardControl::new("SERVER_PUB")),
             ip_pool,
             "vpn.example.com:51820".to_string(),
             routes,
         )
+    }
+
+    /// 心跳请求便捷构造（测试用）。
+    fn hb(pk: Option<&str>, endpoint: Option<&str>) -> PeerHeartbeatRequest {
+        PeerHeartbeatRequest {
+            endpoint: endpoint.map(|s| s.to_string()),
+            wg_public_key: pk.map(|s| s.to_string()),
+            rtt_ms: None,
+            loss_pct: None,
+        }
     }
 
     #[tokio::test]
@@ -1077,6 +1285,7 @@ mod tests {
             device_name: "MBP".to_string(),
             os_info: Some("macOS".to_string()),
             routed_subnets: Vec::new(),
+            client_version: None,
         }
     }
 
@@ -1086,7 +1295,316 @@ mod tests {
             device_name: "GW".to_string(),
             os_info: None,
             routed_subnets: subnets.iter().map(|s| s.to_string()).collect(),
+            client_version: None,
         }
+    }
+
+    fn reg_named(pk: &str, device: &str) -> PeerRegisterRequest {
+        PeerRegisterRequest {
+            wg_public_key: pk.to_string(),
+            device_name: device.to_string(),
+            os_info: None,
+            routed_subnets: Vec::new(),
+            client_version: None,
+        }
+    }
+
+    async fn set_max_devices(pool: &SqlitePool, user_id: &str, n: i64) {
+        sqlx::query("UPDATE users SET max_devices = ?1 WHERE id = ?2")
+            .bind(n)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_device_within_limit_gets_distinct_ips() {
+        let pool = setup_pool().await;
+        let svc = service(pool.clone());
+        set_max_devices(&pool, "user-1", 2).await;
+        let r1 = svc
+            .register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        let r2 = svc
+            .register("user-1", &reg_named("PK2", "iPhone"))
+            .await
+            .unwrap();
+        assert_ne!(r1.vpn_ip, r2.vpn_ip);
+        assert_eq!(
+            svc.peer_repo
+                .list_active_by_user("user-1")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // 同名终端重注册（重启后换了公钥）→ 复用原 IP，不新占槽位。
+        let r1b = svc
+            .register("user-1", &reg_named("PK1b", "MBP"))
+            .await
+            .unwrap();
+        assert_eq!(r1.vpn_ip, r1b.vpn_ip);
+        assert_eq!(
+            svc.peer_repo
+                .list_active_by_user("user-1")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn register_over_limit_takes_over_oldest_offline_device() {
+        // 默认上限 1：新终端顶掉离线的旧终端（复用其 IP，保持旧版自助语义）。
+        let svc = service(setup_pool().await);
+        let r1 = svc
+            .register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        let r2 = svc
+            .register("user-1", &reg_named("PK2", "iPhone"))
+            .await
+            .unwrap();
+        assert_eq!(r1.vpn_ip, r2.vpn_ip);
+        let peers = svc.peer_repo.list_active_by_user("user-1").await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].device_name, "iPhone");
+    }
+
+    #[tokio::test]
+    async fn register_over_limit_rejected_when_all_online() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        // 打卡使其在线 → 槽位不可被接管。
+        svc.heartbeat_checked("user-1", &hb(Some("PK1"), None), 1000)
+            .await
+            .unwrap();
+        let err = svc
+            .register("user-1", &reg_named("PK2", "iPhone"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_with_pubkey_touches_only_that_device() {
+        let pool = setup_pool().await;
+        let svc = service(pool.clone());
+        set_max_devices(&pool, "user-1", 2).await;
+        svc.register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        svc.register("user-1", &reg_named("PK2", "iPhone"))
+            .await
+            .unwrap();
+        svc.heartbeat_checked("user-1", &hb(Some("PK1"), None), 1000)
+            .await
+            .unwrap();
+        let peers = svc.peer_repo.list_active_by_user("user-1").await.unwrap();
+        let mbp = peers.iter().find(|p| p.device_name == "MBP").unwrap();
+        let phone = peers.iter().find(|p| p.device_name == "iPhone").unwrap();
+        assert_eq!(mbp.status, "online");
+        assert_eq!(phone.status, "offline");
+        // 未注册的公钥打卡 → PeerNotFound（客户端据此重新注册）。
+        let err = svc
+            .heartbeat_checked("user-1", &hb(Some("PKX"), None), 2000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::PeerNotFound));
+    }
+
+    #[tokio::test]
+    async fn delete_me_removes_all_devices() {
+        let pool = setup_pool().await;
+        let svc = service(pool.clone());
+        set_max_devices(&pool, "user-1", 2).await;
+        svc.register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        svc.register("user-1", &reg_named("PK2", "iPhone"))
+            .await
+            .unwrap();
+        svc.delete_me("user-1").await.unwrap();
+        assert!(svc
+            .peer_repo
+            .list_active_by_user("user-1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(svc.control.list_peers().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stores_health_metrics_and_online_since() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        let req = PeerHeartbeatRequest {
+            endpoint: Some("1.2.3.4:9".into()),
+            wg_public_key: Some("PK1".into()),
+            rtt_ms: Some(42),
+            loss_pct: Some(5.0),
+        };
+        svc.heartbeat_checked("user-1", &req, 1000).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user_and_pubkey("user-1", "PK1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.rtt_ms, Some(42));
+        assert_eq!(peer.loss_pct, Some(5.0));
+        assert_eq!(peer.online_since, Some(1000));
+
+        // 持续在线：online_since 保持首次上线时刻；指标更新。
+        let req2 = PeerHeartbeatRequest {
+            rtt_ms: Some(55),
+            ..req.clone()
+        };
+        svc.heartbeat_checked("user-1", &req2, 31_000)
+            .await
+            .unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user_and_pubkey("user-1", "PK1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.online_since, Some(1000));
+        assert_eq!(peer.rtt_ms, Some(55));
+
+        // 离线扫描后 online_since 清空；重新上线则重置为新时刻。
+        svc.scan_offline(31_000 + OFFLINE_THRESHOLD_MS + 1)
+            .await
+            .unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user_and_pubkey("user-1", "PK1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.status, "offline");
+        assert_eq!(peer.online_since, None);
+        svc.heartbeat_checked("user-1", &req, 200_000)
+            .await
+            .unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user_and_pubkey("user-1", "PK1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.online_since, Some(200_000));
+    }
+
+    #[tokio::test]
+    async fn register_stores_client_version_and_records_events() {
+        let svc = service(setup_pool().await);
+        let req1 = PeerRegisterRequest {
+            wg_public_key: "PK1".into(),
+            device_name: "MBP".into(),
+            os_info: Some("macOS 14".into()),
+            routed_subnets: Vec::new(),
+            client_version: Some("0.1.0".into()),
+        };
+        svc.register("user-1", &req1).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.client_version.as_deref(), Some("0.1.0"));
+
+        // 新终端 → 记 vpn_ip 事件。
+        let q = vpn_api_types::peer::PeerEventQuery {
+            peer_id: None,
+            limit: None,
+        };
+        let events = svc.list_events(&q).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].field, "vpn_ip");
+        assert_eq!(events[0].new_value.as_deref(), Some(&*peer.vpn_ip));
+
+        // OS 升级 + 版本升级 → 各记一条变更。
+        let req2 = PeerRegisterRequest {
+            os_info: Some("macOS 15".into()),
+            client_version: Some("0.2.0".into()),
+            ..req1
+        };
+        svc.register("user-1", &req2).await.unwrap();
+        let events = svc.list_events(&q).await.unwrap();
+        let fields: Vec<&str> = events.iter().map(|e| e.field.as_str()).collect();
+        assert!(fields.contains(&"os_info"));
+        assert!(fields.contains(&"client_version"));
+        let os_ev = events.iter().find(|e| e.field == "os_info").unwrap();
+        assert_eq!(os_ev.old_value.as_deref(), Some("macOS 14"));
+        assert_eq!(os_ev.new_value.as_deref(), Some("macOS 15"));
+
+        // 按 peer 过滤。
+        let q_peer = vpn_api_types::peer::PeerEventQuery {
+            peer_id: Some(peer.id.clone()),
+            limit: Some(10),
+        };
+        assert_eq!(svc.list_events(&q_peer).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_endpoint_change_records_event() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        svc.heartbeat_checked("user-1", &hb(Some("PK1"), Some("1.1.1.1:1")), 1000)
+            .await
+            .unwrap();
+        svc.heartbeat_checked("user-1", &hb(Some("PK1"), Some("1.1.1.1:1")), 2000)
+            .await
+            .unwrap();
+        // 同 endpoint 重复心跳不重复记录；变更才记录。
+        svc.heartbeat_checked("user-1", &hb(Some("PK1"), Some("2.2.2.2:2")), 3000)
+            .await
+            .unwrap();
+        let q = vpn_api_types::peer::PeerEventQuery {
+            peer_id: None,
+            limit: None,
+        };
+        let endpoint_events: Vec<_> = svc
+            .list_events(&q)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.field == "endpoint")
+            .collect();
+        assert_eq!(endpoint_events.len(), 2);
+        // 时间倒序：最新的是 1.1.1.1:1 → 2.2.2.2:2。
+        assert_eq!(endpoint_events[0].old_value.as_deref(), Some("1.1.1.1:1"));
+        assert_eq!(endpoint_events[0].new_value.as_deref(), Some("2.2.2.2:2"));
+        assert_eq!(endpoint_events[1].old_value, None);
+    }
+
+    #[tokio::test]
+    async fn force_remove_by_user_marks_all_devices() {
+        let pool = setup_pool().await;
+        let svc = service(pool.clone());
+        set_max_devices(&pool, "user-1", 2).await;
+        svc.register("user-1", &reg_named("PK1", "MBP"))
+            .await
+            .unwrap();
+        svc.register("user-1", &reg_named("PK2", "iPhone"))
+            .await
+            .unwrap();
+        svc.force_remove_by_user("user-1").await.unwrap();
+        let peers = svc.peer_repo.list_active_by_user("user-1").await.unwrap();
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().all(|p| p.status == "force_removed"));
+        assert!(svc.control.list_peers().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1156,8 +1674,8 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_subnet_overlapping_vpn_subnet() {
         let svc = service(setup_pool().await); // VPN 子网 10.8.0.0/24
-        // 站点网段覆盖 VPN 子网超网（10/8）→ 拒绝：否则服务端 `ip route replace 10.0.0.0/8 dev wg0`
-        // 会劫持服务端整段 10/8 路由。
+                                               // 站点网段覆盖 VPN 子网超网（10/8）→ 拒绝：否则服务端 `ip route replace 10.0.0.0/8 dev wg0`
+                                               // 会劫持服务端整段 10/8 路由。
         let err = svc
             .register("user-1", &reg_with_subnets("PK1", &["10.0.0.0/8"]))
             .await
@@ -1371,7 +1889,7 @@ mod tests {
         let peer_repo = SqlitePeerRepository::new(pool.clone());
         // 预置一个占用 10.8.0.2 的 peer
         peer_repo
-            .insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, "")
+            .insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, None, "")
             .await
             .unwrap();
         let subnet: Ipv4Net = "10.8.0.0/24".parse().unwrap();
@@ -1408,7 +1926,7 @@ mod tests {
 
         // 心跳被拒（TokenExpired → 401）
         let err = svc
-            .heartbeat_checked("user-1", None, 1000)
+            .heartbeat_checked("user-1", &hb(None, None), 1000)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::TokenExpired));
@@ -1428,7 +1946,9 @@ mod tests {
         // 强制下线 → 心跳被拒。
         svc.force_remove(&peer.id).await.unwrap();
         assert!(matches!(
-            svc.heartbeat_checked("user-1", None, 1000).await.unwrap_err(),
+            svc.heartbeat_checked("user-1", &hb(None, None), 1000)
+                .await
+                .unwrap_err(),
             AppError::TokenExpired
         ));
 
@@ -1438,7 +1958,9 @@ mod tests {
         assert_eq!(row.status, "offline");
 
         // 心跳恢复 → online。
-        svc.heartbeat_checked("user-1", None, 2000).await.unwrap();
+        svc.heartbeat_checked("user-1", &hb(None, None), 2000)
+            .await
+            .unwrap();
         let row = svc.peer_repo.find_by_id(&peer.id).await.unwrap().unwrap();
         assert_eq!(row.status, "online");
     }
@@ -1526,7 +2048,7 @@ mod tests {
     async fn heartbeat_checked_ok_for_normal_peer() {
         let svc = service(setup_pool().await);
         svc.register("user-1", &reg("PK1")).await.unwrap();
-        svc.heartbeat_checked("user-1", Some("1.2.3.4:99"), 1000)
+        svc.heartbeat_checked("user-1", &hb(None, Some("1.2.3.4:99")), 1000)
             .await
             .unwrap();
         let row = svc

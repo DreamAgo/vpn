@@ -79,11 +79,12 @@ impl SqliteUserGroupRepository {
 
     /// 该组当前成员数。
     pub async fn member_count(&self, id: &str) -> Result<i64> {
-        let c: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_group_members WHERE group_id = ?1")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| AppError::Database(Box::new(e)))?;
+        let c: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM user_group_members WHERE group_id = ?1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(c.0)
     }
 
@@ -127,7 +128,8 @@ impl SqliteUserGroupRepository {
             return Ok(0);
         }
         let now = Utc::now().timestamp_millis();
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("UPDATE user_groups SET updated_at = ");
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("UPDATE user_groups SET updated_at = ");
         qb.push_bind(now);
         if let Some(n) = name {
             qb.push(", name = ");
@@ -368,7 +370,12 @@ mod tests {
         let pool = setup_pool().await;
         let repo = SqliteUserGroupRepository::new(pool);
         repo.insert("g1", "ops", "10.0.0.0/8").await.unwrap();
-        assert_eq!(repo.update("g1", Some("eng"), Some("172.16.0.0/12")).await.unwrap(), 1);
+        assert_eq!(
+            repo.update("g1", Some("eng"), Some("172.16.0.0/12"))
+                .await
+                .unwrap(),
+            1
+        );
         let g = repo.get("g1").await.unwrap().unwrap();
         assert_eq!(g.name, "eng");
         assert_eq!(g.routes, "172.16.0.0/12");

@@ -51,7 +51,9 @@ pub async fn update_subnet(
     Json(body): Json<UpdateSubnetRequest>,
 ) -> Result<Json<ApiResponse<SubnetDto>>, ApiError> {
     let svc = state.subnet_service()?;
-    let dto = svc.update(&id, body.name.as_deref(), body.cidr.as_deref()).await?;
+    let dto = svc
+        .update(&id, body.name.as_deref(), body.cidr.as_deref())
+        .await?;
     Ok(success(&state, dto))
 }
 

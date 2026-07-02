@@ -11,6 +11,7 @@ import { usersApi } from '@/services/users';
 import { peersApi } from '@/services/peers';
 import { NodeStatusDot } from '@/components/NodeStatusDot';
 import { EditServerRoutesModal } from '@/components/EditServerRoutesModal';
+import { PeerHealthTable, PeerEventsCard } from '@/components/PeerHealthSection';
 import type { AdminPeerView } from '@/types/api';
 
 dayjs.extend(relativeTime);
@@ -234,6 +235,20 @@ export function DashboardPage() {
               </Descriptions>
             )}
           </Card>
+        </Col>
+      </Row>
+
+      {/* 节点健康监控 */}
+      <Row gutter={[20, 20]} style={{ marginTop: 20 }}>
+        <Col xs={24} xl={16}>
+          <SectionHead label="健康" title="节点健康" />
+          <Card styles={{ body: { padding: 4 } }}>
+            <PeerHealthTable peers={peers} />
+          </Card>
+        </Col>
+        <Col xs={24} xl={8}>
+          <SectionHead label="变更" title="最近变更记录" />
+          <PeerEventsCard />
         </Col>
       </Row>
 

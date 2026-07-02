@@ -21,6 +21,9 @@ pub struct PeerRegisterRequest {
     /// 作为站点网关时声明，服务端会把这些网段路由到本节点。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routed_subnets: Vec<String>,
+    /// 可选：客户端版本（如 "0.1.0"，节点健康监控展示用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 /// 注册节点响应：客户端据此组装本地 WireGuard 隧道。
@@ -46,6 +49,16 @@ pub struct PeerHeartbeatRequest {
     /// 客户端当前出口 endpoint（IP:port），用于漫游与展示；可空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 本机 WireGuard 公钥：多终端模式下用于精确定位是哪台终端在打卡。
+    /// 旧客户端不携带 → 服务端回退按用户打卡（单终端语义）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_public_key: Option<String>,
+    /// 上一次心跳请求的往返延迟（毫秒，客户端测量；节点健康监控）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<i64>,
+    /// 最近 N 次心跳的失败率（百分比 0-100，客户端统计；节点健康监控）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_pct: Option<f64>,
 }
 
 /// 心跳响应：回带该节点当前应导入隧道的网段。
@@ -94,6 +107,44 @@ pub struct AdminPeerView {
     pub created_at: i64,
     #[serde(default)]
     pub routed_subnets: Vec<String>,
+    /// 本次转为在线的起始时刻（unix ms）；不在线为 None。用于展示“在线时长”。
+    #[serde(default)]
+    pub online_since: Option<i64>,
+    /// 客户端最近上报的心跳往返延迟（毫秒）。
+    #[serde(default)]
+    pub rtt_ms: Option<i64>,
+    /// 客户端最近上报的心跳丢包率（百分比 0-100）。
+    #[serde(default)]
+    pub loss_pct: Option<f64>,
+    /// 客户端版本。
+    #[serde(default)]
+    pub client_version: Option<String>,
+}
+
+/// 节点属性变更记录（OS / IP / Endpoint / 设备名 / 版本；节点健康监控）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEventView {
+    pub id: String,
+    pub peer_id: String,
+    /// 设备名 / 用户名（peer 或用户已被删除时为 None）。
+    pub device_name: Option<String>,
+    pub username: Option<String>,
+    /// 变更字段：'os_info' | 'endpoint' | 'vpn_ip' | 'device_name' | 'client_version'
+    pub field: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub created_at: i64,
+}
+
+/// 变更记录查询参数（GET /admin/peer-events）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEventQuery {
+    /// 只看某个节点的记录；缺省为全部节点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
+    /// 返回条数（默认 50，最多 200）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// 更新 peer 路由网段请求（PATCH /admin/peers/:id）。

@@ -51,7 +51,7 @@ impl AuthService {
         let user_id = Uuid::now_v7().to_string();
         let user = self
             .user_repo
-            .insert(&user_id, username, email, &hash, "admin", false)
+            .insert(&user_id, username, email, &hash, "admin", false, 1)
             .await?;
         let access = self.issuer.issue_access(&user.id, &user.role).await?;
         let refresh = self.issuer.issue_refresh(&user.id).await?;
