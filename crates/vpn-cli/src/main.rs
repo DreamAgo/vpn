@@ -74,8 +74,18 @@ async fn run() -> CliResult<()> {
 
 /// 选择凭证后端：系统钥匙串（keyring）为主路径。
 ///
-/// 真机降级：当 keyring 不可用（如 Linux headless 无 libsecret）时，可改用
-/// [`CredentialRepo::file`]；本入口默认 keyring，降级策略留给部署配置。
+/// 真机降级：当 keyring 不可用（如 Linux headless / 容器内无 libsecret）时，
+/// 设环境变量 `VPN_CLI_CRED_BACKEND=file` 改用加密文件存储
+/// （`~/.config/vpn-cli/creds.enc`）。默认仍走 keyring。
 fn credential_repo() -> CredentialRepo {
+    let use_file = std::env::var("VPN_CLI_CRED_BACKEND")
+        .map(|v| v.eq_ignore_ascii_case("file"))
+        .unwrap_or(false);
+    if use_file {
+        match CredentialRepo::file() {
+            Ok(repo) => return repo,
+            Err(e) => eprintln!("vpn-cli: 文件凭证后端不可用，回退 keyring: {e}"),
+        }
+    }
     CredentialRepo::keyring()
 }

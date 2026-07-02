@@ -60,6 +60,19 @@ impl CliError {
             }
         )
     }
+
+    /// 是否为「服务端已无此 peer」（被管理员彻底删除）错误。
+    ///
+    /// 心跳遇此应视为致命：拆隧道并提示重新登录，而非当瞬时错误无限重连。
+    pub fn is_peer_gone(&self) -> bool {
+        matches!(
+            self,
+            CliError::Api {
+                code: vpn_api_types::error_codes::PEER_NOT_FOUND,
+                ..
+            }
+        )
+    }
 }
 
 impl From<reqwest::Error> for CliError {

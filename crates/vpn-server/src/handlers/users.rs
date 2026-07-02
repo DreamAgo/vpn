@@ -12,6 +12,7 @@ use axum::{
     Json,
 };
 use vpn_api_types::{
+    group::AssignGroupRequest,
     user::{
         CreateUserRequest, CreateUserResponse, ListUsersQuery, ResetPasswordResponse,
         UpdateUserRequest, UserDto,
@@ -69,6 +70,13 @@ pub async fn update_user(
         .status
         .ok_or_else(|| AppError::Config("缺少 status 字段".to_string()))?;
     let dto = svc.update_status(&id, &status).await?;
+    // 禁用即踢隧道:强制下线其节点(摘除 WG peer + 标记 force_removed,可恢复)。
+    // peer_service 未装配(如纯用户管理测试场景)则跳过这一联动副作用。
+    if status == "disabled" {
+        if let Ok(ps) = state.peer_service() {
+            ps.force_remove_by_user(&id).await?;
+        }
+    }
     Ok(success(&state, dto))
 }
 
@@ -84,6 +92,19 @@ pub async fn reset_password(
     Ok(success(&state, ResetPasswordResponse { new_password }))
 }
 
+/// PUT /api/v1/admin/users/:id/groups —— 全量设置用户所属组（空列表=取消所有分组）。
+#[tracing::instrument(skip(state, body))]
+pub async fn set_user_groups(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+    Path(id): Path<String>,
+    Json(body): Json<AssignGroupRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let svc = state.user_group_service()?;
+    svc.set_user_groups(&id, &body.group_ids).await?;
+    Ok(success(&state, ()))
+}
+
 /// Story 3.5：DELETE /api/v1/admin/users/:id
 #[tracing::instrument(skip(state, admin))]
 pub async fn delete_user(
@@ -91,7 +112,21 @@ pub async fn delete_user(
     RequireAdmin(admin): RequireAdmin,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    // 不能删自己（与 user_service.delete_user 内部校验一致）；前置以免给被拒请求误清节点。
+    if admin.user_id == id {
+        return Err(AppError::NoAccessReason("无法删除自己的账号".to_string()).into());
+    }
+    // 必须**先**清节点再删用户行：peers.user_id -> users.id 外键无级联，先删 users 会触发外键
+    // 冲突（删任何有 peer 行的用户都会失败）。purge_by_user 摘 WG + 硬删其全部 peer 行 + 回收 IP。
+    // peer_service / user_group_service 未装配（纯用户管理测试场景）则跳过对应联动。
+    if let Ok(ps) = state.peer_service() {
+        ps.purge_by_user(&id).await?;
+    }
     let svc = state.user_service()?;
     svc.delete_user(&admin.user_id, &id).await?;
+    // 联动清理其组成员关联，避免悬挂行使组 member_count 永久虚高（user_group_members 无 FK 级联）。
+    if let Ok(gs) = state.user_group_service() {
+        let _ = gs.remove_user_from_groups(&id).await;
+    }
     Ok(success(&state, ()))
 }

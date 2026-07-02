@@ -3,17 +3,17 @@
 //! daemon 负责持有 VPN 连接的生命周期：
 //! 1. 读凭证（server_url + refresh_token）→ API refresh/login 拿 access token；
 //! 2. `generate_keypair` → `register_peer` 取得分配的 vpn_ip 与服务端信息；
-//! 3. `open_tun` + `configure_ip(vpn_ip)` 打开并配置 TUN 设备；
+//! 3. [`bring_up_tunnel`] 启动**用户态 WireGuard 数据面**（见 [`crate::wg_userspace`]：
+//!    boringtun + tun + UDP，全平台统一、零外部依赖，仅需 root/管理员开 TUN）；
 //! 4. 启动心跳任务（每 30s `heartbeat`）；
 //! 5. 启动 IPC server 处理 CLI 的 Connect/Disconnect/GetStatus；
-//! 6. 数据面转发循环（TUN <-> WireGuard 加解密 <-> UDP）——**骨架**，真机验证。
+//! 6. Disconnect 时一个 watch 信号同时停心跳与转发任务（后者自行删路由、关设备）。
 //!
 //! 状态机 [`ConnState`]：Disconnected / Connecting / Connected / Reconnecting /
 //! Error，经共享 [`SharedState`] 对外（IPC）暴露。
 //!
-//! 本模块大量路径需要真实设备 / root / 网络，单测覆盖**纯逻辑**（状态转移、
-//! 心跳间隔常量、endpoint 推断），系统集成路径以 `// 真机验证` 注释标注且
-//! 不 panic。
+//! 单测覆盖**纯逻辑**（状态转移、心跳间隔常量、allowed-ips 计算、CIDR 推断）；
+//! 真正建隧道需 root + TUN 设备 + 真实对端，在真机/容器验证。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,9 @@ use crate::ipc::{ConnState, IpcRequest, IpcResponse, StatusResponse};
 
 /// 心跳间隔（秒）。服务端期望 30s 一次（见 vpn_api_types::peer）。
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// WireGuard persistent-keepalive（秒），用于 NAT 保活（穿透常驻 NAT 映射）。
+pub const PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 
 /// daemon 共享状态（IPC 与后台任务并发访问）。
 #[derive(Debug, Clone)]
@@ -159,6 +162,20 @@ pub struct TunnelParams {
     pub server_endpoint: String,
     /// 客户端私钥（本地生成，不上送服务端）。
     pub client_private_key: String,
+    /// 应导入隧道的网段（AllowedIPs）：VPN 子网 + 各站点 LAN。
+    pub allowed_routes: Vec<String>,
+}
+
+/// 纯逻辑：计算客户端隧道实际使用的 allowed-ips。
+///
+/// 服务端 `allowed_routes` 已含 VPN 子网；为兼容旧服务端（字段缺省为空），
+/// 空时回退为仅 VPN 子网。
+pub fn effective_allowed_ips(params: &TunnelParams) -> Vec<String> {
+    if params.allowed_routes.is_empty() {
+        vec![params.vpn_subnet.clone()]
+    } else {
+        params.allowed_routes.clone()
+    }
 }
 
 /// 纯逻辑：从 register 响应 + 本地私钥组装隧道参数，并把 vpn_ip 规整为 CIDR。
@@ -178,10 +195,10 @@ pub fn build_configure_cidr(vpn_ip: &str, vpn_subnet: &str) -> CliResult<String>
     Ok(format!("{vpn_ip}/{prefix}"))
 }
 
-/// 执行一次连接：login/refresh → register → 打开并配置 TUN。
+/// 执行一次连接：login/refresh → register，返回隧道参数。
 ///
-/// 返回隧道参数；失败返回错误供重连逻辑决策。真正的数据面转发由
-/// [`run_data_plane`] 承担。
+/// 仅负责控制平面（鉴权 + 注册取得分配的 VPN IP 与服务端信息）；真正建立数据面
+/// 隧道由 [`bring_up_tunnel`] 承担，心跳由 [`run_heartbeat`] 承担。
 pub async fn connect_once(
     api: &ApiClient,
     keypair: &vpn_wireguard::WgKeypair,
@@ -203,94 +220,157 @@ pub async fn connect_once(
     };
     let resp = api.register_peer(&req).await?;
 
-    let params = TunnelParams {
+    // Split-horizon：内网节点可经 `VPN_ENDPOINT_OVERRIDE` 用内网 endpoint 直连，
+    // 避开公网 IP 的 NAT 回环；外网节点不设置该变量，用服务端下发的(公网) endpoint。
+    let server_endpoint = std::env::var("VPN_ENDPOINT_OVERRIDE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| resp.server_endpoint.clone());
+    if server_endpoint != resp.server_endpoint {
+        tracing::info!(override_endpoint = %server_endpoint, server_endpoint = %resp.server_endpoint, "使用 VPN_ENDPOINT_OVERRIDE 覆盖隧道 endpoint");
+    }
+
+    Ok(TunnelParams {
         vpn_ip: resp.vpn_ip.clone(),
         vpn_subnet: resp.vpn_subnet.clone(),
         server_public_key: resp.server_public_key.clone(),
-        server_endpoint: resp.server_endpoint.clone(),
+        server_endpoint,
         client_private_key: keypair.private_key.clone(),
-    };
-
-    // 3) 打开 TUN 并配置 IP。真机验证：需要 root / 管理员权限。
-    let cidr = build_configure_cidr(&params.vpn_ip, &params.vpn_subnet)?;
-    let mut tun = vpn_platform::open_tun("vpn-cli0")?;
-    tun.configure_ip(&cidr).await?;
-    // 设备打开成功后即关闭句柄；真正的转发循环在 run_data_plane 中重新持有。
-    // （此处分离便于「连接验证」与「长期转发」职责清晰；真机上应直接复用。）
-    tun.close().await?;
-
-    Ok(params)
+        allowed_routes: resp.allowed_routes.clone(),
+    })
 }
 
-/// 数据面转发循环骨架：TUN <-> WireGuard 加解密 <-> UDP。
+/// 建立客户端数据面隧道：**全平台统一走用户态 WireGuard**（boringtun，零外部依赖）。
 ///
-/// 真机验证：本轮不实现真实 boringtun 隧道（与 vpn-wireguard 的 x25519-dalek
-/// 版本约束冲突，且需 root + UDP socket + 真实对端）。这里给出结构清晰的骨架：
-/// - 打开 TUN 设备并配置 IP；
-/// - 循环 `recv` 出站 IP 包 → （此处应交给 WireGuard 加密后经 UDP 发往服务端）；
-/// - 从 UDP 收到密文 → （解密后）`send` 回 TUN。
-///
-/// 当前实现仅维持设备打开 + 在收到关停信号时退出，不做真实转发，**不 panic**。
-pub async fn run_data_plane(
+/// 不再 shell-out 到 `wg`/`wg-quick`/`wireguard.exe`——隧道在进程内完成（见
+/// [`crate::wg_userspace`]）。仅需 root/管理员开 TUN 设备。转发任务在 `shutdown`
+/// 置位后自行清理（删路由、关设备），故 [`tear_down_tunnel`] 只需触发该信号。
+pub async fn bring_up_tunnel(
+    iface: &str,
+    keypair: &vpn_wireguard::WgKeypair,
     params: &TunnelParams,
-    state: &SharedState,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-    now_unix: i64,
-) -> CliResult<()> {
-    let cidr = build_configure_cidr(&params.vpn_ip, &params.vpn_subnet)?;
-    let mut tun = vpn_platform::open_tun("vpn-cli0")?;
-    tun.configure_ip(&cidr).await?;
-    state.set_state(ConnState::Connected, now_unix).await;
-
-    // 真机验证：此处应构造 WireGuard Tunn（client_private_key + server_public_key）
-    // 与 UDP socket（连接 server_endpoint），并用 select! 在三个方向间转发：
-    //   tun.recv -> tunn.encapsulate -> udp.send
-    //   udp.recv -> tunn.decapsulate -> tun.send
-    //   tunn.update_timers 周期性维护握手 / keepalive
-    // 当前骨架只等待关停信号，避免在无对端 / 无权限环境忙等或 panic。
-    let mut buf = vec![0u8; 1500];
-    loop {
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-            }
-            // 真机验证：读取出站包。无设备能力时该分支不会就绪，仅占位说明数据流向。
-            res = tun.recv(&mut buf) => {
-                match res {
-                    Ok(n) => {
-                        // 出站包：加密后经 UDP 送出（骨架未实现）。
-                        state.add_traffic(0, n as u64).await;
-                    }
-                    Err(_) => break, // 设备异常 -> 交给上层重连
-                }
-            }
-        }
-    }
-    let _ = tun.close().await;
-    Ok(())
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    // 转发循环遇致命错误时广播关停(连带停心跳)的发送端,通常传 shutdown 对应 Sender 的 clone。
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    // 流量计数回写目标（前端读 bytes_rx/bytes_tx）；None 时不统计。
+    traffic: Option<SharedState>,
+    // 实时路由更新接收端(P1.4);None 时不支持热更新。
+    routes_rx: Option<tokio::sync::watch::Receiver<Vec<String>>>,
+) -> CliResult<tokio::task::JoinHandle<()>> {
+    let vpn_ip: std::net::Ipv4Addr = params
+        .vpn_ip
+        .parse()
+        .map_err(|e| CliError::Other(format!("非法 vpn_ip `{}`: {e}", params.vpn_ip)))?;
+    // 从 vpn_subnet（如 10.8.0.0/24）取前缀；缺省按 /24。
+    let prefix = params
+        .vpn_subnet
+        .split_once('/')
+        .and_then(|(_, p)| p.parse::<u8>().ok())
+        .unwrap_or(24);
+    let allowed = effective_allowed_ips(params);
+    crate::wg_userspace::UserspaceTunnel::bring_up(
+        iface,
+        &keypair.private_key,
+        &params.server_public_key,
+        &params.server_endpoint,
+        vpn_ip,
+        prefix,
+        &allowed,
+        PERSISTENT_KEEPALIVE_SECS,
+        shutdown,
+        shutdown_tx,
+        traffic,
+        routes_rx,
+    )
+    .await
 }
 
-/// 心跳循环骨架：每 [`HEARTBEAT_INTERVAL_SECS`] 秒上报一次。
+/// 拆除隧道：用户态实现的转发任务在 shutdown 信号后自行删路由 + 关设备，
+/// 故此处无需额外动作（保留函数以维持调用点语义清晰）。
+pub async fn tear_down_tunnel(_iface: &str) {}
+
+/// 心跳循环：每 [`HEARTBEAT_INTERVAL_SECS`] 秒上报一次，**韧性重连**版。
 ///
-/// 上报失败（如 token 失效已自动刷新仍失败、网络中断）返回错误，交由重连逻辑。
+/// 关键语义：网络抖动不应拆隧道——用户态数据面(boringtun)的定时器会自动重握手，
+/// 只要心跳任务不"死掉"。因此：
+/// - **瞬时失败**（网络中断/服务端暂不可达）：不退出，标记 [`ConnState::Reconnecting`]，
+///   下个 tick 重试；成功后自动恢复 [`ConnState::Connected`]。
+/// - **token 彻底失效**（access 已自动刷新仍失败 → 被管理员强制下线）：返回 `Err`，
+///   交由上层拆隧道并要求重新登录。
+///
+/// `state` 用于回写重连/恢复状态(前端据此显示)；`None` 时仅靠返回值表达结果。
+///
+/// P1.4:心跳响应回带服务端实时计算的 `allowed_routes`;与 `initial_routes`(建隧道时
+/// 的集合)比对,有变化即经 `routes_tx` 下发给转发循环做增量路由更新——组/网段变更
+/// 无需重连即对在线节点生效。比对顺序无关(排序后比)。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_heartbeat(
     api: Arc<ApiClient>,
     endpoint: Option<String>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    state: Option<SharedState>,
+    initial_routes: Vec<String>,
+    routes_tx: Option<tokio::sync::watch::Sender<Vec<String>>>,
 ) -> CliResult<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    let mut failures: u32 = 0;
+    // 当前已应用的 allowed_routes(排序后,用于顺序无关比对)。
+    let mut current_sorted = {
+        let mut v = initial_routes;
+        v.sort();
+        v
+    };
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+            res = shutdown.changed() => {
+                // sender 被 drop（主循环退出/连接被替换）或显式置位 true → 退出心跳循环，
+                // 不在通道关闭后空转（changed() 对已关闭通道会立即 Err 并永久就绪）。
+                if res.is_err() || *shutdown.borrow() { break; }
             }
             _ = ticker.tick() => {
                 let req = vpn_api_types::peer::PeerHeartbeatRequest {
                     endpoint: endpoint.clone(),
                 };
-                api.heartbeat(&req).await?;
+                match api.heartbeat(&req).await {
+                    Ok(resp) => {
+                        // P1.4:检测 allowed_routes 变化 → 下发实时路由更新。
+                        let mut next_sorted = resp.allowed_routes.clone();
+                        next_sorted.sort();
+                        // 空集视为“服务端未回带路由信息”（旧服务端 data:null → 解析为默认空）：
+                        // 跳过下发，避免把本地路由全删成黑洞。新服务端的 allowed_routes 恒含
+                        // VPN 子网，不会为空。
+                        if !resp.allowed_routes.is_empty() && next_sorted != current_sorted {
+                            tracing::info!(
+                                routes = ?resp.allowed_routes,
+                                "检测到 allowed_routes 变更,下发实时路由更新"
+                            );
+                            current_sorted = next_sorted;
+                            if let Some(tx) = &routes_tx {
+                                let _ = tx.send(resp.allowed_routes);
+                            }
+                        }
+                        // 抖动后恢复:从 Reconnecting 标回 Connected。
+                        if failures > 0 {
+                            failures = 0;
+                            tracing::info!("心跳恢复,连接已重新建立");
+                            if let Some(s) = &state {
+                                s.set_state(ConnState::Connected, now_unix()).await;
+                            }
+                        }
+                    }
+                    // 致命错误 → 交上层拆隧道、回登录，而非当瞬时错误无限重连、把死隧道挂着黑洞流量：
+                    // - token+refresh 都失效（被管理员强制下线）；
+                    // - 服务端已无此 peer（被管理员彻底删除）→ PeerNotFound。
+                    Err(e) if e.is_token_expired() || e.is_peer_gone() => return Err(e),
+                    // 瞬时网络错误:保持隧道,标记重连,下个 tick 再试。
+                    Err(e) => {
+                        failures = failures.saturating_add(1);
+                        tracing::warn!(error = %e, failures, "心跳失败,保持隧道并重试");
+                        if let Some(s) = &state {
+                            s.set_state(ConnState::Reconnecting, now_unix()).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -332,10 +412,13 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
         let _ = crate::ipc::serve(&socket, handler).await;
     });
 
-    // 主循环：响应控制消息。真机验证：实际驱动 connect_once + run_data_plane +
-    // run_heartbeat + 重连。此处保证不 panic 且可被 Disconnect 优雅关停。
+    // 主循环：响应控制消息。Connect → 注册 + 建内核隧道 + 启动心跳任务；
+    // Disconnect → 停心跳 + 拆隧道。保证不 panic 且可被 Disconnect 优雅关停。
     let keypair = vpn_wireguard::generate_keypair();
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    // 每条活跃连接持有一个心跳任务关停信号；重连/断开时替换或清空。
+    let mut active_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+    // 当前活跃连接的转发任务句柄；重连时等它清完路由再建新隧道，避免删掉新隧道的同 CIDR 路由。
+    let mut active_forward: Option<tokio::task::JoinHandle<()>> = None;
     while let Some(msg) = ctrl_rx.recv().await {
         match msg {
             ControlMsg::Connect => {
@@ -344,8 +427,76 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                     .await
                 {
                     Ok(params) => {
-                        state.set_vpn_ip(Some(params.vpn_ip.clone())).await;
-                        state.set_state(ConnState::Connected, now_unix()).await;
+                        // 注册成功后再拆旧连接（先提交后拆）：避免一次冗余 Connect 叠加瞬时失败
+                        // 把正在工作的隧道毁掉。先发关停信号，再**等待**旧转发任务退出（它会删自己
+                        // 加的路由）——否则旧任务的 `route delete` 可能删掉下面新隧道刚加的同 CIDR
+                        // 路由，导致重连黑洞；固定 TUN 名也可能因旧设备未释放而 EBUSY。
+                        if let Some(tx) = active_shutdown.take() {
+                            let _ = tx.send(true);
+                        }
+                        if let Some(old) = active_forward.take() {
+                            let _ =
+                                tokio::time::timeout(std::time::Duration::from_secs(3), old).await;
+                        }
+                        // 关停信号：隧道转发任务与心跳任务共用，Disconnect 一并停止。
+                        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+                        // 实时路由通道(P1.4):心跳→转发循环下发新 allowed_routes。
+                        let init_routes = effective_allowed_ips(&params);
+                        let (routes_tx, routes_rx) =
+                            tokio::sync::watch::channel(init_routes.clone());
+                        match bring_up_tunnel(
+                            &config.interface,
+                            &keypair,
+                            &params,
+                            sd_rx.clone(),
+                            sd_tx.clone(),
+                            Some(state.clone()),
+                            Some(routes_rx),
+                        )
+                        .await
+                        {
+                            Ok(task) => {
+                                active_forward = Some(task);
+                                state.set_vpn_ip(Some(params.vpn_ip.clone())).await;
+                                state.set_state(ConnState::Connected, now_unix()).await;
+                                // 心跳任务在致命错误时需主动拆数据面隧道，故克隆一份关停发送端
+                                // 给它（主关停端仍存 active_shutdown 供 Disconnect 使用）。
+                                let hb_sd_tx = sd_tx.clone();
+                                active_shutdown = Some(sd_tx);
+                                // 启动心跳任务：每 30s 上报，daemon 在线即自动保活。
+                                // 韧性重连:瞬时失败不退出;仅致命错误(强制下线/peer 被删)才退出并置错误态。
+                                let api_hb = api.clone();
+                                let state_hb = state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = run_heartbeat(
+                                        api_hb,
+                                        None,
+                                        sd_rx,
+                                        Some(state_hb.clone()),
+                                        init_routes,
+                                        Some(routes_tx),
+                                    )
+                                    .await
+                                    {
+                                        // 致命错误：主动停掉数据面转发循环（删路由、关设备），
+                                        // 避免转发任务成孤儿、把已失效隧道的路由继续黑洞流量。
+                                        let _ = hb_sd_tx.send(true);
+                                        tracing::warn!(error = %e, "心跳任务退出，已拆除隧道");
+                                        let msg = if e.is_token_expired() {
+                                            "已被管理员强制下线,请重新登录后再连接".to_string()
+                                        } else {
+                                            format!("连接已断开:{e}")
+                                        };
+                                        state_hb.set_error(msg, now_unix()).await;
+                                    }
+                                });
+                                tracing::info!(vpn_ip = %params.vpn_ip, iface = %config.interface, "已连接，心跳已启动");
+                            }
+                            Err(e) => {
+                                // 建隧道失败：sd_tx 随作用域 drop（未 spawn 任务）。
+                                state.set_error(e.to_string(), now_unix()).await;
+                            }
+                        }
                     }
                     Err(e) => {
                         state.set_error(e.to_string(), now_unix()).await;
@@ -353,7 +504,13 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                 }
             }
             ControlMsg::Disconnect => {
-                let _ = shutdown_tx.send(true);
+                if let Some(tx) = active_shutdown.take() {
+                    let _ = tx.send(true);
+                }
+                if let Some(old) = active_forward.take() {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), old).await;
+                }
+                tear_down_tunnel(&config.interface).await;
                 state.set_state(ConnState::Disconnected, now_unix()).await;
             }
         }
@@ -361,7 +518,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
     Ok(())
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
@@ -394,6 +551,32 @@ mod tests {
     fn build_cidr_rejects_bad_subnet() {
         assert!(build_configure_cidr("10.8.0.5", "10.8.0.0").is_err());
         assert!(build_configure_cidr("10.8.0.5", "nonsense").is_err());
+    }
+
+    fn sample_params(allowed: Vec<String>) -> TunnelParams {
+        TunnelParams {
+            vpn_ip: "10.8.0.5".into(),
+            vpn_subnet: "10.8.0.0/24".into(),
+            server_public_key: "spub".into(),
+            server_endpoint: "1.2.3.4:51820".into(),
+            client_private_key: "priv".into(),
+            allowed_routes: allowed,
+        }
+    }
+
+    #[test]
+    fn effective_allowed_ips_uses_server_routes_when_present() {
+        let p = sample_params(vec!["10.8.0.0/24".into(), "192.168.20.0/24".into()]);
+        assert_eq!(
+            effective_allowed_ips(&p),
+            vec!["10.8.0.0/24".to_string(), "192.168.20.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_allowed_ips_falls_back_to_vpn_subnet() {
+        let p = sample_params(vec![]);
+        assert_eq!(effective_allowed_ips(&p), vec!["10.8.0.0/24".to_string()]);
     }
 
     #[test]

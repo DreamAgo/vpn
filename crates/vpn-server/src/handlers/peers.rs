@@ -14,8 +14,8 @@ use axum::{
 };
 use vpn_api_types::{
     peer::{
-        AdminPeerQuery, AdminPeerView, PeerHeartbeatRequest, PeerRegisterRequest,
-        PeerRegisterResponse, UpdatePeerRoutesRequest,
+        AdminPeerQuery, AdminPeerView, PeerHeartbeatRequest, PeerHeartbeatResponse,
+        PeerRegisterRequest, PeerRegisterResponse, UpdatePeerRoutesRequest,
     },
     ApiResponse, Page,
 };
@@ -52,16 +52,17 @@ pub async fn heartbeat(
     State(state): State<AppState>,
     current: CurrentUser,
     Json(body): Json<PeerHeartbeatRequest>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
+) -> Result<Json<ApiResponse<PeerHeartbeatResponse>>, ApiError> {
     let svc = state.peer_service()?;
     // Story 5.5：若该 peer 已被 admin 强制下线，心跳被拒（TokenExpired → 401，提示重新登录）。
-    svc.heartbeat_checked(
-        &current.user_id,
-        body.endpoint.as_deref(),
-        state.clock.now_unix_ms(),
-    )
-    .await?;
-    Ok(success(&state, ()))
+    let allowed_routes = svc
+        .heartbeat_checked(
+            &current.user_id,
+            body.endpoint.as_deref(),
+            state.clock.now_unix_ms(),
+        )
+        .await?;
+    Ok(success(&state, PeerHeartbeatResponse { allowed_routes }))
 }
 
 /// Story 4.7：DELETE /api/v1/peers/me
@@ -135,5 +136,17 @@ pub async fn force_remove_peer(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.peer_service()?;
     svc.force_remove(&id).await?;
+    Ok(success(&state, ()))
+}
+
+/// DELETE /api/v1/admin/peers/:id/purge（需 admin，彻底删除节点 + 回收 VPN IP）
+#[tracing::instrument(skip(state))]
+pub async fn purge_peer(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let svc = state.peer_service()?;
+    svc.purge(&id).await?;
     Ok(success(&state, ()))
 }

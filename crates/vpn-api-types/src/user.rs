@@ -19,6 +19,9 @@ pub struct UserDto {
     pub must_change_password: bool,
     /// 最后登录时间（unix ms），从未登录为 None
     pub last_login_at: Option<i64>,
+    /// 所属用户组 id 列表（可属多个组；未分组为空，前端用组列表解析名称）。
+    #[serde(default)]
+    pub group_ids: Vec<String>,
     pub created_at: i64,
 }
 

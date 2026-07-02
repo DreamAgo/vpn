@@ -60,6 +60,9 @@ pub enum AppError {
     #[error("系统已初始化")]
     AlreadyInitialized,
 
+    #[error("{0}")]
+    ResourceNotFound(String),
+
     // ===== 4xxx 限额 =====
     #[error("请求过频，请稍后再试")]
     RateLimited,
@@ -82,6 +85,10 @@ pub enum AppError {
 
     #[error("配置错误：{0}")]
     Config(String),
+
+    // ===== 6xxx 请求/校验 =====
+    #[error("{0}")]
+    Validation(String),
 }
 
 impl AppError {
@@ -103,6 +110,7 @@ impl AppError {
             AppError::DuplicateResource(_) => error_codes::DUPLICATE_RESOURCE,
             AppError::NotInitialized => error_codes::NOT_INITIALIZED,
             AppError::AlreadyInitialized => error_codes::ALREADY_INITIALIZED,
+            AppError::ResourceNotFound(_) => error_codes::RESOURCE_NOT_FOUND,
             AppError::RateLimited => error_codes::RATE_LIMITED,
             AppError::PeerQuotaExceeded => error_codes::PEER_QUOTA_EXCEEDED,
             AppError::IpPoolExhausted => error_codes::IP_POOL_EXHAUSTED,
@@ -110,6 +118,7 @@ impl AppError {
             AppError::WireGuard(_) => error_codes::WIREGUARD_ERROR,
             AppError::Internal(_) => error_codes::INTERNAL_ERROR,
             AppError::Config(_) => error_codes::CONFIG_ERROR,
+            AppError::Validation(_) => error_codes::VALIDATION_ERROR,
         }
     }
 

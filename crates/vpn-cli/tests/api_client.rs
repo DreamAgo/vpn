@@ -190,7 +190,11 @@ async fn heartbeat_posts_endpoint() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v1/peers/heartbeat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(())))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(
+            vpn_api_types::peer::PeerHeartbeatResponse {
+                allowed_routes: vec!["10.8.0.0/24".into(), "172.31.100.0/24".into()],
+            },
+        )))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -211,5 +215,6 @@ async fn heartbeat_posts_endpoint() {
     let req = vpn_api_types::peer::PeerHeartbeatRequest {
         endpoint: Some("1.2.3.4:1234".into()),
     };
-    client.heartbeat(&req).await.unwrap();
+    let resp = client.heartbeat(&req).await.unwrap();
+    assert_eq!(resp.allowed_routes, vec!["10.8.0.0/24", "172.31.100.0/24"]);
 }

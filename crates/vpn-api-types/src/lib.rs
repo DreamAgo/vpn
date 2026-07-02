@@ -11,7 +11,9 @@ pub mod audit;
 pub mod auth;
 pub mod envelope;
 pub mod error_codes;
+pub mod group;
 pub mod peer;
+pub mod subnet;
 pub mod system;
 pub mod user;
 

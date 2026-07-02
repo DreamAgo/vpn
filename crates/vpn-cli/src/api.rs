@@ -17,8 +17,13 @@ use std::sync::Mutex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use vpn_api_types::{
-    auth::{LoginRequest, LoginResponse, LogoutRequest, RefreshRequest, RefreshResponse},
-    peer::{PeerHeartbeatRequest, PeerRegisterRequest, PeerRegisterResponse},
+    auth::{
+        ChangePasswordRequest, LoginRequest, LoginResponse, LogoutRequest, RefreshRequest,
+        RefreshResponse,
+    },
+    peer::{
+        PeerHeartbeatRequest, PeerHeartbeatResponse, PeerRegisterRequest, PeerRegisterResponse,
+    },
     ApiResponse,
 };
 
@@ -129,6 +134,18 @@ impl ApiClient {
         Ok(resp)
     }
 
+    /// 修改当前登录用户的密码（需已认证）。成功后旧密码立即失效。
+    pub async fn change_password(&self, old_password: &str, new_password: &str) -> CliResult<()> {
+        let req = ChangePasswordRequest {
+            old_password: old_password.to_string(),
+            new_password: new_password.to_string(),
+        };
+        let _: () = self
+            .post_json_authed("/api/v1/auth/change-password", &req)
+            .await?;
+        Ok(())
+    }
+
     /// 用 refresh token 换取新的 access token，并更新内部状态。
     pub async fn refresh(&self) -> CliResult<RefreshResponse> {
         let refresh_token = self
@@ -174,9 +191,18 @@ impl ApiClient {
         self.post_json_authed("/api/v1/peers/register", req).await
     }
 
-    /// 周期性心跳上报（每 30s）。
-    pub async fn heartbeat(&self, req: &PeerHeartbeatRequest) -> CliResult<()> {
-        self.post_json_authed("/api/v1/peers/heartbeat", req).await
+    /// 周期性心跳上报（每 30s）。返回服务端实时计算的 allowed_routes(P1.4:
+    /// 组/网段变更后客户端据此增量更新路由,无需重连)。
+    pub async fn heartbeat(
+        &self,
+        req: &PeerHeartbeatRequest,
+    ) -> CliResult<PeerHeartbeatResponse> {
+        // 旧服务端心跳返回 data:null（无 allowed_routes）。用 Option 容错解析：null → None →
+        // 回退默认空响应；调用方据“空 allowed_routes = 无路由信息”跳过路由下发、不动隧道，
+        // 避免对结构体从 null 反序列化失败被当作瞬时错误而卡在重连。
+        let resp: Option<PeerHeartbeatResponse> =
+            self.post_json_authed("/api/v1/peers/heartbeat", req).await?;
+        Ok(resp.unwrap_or_default())
     }
 
     /// 下载客户端 .conf 配置（非信封，纯文本附件）。

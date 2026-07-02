@@ -19,5 +19,5 @@ pub mod keys;
 pub use config::{render_client_config, WgPeerConfig};
 pub use control::{NoopWireGuardControl, WireGuardControl};
 pub use ip_pool::IpPool;
-pub use kernel::KernelWireGuardControl;
+pub use kernel::{KernelWireGuardControl, WgMode};
 pub use keys::{generate_keypair, public_key_from_private, WgKeypair};

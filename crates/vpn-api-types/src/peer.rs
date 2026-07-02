@@ -48,6 +48,16 @@ pub struct PeerHeartbeatRequest {
     pub endpoint: Option<String>,
 }
 
+/// 心跳响应：回带该节点当前应导入隧道的网段。
+///
+/// 服务端按最新配置(用户组路由 / 全局 server_routes / 站点网关)实时计算;客户端
+/// 据此与本地路由表做增量增删，使组/网段变更**无需重连即对在线节点生效**(P1.4)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerHeartbeatResponse {
+    #[serde(default)]
+    pub allowed_routes: Vec<String>,
+}
+
 /// admin 后台展示的节点视图。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDto {

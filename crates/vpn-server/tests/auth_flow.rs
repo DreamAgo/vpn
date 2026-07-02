@@ -15,8 +15,11 @@ use tower::ServiceExt;
 use vpn_server::{
     build_router,
     ratelimit::LoginAttempts,
-    repositories::{SqliteSessionRepository, SqliteUserRepository},
-    services::{Argon2Hasher, AuthService, JwtTokenIssuer},
+    repositories::{
+        SqlitePeerRepository, SqliteSessionRepository, SqliteSystemConfigRepository,
+        SqliteUserRepository,
+    },
+    services::{build_peer_service, Argon2Hasher, AuthService, JwtTokenIssuer},
     AppState,
 };
 
@@ -35,7 +38,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
     sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
 
     let user_repo = SqliteUserRepository::new(pool.clone());
-    let session_repo = SqliteSessionRepository::new(pool);
+    let session_repo = SqliteSessionRepository::new(pool.clone());
     let hasher: Arc<dyn vpn_core::service::PasswordHasher> = Arc::new(Argon2Hasher::new());
     let tmp = tempfile::tempdir().unwrap();
     let issuer = JwtTokenIssuer::load_or_generate(tmp.path()).unwrap();
@@ -47,7 +50,22 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         login_attempts: LoginAttempts::new(),
     });
 
-    let state = AppState::new().with_auth_service(auth_service);
+    // 受保护接口 /admin/system/info 现读取真实 peer_service，故测试也需装配（Noop 后端）。
+    let peer_repo = SqlitePeerRepository::new(pool.clone());
+    let config_repo = SqliteSystemConfigRepository::new(pool);
+    let subnet = "10.8.0.0/24".parse().unwrap();
+    let peer_service = build_peer_service(
+        peer_repo,
+        &config_repo,
+        subnet,
+        "vpn.example.com:51820".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new()
+        .with_auth_service(auth_service)
+        .with_peer_service(Arc::new(peer_service));
     (build_router(state), tmp)
 }
 
