@@ -170,6 +170,7 @@ fn user_row_to_dto(row: UserRow) -> UserDto {
         status: row.status,
         must_change_password: row.must_change_password,
         last_login_at: row.last_login_at,
+        group_ids: row.group_ids,
         created_at: row.created_at,
     }
 }

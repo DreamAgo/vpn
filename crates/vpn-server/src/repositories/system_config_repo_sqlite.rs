@@ -14,6 +14,11 @@ impl SqliteSystemConfigRepository {
         Self { pool }
     }
 
+    /// 底层连接池（供同库的其他仓储复用，避免到处传 pool）。
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// 读取某 key 的值（不存在返回 None）。
     pub async fn get(&self, key: &str) -> Result<Option<String>> {
         let row: Option<(String,)> =

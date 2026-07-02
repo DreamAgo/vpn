@@ -19,6 +19,9 @@ pub const KEY_USERNAME: &str = "username";
 /// 凭证 key：本机作为站点网关时声明的 LAN 网段（逗号分隔 CIDR）。
 pub const KEY_ROUTES: &str = "routed_subnets";
 
+/// 默认客户端 WireGuard 接口名（可经环境变量 `VPN_CLI_INTERFACE` 覆盖）。
+pub const DEFAULT_INTERFACE: &str = "vpncli0";
+
 /// daemon 运行配置。
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -32,6 +35,8 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     /// 本机背后路由的 LAN 网段（站点网关模式，register 上送）。
     pub routed_subnets: Vec<String>,
+    /// 客户端 WireGuard 接口名（内核数据面用）。
+    pub interface: String,
 }
 
 /// 凭证仓库：封装底层 [`CredentialStore`]，提供 server_url / refresh_token 读写。
@@ -135,6 +140,8 @@ impl CredentialRepo {
             device_name,
             socket_path,
             routed_subnets: self.routes()?,
+            interface: std::env::var("VPN_CLI_INTERFACE")
+                .unwrap_or_else(|_| DEFAULT_INTERFACE.to_string()),
         })
     }
 }

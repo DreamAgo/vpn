@@ -66,6 +66,10 @@ pub fn build_router(state: AppState) -> Router {
                 get(handlers::system::system_info),
             )
             .route(
+                "/api/v1/admin/system/routes",
+                axum::routing::put(handlers::system::update_server_routes),
+            )
+            .route(
                 "/api/v1/admin/users",
                 post(handlers::users::create_user).get(handlers::users::list_users),
             )
@@ -76,6 +80,26 @@ pub fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/admin/users/{id}/reset-password",
                 post(handlers::users::reset_password),
+            )
+            .route(
+                "/api/v1/admin/users/{id}/groups",
+                axum::routing::put(handlers::users::set_user_groups),
+            )
+            .route(
+                "/api/v1/admin/groups",
+                get(handlers::groups::list_groups).post(handlers::groups::create_group),
+            )
+            .route(
+                "/api/v1/admin/groups/{id}",
+                patch(handlers::groups::update_group).delete(handlers::groups::delete_group),
+            )
+            .route(
+                "/api/v1/admin/subnets",
+                get(handlers::subnets::list_subnets).post(handlers::subnets::create_subnet),
+            )
+            .route(
+                "/api/v1/admin/subnets/{id}",
+                patch(handlers::subnets::update_subnet).delete(handlers::subnets::delete_subnet),
             )
             .route("/api/v1/peers/register", post(handlers::peers::register))
             .route("/api/v1/peers/heartbeat", post(handlers::peers::heartbeat))
@@ -96,6 +120,10 @@ pub fn build_router(state: AppState) -> Router {
                 "/api/v1/admin/peers/{id}",
                 delete(handlers::peers::force_remove_peer)
                     .patch(handlers::peers::update_peer_routes),
+            )
+            .route(
+                "/api/v1/admin/peers/{id}/purge",
+                delete(handlers::peers::purge_peer),
             )
             // 审计中间件（内层）：在 require_auth 之后运行，故 extensions 已含 CurrentUser。
             .layer(from_fn_with_state(state.clone(), middleware::audit_layer))

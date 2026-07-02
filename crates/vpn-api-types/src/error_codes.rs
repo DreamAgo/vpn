@@ -45,6 +45,8 @@ pub const DUPLICATE_RESOURCE: i32 = 3003;
 pub const NOT_INITIALIZED: i32 = 3004;
 /// 系统已初始化（first-time-setup 重复调用）。
 pub const ALREADY_INITIALIZED: i32 = 3005;
+/// 命名资源不存在（用户组 / 网段等,区别于 USER_NOT_FOUND / PEER_NOT_FOUND）。映射 HTTP 404。
+pub const RESOURCE_NOT_FOUND: i32 = 3006;
 
 // ===== 4xxx 限额/限速 =====
 
@@ -65,6 +67,11 @@ pub const WIREGUARD_ERROR: i32 = 5002;
 pub const INTERNAL_ERROR: i32 = 5003;
 /// 配置错误（如缺少环境变量）。
 pub const CONFIG_ERROR: i32 = 5004;
+
+// ===== 6xxx 请求/校验错误 =====
+
+/// 客户端输入校验失败（非法 CIDR、空名称等）。映射 HTTP 400 BAD_REQUEST。
+pub const VALIDATION_ERROR: i32 = 6001;
 
 #[cfg(test)]
 mod tests {
@@ -99,9 +106,12 @@ mod tests {
             DUPLICATE_RESOURCE,
             NOT_INITIALIZED,
             ALREADY_INITIALIZED,
+            RESOURCE_NOT_FOUND,
         ] {
             assert!((3000..4000).contains(&code));
         }
+        // 6xxx 范围（请求/校验错误）
+        assert!((6000..7000).contains(&VALIDATION_ERROR));
         // 4xxx 范围
         for code in [RATE_LIMITED, PEER_QUOTA_EXCEEDED, IP_POOL_EXHAUSTED] {
             assert!((4000..5000).contains(&code));

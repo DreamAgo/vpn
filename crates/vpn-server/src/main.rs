@@ -11,11 +11,12 @@ use vpn_server::{
     ratelimit::LoginAttempts,
     repositories::{
         SqliteAuditLogRepository, SqlitePeerRepository, SqliteSessionRepository,
-        SqliteSystemConfigRepository, SqliteUserRepository,
+        SqliteSubnetRepository, SqliteSystemConfigRepository, SqliteUserGroupRepository,
+        SqliteUserRepository,
     },
     services::{
         build_peer_service_with_backend, Argon2Hasher, AuditService, AuthService, JwtTokenIssuer,
-        PeerService, UserService,
+        PeerService, SubnetService, UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -62,6 +63,13 @@ async fn main() -> anyhow::Result<()> {
         session_repo.clone(),
         hasher.clone(),
     ));
+    // 用户组服务:组 CRUD + 用户分配(组的可路由网段用于访问控制)。
+    let user_group_service = Arc::new(UserGroupService::new(
+        SqliteUserGroupRepository::new(pool.clone()),
+        user_repo.clone(),
+    ));
+    // 网段目录服务:集中维护命名网段,供各处下拉选择。
+    let subnet_service = Arc::new(SubnetService::new(SqliteSubnetRepository::new(pool.clone())));
     let auth_service = Arc::new(AuthService {
         user_repo,
         session_repo,
@@ -112,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new()
         .with_auth_service(auth_service)
         .with_user_service(user_service)
+        .with_user_group_service(user_group_service)
+        .with_subnet_service(subnet_service)
         .with_peer_service(peer_service)
         .with_audit_service(audit_service);
     let app = build_router(state);

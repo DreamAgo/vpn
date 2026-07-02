@@ -2,8 +2,10 @@
 
 pub mod audit;
 pub mod auth;
+pub mod groups;
 pub mod health;
 pub mod peers;
 pub mod static_files;
+pub mod subnets;
 pub mod system;
 pub mod users;

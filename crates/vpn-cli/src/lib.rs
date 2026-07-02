@@ -24,3 +24,4 @@ pub mod error;
 pub mod ipc;
 pub mod netmon;
 pub mod reconnect;
+pub mod wg_userspace;

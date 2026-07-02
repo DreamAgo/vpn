@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use vpn_core::time::{Clock, SystemClock};
 
-use crate::services::{AuditService, AuthService, PeerService, UserService};
+use crate::services::{
+    AuditService, AuthService, PeerService, SubnetService, UserGroupService, UserService,
+};
 
 /// AppState 持有所有跨 handler 共享的资源。
 ///
@@ -13,6 +15,8 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub auth_service: Option<Arc<AuthService>>,
     pub user_service: Option<Arc<UserService>>,
+    pub user_group_service: Option<Arc<UserGroupService>>,
+    pub subnet_service: Option<Arc<SubnetService>>,
     pub peer_service: Option<Arc<PeerService>>,
     pub audit_service: Option<Arc<AuditService>>,
 }
@@ -24,6 +28,8 @@ impl AppState {
             clock: Arc::new(SystemClock),
             auth_service: None,
             user_service: None,
+            user_group_service: None,
+            subnet_service: None,
             peer_service: None,
             audit_service: None,
         }
@@ -36,6 +42,16 @@ impl AppState {
 
     pub fn with_user_service(mut self, svc: Arc<UserService>) -> Self {
         self.user_service = Some(svc);
+        self
+    }
+
+    pub fn with_user_group_service(mut self, svc: Arc<UserGroupService>) -> Self {
+        self.user_group_service = Some(svc);
+        self
+    }
+
+    pub fn with_subnet_service(mut self, svc: Arc<SubnetService>) -> Self {
+        self.subnet_service = Some(svc);
         self
     }
 
@@ -61,6 +77,20 @@ impl AppState {
         self.user_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("user_service 未初始化".to_string()))
+    }
+
+    /// 获取 UserGroupService，未初始化则返回错误（启动顺序问题）。
+    pub fn user_group_service(&self) -> Result<Arc<UserGroupService>, vpn_core::AppError> {
+        self.user_group_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("user_group_service 未初始化".to_string()))
+    }
+
+    /// 获取 SubnetService，未初始化则返回错误（启动顺序问题）。
+    pub fn subnet_service(&self) -> Result<Arc<SubnetService>, vpn_core::AppError> {
+        self.subnet_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("subnet_service 未初始化".to_string()))
     }
 
     /// 获取 PeerService，未初始化则返回错误（启动顺序问题）。

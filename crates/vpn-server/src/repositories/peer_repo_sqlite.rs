@@ -104,6 +104,22 @@ impl SqlitePeerRepository {
         Ok(rows)
     }
 
+    /// 列出活跃且**声明了站点 LAN 网段**的网关 peer：(peer_id, user_id, routed_subnets)。
+    ///
+    /// 仅扫描 `routed_subnets != ''` 的网关 peer（绝大多数普通节点不声明网段），供
+    /// allowed_routes 计算（每次心跳调用）与注册/改路由时的网段冲突检测复用，避免对
+    /// 全量 peer 做全表扫描（参见 [`PeerService::compute_allowed_routes`]）。
+    pub async fn list_active_gateway_routes(&self) -> Result<Vec<(String, String, String)>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id, user_id, routed_subnets FROM peers
+             WHERE status NOT IN ('deleted', 'force_removed') AND routed_subnets != ''",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(rows)
+    }
+
     /// 插入新 peer。wg_public_key / vpn_ip 冲突返回 DuplicateResource。
     #[allow(clippy::too_many_arguments)]
     pub async fn insert(
@@ -156,6 +172,10 @@ impl SqlitePeerRepository {
 
     /// 复用既有 peer：更新 wg_public_key / device_name / os_info（保留 vpn_ip）。
     /// wg_public_key 与别的 peer 冲突返回 DuplicateResource。
+    ///
+    /// 「强制下线」语义=踢下线 + 强制重连:若该 peer 当前是 `force_removed`,重新注册
+    /// 时把状态清回 `offline`(下次心跳即恢复 `online`),使节点重连后可再次上线。
+    /// 其它状态(online/offline)保持不变。永久封禁应禁用/删除用户账号。
     pub async fn update_registration(
         &self,
         id: &str,
@@ -166,7 +186,8 @@ impl SqlitePeerRepository {
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         let result = sqlx::query(
-            r#"UPDATE peers SET device_name = ?1, wg_public_key = ?2, os_info = ?3, routed_subnets = ?4, updated_at = ?5
+            r#"UPDATE peers SET device_name = ?1, wg_public_key = ?2, os_info = ?3, routed_subnets = ?4, updated_at = ?5,
+                   status = CASE WHEN status = 'force_removed' THEN 'offline' ELSE status END
                WHERE id = ?6"#,
         )
         .bind(device_name)
@@ -278,6 +299,35 @@ impl SqlitePeerRepository {
                 .await
                 .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(result.rows_affected())
+    }
+
+    /// 硬删除：从 peers 表彻底删除指定行（admin 彻底删除节点）。返回受影响行数。
+    ///
+    /// 与 `mark_force_removed` / `mark_deleted_by_user` 的软删除不同，这里物理删除记录，
+    /// 调用方需同时摘除 WireGuard peer 并回收 VPN IP。
+    pub async fn delete_by_id(&self, id: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM peers WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 硬删某用户的**全部** peer 行（任意状态，含历史 'deleted' 行），返回被删行的 vpn_ip
+    /// 以便调用方回收 IP。删除用户前调用以满足 `peers.user_id -> users.id` 外键（无级联）。
+    pub async fn delete_all_by_user(&self, user_id: &str) -> Result<Vec<String>> {
+        let ips: Vec<(String,)> = sqlx::query_as("SELECT vpn_ip FROM peers WHERE user_id = ?1")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        sqlx::query("DELETE FROM peers WHERE user_id = ?1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(ips.into_iter().map(|r| r.0).collect())
     }
 
     /// Story 5.5：admin peer 列表（JOIN users 取 username/email）。

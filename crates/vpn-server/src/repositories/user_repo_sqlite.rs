@@ -59,6 +59,7 @@ type UserRowTuple = (
     Option<i64>,
     i64,
     i64,
+    Option<String>,
 );
 
 impl From<UserRowTuple> for UserRow {
@@ -74,6 +75,16 @@ impl From<UserRowTuple> for UserRow {
             last_login_at: r.7,
             created_at: r.8,
             updated_at: r.9,
+            // group_concat 结果：CSV 或 NULL（无任何组）→ 解析为 Vec。
+            group_ids: r
+                .10
+                .map(|csv| {
+                    csv.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -90,6 +101,8 @@ pub struct UserRow {
     pub last_login_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 所属用户组 id 列表（可属多个组；未分组为空）。
+    pub group_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +126,8 @@ impl SqliteUserRepository {
     pub async fn find_by_username(&self, username: &str) -> Result<Option<UserRow>> {
         let row: Option<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                          last_login_at, created_at, updated_at
+                          last_login_at, created_at, updated_at,
+                      (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                    FROM users WHERE username = ?1"#,
         )
         .bind(username)
@@ -126,7 +140,8 @@ impl SqliteUserRepository {
     pub async fn find_by_id(&self, id: &str) -> Result<Option<UserRow>> {
         let row: Option<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                          last_login_at, created_at, updated_at
+                          last_login_at, created_at, updated_at,
+                      (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                    FROM users WHERE id = ?1"#,
         )
         .bind(id)
@@ -175,6 +190,7 @@ impl SqliteUserRepository {
                 last_login_at: None,
                 created_at: now,
                 updated_at: now,
+                group_ids: Vec::new(),
             }),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 Err(AppError::DuplicateResource("用户名或邮箱".to_string()))
@@ -213,6 +229,16 @@ impl SqliteUserRepository {
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(())
+    }
+
+    /// 用户是否存在（分配组前校验）。
+    pub async fn exists(&self, id: &str) -> Result<bool> {
+        let c: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(c.0 > 0)
     }
 
     /// 更新用户状态（"active" | "disabled"）。返回受影响行数（0 表示用户不存在）。
@@ -278,7 +304,8 @@ impl SqliteUserRepository {
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                      last_login_at, created_at, updated_at
+                      last_login_at, created_at, updated_at,
+                      (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                FROM users"#,
         );
         Self::push_where(&mut qb, filter);

@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use vpn_api_types::ApiResponse;
+use vpn_api_types::{error_codes, ApiResponse};
 use vpn_core::AppError;
 
 /// Axum 用的错误包装。包含 AppError + 请求上下文（request_id, timestamp）。
@@ -50,10 +50,12 @@ impl From<AppError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = if self.inner.is_client_error() {
-            // 认证错误用 401，权限用 403，资源用 404，限速用 429，其他客户端用 400
+            // 认证错误用 401，权限用 403，重复资源用 409，资源不存在用 404，限速用 429，
+            // 校验/其他客户端错误用 400
             match self.inner.code() {
                 1001..=1099 => StatusCode::UNAUTHORIZED,
                 2001..=2099 => StatusCode::FORBIDDEN,
+                c if c == error_codes::DUPLICATE_RESOURCE => StatusCode::CONFLICT,
                 3001..=3099 => StatusCode::NOT_FOUND,
                 4001..=4099 => StatusCode::TOO_MANY_REQUESTS,
                 _ => StatusCode::BAD_REQUEST,

@@ -25,6 +25,14 @@ pub trait WireGuardControl: Send + Sync {
     async fn remove_peer(&self, public_key: &str) -> Result<()>;
     /// 列出当前已配置的 peer 公钥。
     async fn list_peers(&self) -> Result<Vec<String>>;
+    /// 删除若干站点 LAN 网段对应的 OS 路由（`<subnet> dev <iface>`）。
+    ///
+    /// 某 peer 的 routed_subnets 被**缩减**时，`configure_peer` 的 `ip route replace`
+    /// 只会重铺当前网段、不会删除已移除网段的旧路由，残留路由会把流量黑洞到接口上
+    /// 已无对应 allowed-ips 的 peer。故缩减路由时需显式删除。默认无操作（Noop/测试后端）。
+    async fn remove_routes(&self, _subnets: &[String]) -> Result<()> {
+        Ok(())
+    }
     /// 服务端公钥（base64）。
     fn server_public_key(&self) -> &str;
 }
