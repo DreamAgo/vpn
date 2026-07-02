@@ -10,7 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@ant-design/icons": "^6.2.3",
+    "@ant-design/icons": "^6.3.2",
     "@ant-design/pro-components": "^2.8.10",
     "@fontsource/archivo": "^5.2.8",
     "@fontsource/chakra-petch": "^5.2.7",
