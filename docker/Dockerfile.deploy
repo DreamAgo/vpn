@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.7
+#
+# vpn 服务端部署镜像（无 cargo-chef 版本）
+#
+# 为什么不用 docker/Dockerfile：部署机 188.89 的 registry 镜像源对
+# lukemathwalker/cargo-chef 返回 403，无法拉取；且该镜像为 trixie，glibc
+# 高于运行时/客户端的 bookworm。本文件改用本地已缓存的 rust:1.90-slim-bookworm，
+# glibc 与运行时(debian:bookworm-slim)及客户端容器一致。
+#
+# 与 docker/Dockerfile 的关键差异（复刻线上 vpn:deploy 实际形态）：
+# - 运行时安装内核 WireGuard 所需 CLI：wireguard-tools / iproute2 / iptables
+# - 二进制置于 /usr/local/bin/vpn-server，以 root 运行（CAP_NET_ADMIN）
+# - 通过 /entrypoint.sh 开启 ip_forward + 对 VPN 子网做 MASQUERADE，再 exec 服务端
+
+ARG RUST_VERSION=1.90
+
+# ===== Stage 1: frontend-builder =====
+FROM node:22-slim AS frontend-builder
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+# 国内网络：npm 走 npmmirror 加速
+RUN npm config set registry https://registry.npmmirror.com && npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ===== Stage 2: builder（bookworm，匹配运行时 glibc）=====
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+WORKDIR /app
+# aws-lc-sys 需要 cmake/make/perl；pkg-config 供其它 -sys crate
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake make perl pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+# 国内网络加速：crates 依赖走阿里云 sparse 镜像源（比 rsproxy 更稳）。
+# Rosetta 模拟下 sparse registry 易报 "unexpected eof"，关掉 HTTP/2 多路复用 +
+# 提高重试次数规避（CARGO_HTTP_MULTIPLEXING=false 是该 EOF 问题的已知解法）。
+ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
+RUN cat > "${CARGO_HOME:-/usr/local/cargo}/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = "aliyun"
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+[net]
+retry = 10
+git-fetch-with-cli = true
+[http]
+multiplexing = false
+EOF
+# 复用 frontend dist 用于 rust-embed
+COPY --from=frontend-builder /app/frontend/dist frontend/dist
+COPY . .
+# 删掉仓库钉的 rust-toolchain.toml（要 rustfmt/clippy 组件，会触发 rustup 去
+# 镜像源拉 channel manifest 而 504）。cargo build 只需基础镜像自带的 1.90 默认
+# 工具链，不需要这两个组件。仅改容器内副本，不动仓库文件。
+RUN rm -f rust-toolchain.toml
+# SQLX_OFFLINE 避免 build 时需要 DATABASE_URL
+ENV SQLX_OFFLINE=true
+RUN cargo build --release --bin vpn-server
+
+# ===== Stage 3: runtime（debian bookworm-slim + 内核 WG 工具）=====
+FROM debian:bookworm-slim AS runtime
+# wireguard-go：用户态 WireGuard 实现，供 VPN_WG_BACKEND=userspace 使用
+# （无内核 WG 模块的老内核如 CentOS 7 / 3.10 只需 /dev/net/tun 即可建隧道）。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 wireguard-tools wireguard-go iproute2 iptables \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /var/lib/vpn
+
+COPY --from=builder /app/target/release/vpn-server /usr/local/bin/vpn-server
+# migrations 与二进制一起携带（启动时由 sqlx migrate 加载）
+COPY --from=builder /app/migrations /app/migrations
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+WORKDIR /app
+EXPOSE 80 443 8080 8889 51820/udp
+
+ENV VPN_DATA_DIR=/var/lib/vpn
+ENV DATABASE_URL=sqlite:////var/lib/vpn/vpn.db?mode=rwc
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/entrypoint.sh"]
