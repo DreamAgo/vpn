@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+#
+# vpn-cli 客户端 Docker 镜像（本地端到端验证用）
+#
+# 客户端数据面为用户态 boringtun（单二进制，零外部 wg 工具），仅需
+# root/CAP_NET_ADMIN + /dev/net/tun。headless 容器用 VPN_CLI_CRED_BACKEND=file
+# 走加密文件凭证后端（无需 keyring/libdbus）。reqwest 用 rustls，无需 OpenSSL。
+
+ARG RUST_VERSION=1.90
+
+# ===== Stage 1: builder（bookworm，匹配运行时 glibc）=====
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake make perl pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+# 国内网络加速：走 rsproxy.cn 镜像源
+ENV RUSTUP_DIST_SERVER=https://rsproxy.cn \
+    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+RUN cat > "${CARGO_HOME:-/usr/local/cargo}/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+[net]
+git-fetch-with-cli = true
+EOF
+COPY . .
+ENV SQLX_OFFLINE=true
+RUN cargo build --release --bin vpn-cli
+
+# ===== Stage 2: runtime（debian bookworm-slim）=====
+FROM debian:bookworm-slim AS runtime
+# iproute2/iputils-ping 仅用于容器内手工排查与 ping 验证；数据面本身不依赖它们。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates iproute2 iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/vpn-cli /usr/local/bin/vpn-cli
+
+ENV VPN_CLI_CRED_BACKEND=file
+ENV RUST_LOG=info
+# 交互式排查：默认挂起，实际验证时用 docker exec 手动跑 login/daemon/up。
+ENTRYPOINT ["sleep", "infinity"]
