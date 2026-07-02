@@ -25,6 +25,7 @@ import { SubnetsPage } from './pages/SubnetsPage';
 import { PeersPage } from './pages/PeersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { ConnectionGuidePage } from './pages/ConnectionGuidePage';
+import { BackupPage } from './pages/BackupPage';
 import { useAuthStore } from './stores/authStore';
 
 const queryClient = new QueryClient({
@@ -95,6 +96,7 @@ function App() {
                   <Route path="/subnets" element={<SubnetsPage />} />
                   <Route path="/peers" element={<PeersPage />} />
                   <Route path="/audit-logs" element={<AuditLogsPage />} />
+                  <Route path="/backup" element={<BackupPage />} />
                   <Route path="/connect" element={<ConnectionGuidePage />} />
                 </Route>
               </Route>

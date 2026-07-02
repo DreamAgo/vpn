@@ -203,6 +203,9 @@ jobs:
 
       - name: Tauri build (MSI + NSIS)
         working-directory: desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build
 
       - name: Upload artifact
@@ -212,6 +215,8 @@ jobs:
           path: |
             desktop/src-tauri/target/release/bundle/msi/*.msi
             desktop/src-tauri/target/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/release/bundle/msi/*.sig
+            desktop/src-tauri/target/release/bundle/nsis/*.sig
 
   # ============================================================
   # 汇总产物并创建 GitHub Release（仅 tag 触发；手动 dispatch 只留工件）
@@ -228,6 +233,50 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Generate Tauri updater manifest
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import quote
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith("v") else tag
+          repo = os.environ["GITHUB_REPOSITORY"]
+          root = Path("artifacts")
+
+          exe_candidates = sorted(root.glob("vpn-desktop-windows/**/*.exe"))
+          if not exe_candidates:
+            raise SystemExit("missing Windows desktop NSIS installer for updater manifest")
+          exe = exe_candidates[0]
+          sig = Path(str(exe) + ".sig")
+          if not sig.exists():
+            sibling = exe.with_suffix(exe.suffix + ".sig")
+            sig = sibling
+          if not sig.exists():
+            raise SystemExit(f"missing updater signature for {exe}")
+
+          filename = quote(exe.name)
+          manifest = {
+            "version": version,
+            "notes": f"VPN Client {version}",
+            "pub_date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "platforms": {
+              "windows-x86_64": {
+                "signature": sig.read_text(encoding="utf-8").strip(),
+                "url": f"https://github.com/{repo}/releases/download/{tag}/{filename}",
+              }
+            },
+          }
+          (root / "latest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+          )
+          PY
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

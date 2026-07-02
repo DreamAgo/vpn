@@ -123,7 +123,8 @@ async fn main() -> anyhow::Result<()> {
         .with_user_group_service(user_group_service)
         .with_subnet_service(subnet_service)
         .with_peer_service(peer_service)
-        .with_audit_service(audit_service);
+        .with_audit_service(audit_service)
+        .with_db_pool(pool.clone());
     let app = build_router(state);
 
     // 监听端口

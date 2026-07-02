@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-// 本地打包字体(离线可用):Chakra Petch 做仪表感显示体,IBM Plex Mono 做技术读数。
+// 本地打包字体(离线可用):Chakra Petch 用于品牌字标,IBM Plex Mono 用于地址和流量读数。
 import "@fontsource/chakra-petch/500.css";
 import "@fontsource/chakra-petch/600.css";
 import "@fontsource/chakra-petch/700.css";
