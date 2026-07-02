@@ -49,12 +49,20 @@ Name: "installservice"; Description: "注册为 Windows 服务（vpn-cli daemon 
 [Files]
 ; 源路径相对本 .iss 文件所在目录（packaging\windows\）。
 Source: "..\..\target\release\vpn-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
+; WireGuard 官方 wintun.dll：Windows 上用户态隧道(tun crate)运行时加载。
+; 构建前由 CI / 脚本放到 packaging\windows\wintun.dll（不入库）。
+Source: "wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
 ; 将安装目录追加到系统 PATH（Check 防止重复追加）。
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
     ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
     Tasks: addtopath; Check: NeedsAddPath('{app}')
+; 指向随包 wintun.dll 的绝对路径：daemon 以服务运行时用它显式 load，
+; 不依赖工作目录默认搜索（wg_userspace.rs 读 VPN_WINTUN_PATH）。
+Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
+    ValueType: string; ValueName: "VPN_WINTUN_PATH"; ValueData: "{app}\wintun.dll"; \
+    Flags: uninsdeletevalue
 
 [Run]
 ; 可选：安装后注册 Windows Service。复用 vpn-platform DaemonRuntime（sc.exe）。
