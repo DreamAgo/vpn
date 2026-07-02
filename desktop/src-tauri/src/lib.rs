@@ -13,9 +13,15 @@ use std::sync::Arc;
 use manager::VpnManager;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     Manager, WindowEvent,
 };
+
+struct TrayUi {
+    tray: TrayIcon<tauri::Wry>,
+    connect: MenuItem<tauri::Wry>,
+    disconnect: MenuItem<tauri::Wry>,
+}
 
 /// Show + focus the main popover window(健壮版:取消最小化 + 置顶一次 + 聚焦)。
 fn show_window(app: &tauri::AppHandle) {
@@ -36,6 +42,26 @@ fn hide_window(window: tauri::Window) {
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
+}
+
+#[tauri::command]
+fn sync_tray_state(app: tauri::AppHandle, state: String) {
+    if let Some(ui) = app.try_state::<TrayUi>() {
+        let connected = state == "connected" || state == "reconnecting";
+        let connecting = state == "connecting";
+        let errored = state == "error";
+        let _ = ui.connect.set_enabled(!connected && !connecting);
+        let _ = ui.disconnect.set_enabled(connected || connecting);
+        let label = match state.as_str() {
+            "connected" => "已连接",
+            "connecting" => "连接中",
+            "reconnecting" => "重连中",
+            "error" => "连接异常",
+            _ => "未连接",
+        };
+        let suffix = if errored { " · 请查看错误详情" } else { "" };
+        let _ = ui.tray.set_tooltip(Some(format!("易链 · {label}{suffix}")));
+    }
 }
 
 /// 从托盘菜单触发连接(进程内库调用,fire-and-forget;结果反映在状态轮询里)。
@@ -115,6 +141,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ))
         .manage(Arc::new(VpnManager::new()))
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
@@ -127,6 +159,7 @@ pub fn run() {
             commands::saved_server,
             hide_window,
             quit_app,
+            sync_tray_state,
         ])
         .setup(|app| {
             // Windows:把随包分发的 wintun.dll 绝对路径告诉数据面(vpn-cli 据此显式 load),
@@ -171,21 +204,21 @@ pub fn run() {
             }
 
             // Tray context menu.
-            let open_i = MenuItem::with_id(app, "open", "Open Panel", true, None::<&str>)?;
-            let connect_i = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
+            let open_i = MenuItem::with_id(app, "open", "打开易链", true, None::<&str>)?;
+            let connect_i = MenuItem::with_id(app, "connect", "建立安全链路", true, None::<&str>)?;
             let disconnect_i =
-                MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                MenuItem::with_id(app, "disconnect", "断开连接", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "退出易链", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_i, &connect_i, &disconnect_i, &quit_i])?;
 
             // 专门的小尺寸单色托盘图标(44×44,带 alpha);macOS 以 template 模式
             // 渲染,随菜单栏明暗主题自动着色,避免用 512×512 app 图标缩放后看不清/不显示。
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
-            let _tray = TrayIconBuilder::with_id("main-tray")
+            let tray = TrayIconBuilder::with_id("main-tray")
                 .icon(tray_icon)
                 .icon_as_template(true)
-                .tooltip("VPN Client")
+                .tooltip("易链")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -214,6 +247,13 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            let _ = disconnect_i.set_enabled(false);
+            app.manage(TrayUi {
+                tray,
+                connect: connect_i.clone(),
+                disconnect: disconnect_i.clone(),
+            });
 
             // 首次启动直接弹出面板，便于发现 UI（菜单栏 App 默认隐藏窗口，
             // 否则用户只能靠右上角托盘图标唤出，容易找不到）。失焦后会自动隐藏，

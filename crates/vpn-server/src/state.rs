@@ -1,6 +1,7 @@
 //! 共享应用状态（注入到所有 handler）。
 
 use std::sync::Arc;
+use sqlx::SqlitePool;
 use vpn_core::time::{Clock, SystemClock};
 
 use crate::services::{
@@ -19,6 +20,7 @@ pub struct AppState {
     pub subnet_service: Option<Arc<SubnetService>>,
     pub peer_service: Option<Arc<PeerService>>,
     pub audit_service: Option<Arc<AuditService>>,
+    pub db_pool: Option<SqlitePool>,
 }
 
 impl AppState {
@@ -32,6 +34,7 @@ impl AppState {
             subnet_service: None,
             peer_service: None,
             audit_service: None,
+            db_pool: None,
         }
     }
 
@@ -62,6 +65,11 @@ impl AppState {
 
     pub fn with_audit_service(mut self, svc: Arc<AuditService>) -> Self {
         self.audit_service = Some(svc);
+        self
+    }
+
+    pub fn with_db_pool(mut self, pool: SqlitePool) -> Self {
+        self.db_pool = Some(pool);
         self
     }
 
@@ -105,6 +113,12 @@ impl AppState {
         self.audit_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("audit_service 未初始化".to_string()))
+    }
+
+    pub fn db_pool(&self) -> Result<SqlitePool, vpn_core::AppError> {
+        self.db_pool
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("db_pool 未初始化".to_string()))
     }
 }
 

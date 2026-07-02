@@ -39,6 +39,10 @@ dayjs.locale('zh-cn');
 
 const { Title, Text } = Typography;
 
+function isSiteGateway(peer: AdminPeerView): boolean {
+  return (peer.routedSubnets ?? []).length > 0;
+}
+
 function describeError(err: unknown, fallback: string): string {
   if (err instanceof ApiError) {
     switch (err.code) {
@@ -154,6 +158,20 @@ export function PeersPage() {
           record.endpoint ? record.endpoint : <Text type="secondary">—</Text>,
       },
       {
+        title: '站点网关',
+        key: 'siteGateway',
+        width: 130,
+        render: (_, record) =>
+          isSiteGateway(record) ? (
+            <Space size={4} wrap>
+              <Tag color="blue">已启用</Tag>
+              <Text type="secondary">{record.routedSubnets?.length ?? 0} 个网段</Text>
+            </Space>
+          ) : (
+            <Text type="secondary">未启用</Text>
+          ),
+      },
+      {
         title: '操作',
         key: 'action',
         width: 280,
@@ -163,7 +181,7 @@ export function PeersPage() {
               详情
             </Button>
             <Button type="link" size="small" onClick={() => setEditRoutes(record)}>
-              编辑路由
+              设置网关
             </Button>
             <Popconfirm
               title="强制下线"
@@ -291,6 +309,9 @@ export function PeersPage() {
               {detail.endpoint ?? '—'}
             </Descriptions.Item>
             <Descriptions.Item label="操作系统">{detail.osInfo ?? '—'}</Descriptions.Item>
+            <Descriptions.Item label="站点网关">
+              {isSiteGateway(detail) ? <Tag color="blue">已启用</Tag> : <Tag>未启用</Tag>}
+            </Descriptions.Item>
             <Descriptions.Item label="站点 LAN 网段">
               <Space direction="vertical" size={4} style={{ width: '100%' }}>
                 <div>
@@ -310,7 +331,7 @@ export function PeersPage() {
                   style={{ padding: 0 }}
                   onClick={() => setEditRoutes(detail)}
                 >
-                  编辑路由
+                  设置站点网关
                 </Button>
               </Space>
             </Descriptions.Item>
