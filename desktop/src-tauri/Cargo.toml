@@ -1,0 +1,48 @@
+[package]
+name = "vpn-desktop"
+version = "0.1.0"
+description = "VPN Client — Tauri 2 menu-bar desktop GUI for vpn-cli"
+authors = ["Shangguanjunjie"]
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+# Standalone workspace: deliberately NOT a member of the repo-root workspace,
+# so adding the heavy Tauri/webview deps does not affect the existing
+# `cargo build`/clippy/test of vpn-server / vpn-cli etc. Path deps still work.
+[workspace]
+
+[lib]
+name = "vpn_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Reuse the existing client logic directly as a library (single process — no
+# separate daemon, no IPC): connect_once + bring_up_tunnel + run_heartbeat +
+# SharedState live in vpn-cli; keys come from vpn-wireguard.
+vpn-cli = { path = "../../crates/vpn-cli" }
+vpn-wireguard = { path = "../../crates/vpn-wireguard" }
+
+tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
+tauri-plugin-shell = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+# 仅 macOS：双击自提权(geteuid 判断当前是否 root)。
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[features]
+# This feature is used for production builds where `devUrl` is not used.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
