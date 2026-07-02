@@ -76,7 +76,8 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "daemon uninstall"; \
     Flags: runhidden waituntilterminated; RunOnceId: "VpnCliDaemonUninstall"
 
 [Code]
-{ 判断 {app} 是否已在系统 PATH 中，避免重复追加。 }
+// 判断安装目录是否已在系统 PATH 中，避免重复追加。
+// （不用 { } 注释：内含的 {app} 会被当成常量提前闭合注释导致语法错误。）
 function NeedsAddPath(Param: string): Boolean;
 var
   OrigPath: string;
