@@ -59,7 +59,9 @@ function MetadataView({ metadata }: { metadata: string | null }) {
         margin: 0,
         whiteSpace: 'pre-wrap',
         wordBreak: 'break-all',
-        background: '#FAFAFA',
+        background: 'var(--code-bg)',
+        border: '1px solid var(--code-border)',
+        color: 'var(--code-text)',
         padding: 12,
         borderRadius: 4,
       }}
@@ -173,7 +175,7 @@ export function AuditLogsPage() {
   );
 
   return (
-    <div style={{ padding: 24 }}>
+    <div>
       <Title level={4} style={{ marginBottom: 16 }}>
         审计日志
       </Title>

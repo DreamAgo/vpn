@@ -71,7 +71,7 @@ export function AccountSettingsPage() {
   });
 
   return (
-    <div style={{ padding: 24, maxWidth: 640, margin: '0 auto' }}>
+    <div style={{ maxWidth: 640 }}>
       <Title level={4} style={{ marginBottom: 16 }}>
         账号设置
       </Title>

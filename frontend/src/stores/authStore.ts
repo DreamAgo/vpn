@@ -30,12 +30,23 @@ interface AuthState {
   setMustChangePassword: (v: boolean) => void;
 }
 
+/** 同步读取 localStorage（SPA 端始终可用；出错时回退 null）。 */
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 export const useAuthStore = create<AuthState>((set, get) => ({
   accessToken: null,
-  refreshToken: null,
-  username: null,
+  // 关键：初始即同步读出 refresh token，使 RequireAuth 首次渲染就能据此静默刷新，
+  // 而不是等 App 的 hydrate effect（晚于子组件的路由守卫判定，会误跳登录页）。
+  refreshToken: readStored(REFRESH_KEY),
+  username: readStored(USERNAME_KEY),
   mustChangePassword: false,
-  hydrated: false,
+  hydrated: true,
 
   setSession({ accessToken, refreshToken, username, mustChangePassword = false }) {
     setAccessToken(accessToken);

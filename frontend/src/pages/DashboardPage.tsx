@@ -1,32 +1,6 @@
-/**
- * Story 2.12 + 5.9：仪表盘（KPI 卡片 + 离线告警 + 最近节点 + 系统信息）。
- *
- * - 4 个 KPI：用户总数 / 在线节点 / 离线节点 / 今日新增（最近 24h 接入的 peer）。
- * - 离线超 10 分钟的节点 → Alert 警告 + "处理"按钮跳 /peers。
- * - 最近心跳的 10 个节点列表（NodeStatusDot + 设备名 + 虚拟 IP + 相对时间）。
- * - 保留系统信息卡片。
- * - 节点数据每 10s 轮询（refetchInterval）。
- */
-import {
-  Card,
-  Col,
-  Row,
-  Statistic,
-  Descriptions,
-  Tag,
-  Skeleton,
-  Alert,
-  Typography,
-  List,
-  Space,
-} from 'antd';
-import {
-  ApiOutlined,
-  ClusterOutlined,
-  UserOutlined,
-  ThunderboltOutlined,
-} from '@ant-design/icons';
-import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
+import { Card, Col, Row, Descriptions, Tag, Skeleton, Alert, Typography, List, Space, Button } from 'antd';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
@@ -36,28 +10,63 @@ import { systemApi } from '@/services/auth';
 import { usersApi } from '@/services/users';
 import { peersApi } from '@/services/peers';
 import { NodeStatusDot } from '@/components/NodeStatusDot';
+import { EditServerRoutesModal } from '@/components/EditServerRoutesModal';
 import type { AdminPeerView } from '@/types/api';
 
 dayjs.extend(relativeTime);
 dayjs.locale('zh-cn');
 
-const { Title, Text, Link } = Typography;
-
+const { Text, Link } = Typography;
 const OFFLINE_ALERT_MINUTES = 10;
+
+function SectionHead({ label, title, extra }: { label: string; title: string; extra?: React.ReactNode }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+      <div>
+        <span className="bp-eyebrow">{label}</span>
+        <div style={{ fontSize: 18, fontWeight: 700, marginTop: 6, color: 'var(--ink)' }}>
+          {title}
+        </div>
+      </div>
+      {extra}
+    </div>
+  );
+}
+
+function Tile({ eyebrow, value, caption, accent }: { eyebrow: string; value: React.ReactNode; caption: string; accent?: string }) {
+  return (
+    <div
+      style={{
+        background: 'var(--card)',
+        border: '1px solid var(--line)',
+        borderRadius: 8,
+        padding: '18px 20px',
+        height: '100%',
+        boxShadow: 'var(--surface-shadow)',
+      }}
+    >
+      <span className="bp-eyebrow">{eyebrow}</span>
+      <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: 32, lineHeight: 1.1, marginTop: 14, color: accent ?? 'var(--ink)' }}>
+        {value}
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>{caption}</div>
+    </div>
+  );
+}
 
 export function DashboardPage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [editRoutes, setEditRoutes] = useState(false);
 
   const { data: system, isLoading: sysLoading, isError: sysError, error: sysErr } = useQuery({
     queryKey: ['system-info'],
     queryFn: () => systemApi.getSystemInfo(),
   });
-
   const { data: usersPage } = useQuery({
     queryKey: ['dashboard-users-total'],
     queryFn: () => usersApi.listUsers({ page: 1, pageSize: 1 }),
   });
-
   const { data: peersPage } = useQuery({
     queryKey: ['dashboard-peers'],
     queryFn: () => peersApi.listAdminPeers({ page: 1, pageSize: 500 }),
@@ -70,7 +79,6 @@ export function DashboardPage() {
   const todayThreshold = dayjs().subtract(24, 'hour').valueOf();
   const newTodayCount = peers.filter((p) => p.createdAt >= todayThreshold).length;
 
-  // 离线超 10 分钟的节点（按离线时长降序，最多展示前几条）。
   const now = dayjs();
   const staleOffline = peers
     .filter(
@@ -81,30 +89,29 @@ export function DashboardPage() {
     )
     .sort((a, b) => (a.lastSeenAt ?? 0) - (b.lastSeenAt ?? 0));
 
-  // 最近心跳的 10 个节点（有心跳的优先，按 lastSeenAt 降序）。
   const recentPeers = [...peers]
     .filter((p) => p.lastSeenAt != null)
     .sort((a, b) => (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0))
     .slice(0, 10);
 
   return (
-    <div style={{ padding: 24 }}>
-      <Title level={4} style={{ marginBottom: 16 }}>
-        仪表盘
-      </Title>
+    <div>
+      <div style={{ marginBottom: 22 }}>
+        <span className="bp-eyebrow">控制总览</span>
+        <div style={{ fontSize: 28, fontWeight: 700, marginTop: 8, color: 'var(--ink)' }}>
+          仪表盘
+        </div>
+      </div>
 
       {/* 离线告警 */}
       {staleOffline.length > 0 && (
-        <Space direction="vertical" style={{ width: '100%', marginBottom: 16 }} size="small">
+        <Space direction="vertical" style={{ width: '100%', marginBottom: 18 }} size="small">
           {staleOffline.slice(0, 5).map((p) => (
             <Alert
               key={p.id}
               type="warning"
               showIcon
-              message={`节点 ${p.deviceName}（${p.username}）已离线 ${now.diff(
-                dayjs(p.lastSeenAt),
-                'minute'
-              )} 分钟`}
+              message={`节点 ${p.deviceName}（${p.username}）已离线 ${now.diff(dayjs(p.lastSeenAt), 'minute')} 分钟`}
               action={
                 <a onClick={() => navigate('/peers')} style={{ whiteSpace: 'nowrap' }}>
                   处理
@@ -115,55 +122,31 @@ export function DashboardPage() {
         </Space>
       )}
 
-      {/* KPI 卡片 */}
-      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Statistic
-              title="用户总数"
-              value={usersPage?.total ?? '—'}
-              prefix={<UserOutlined />}
-            />
-          </Card>
+      {/* KPI 瓦片 */}
+      <Row gutter={[16, 16]} style={{ marginBottom: 26 }}>
+        <Col xs={12} lg={6}>
+          <Tile eyebrow="用户" value={usersPage?.total ?? '—'} caption="用户总数" />
         </Col>
-        <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Statistic
-              title="在线节点"
-              value={peersPage ? onlineCount : '—'}
-              prefix={<ApiOutlined />}
-              valueStyle={{ color: '#52C41A' }}
-            />
-          </Card>
+        <Col xs={12} lg={6}>
+          <Tile eyebrow="在线" value={peersPage ? onlineCount : '—'} caption="在线节点" accent="#16a34a" />
         </Col>
-        <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Statistic
-              title="离线节点"
-              value={peersPage ? offlineCount : '—'}
-              prefix={<ClusterOutlined />}
-              valueStyle={{ color: '#8c8c8c' }}
-            />
-          </Card>
+        <Col xs={12} lg={6}>
+          <Tile eyebrow="离线" value={peersPage ? offlineCount : '—'} caption="离线节点" accent="#64748b" />
         </Col>
-        <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Statistic
-              title="今日新增"
-              value={peersPage ? newTodayCount : '—'}
-              prefix={<ThunderboltOutlined />}
-            />
-          </Card>
+        <Col xs={12} lg={6}>
+          <Tile eyebrow="24 小时" value={peersPage ? newTodayCount : '—'} caption="今日新增" accent="#d97706" />
         </Col>
       </Row>
 
-      <Row gutter={[16, 16]}>
+      <Row gutter={[20, 20]}>
         {/* 最近节点 */}
         <Col xs={24} lg={12}>
-          <Card
+          <SectionHead
+            label="活动"
             title="最近活动节点"
-            extra={<Link onClick={() => navigate('/peers')}>查看全部 →</Link>}
-          >
+            extra={<Link onClick={() => navigate('/peers')}>查看全部</Link>}
+          />
+          <Card styles={{ body: { padding: recentPeers.length === 0 ? 20 : 4 } }}>
             {recentPeers.length === 0 ? (
               <Text type="secondary">暂无活动节点</Text>
             ) : (
@@ -178,7 +161,7 @@ export function DashboardPage() {
                         <Text strong>{p.deviceName}</Text>
                         <Text code>{p.vpnIp}</Text>
                       </Space>
-                      <Text type="secondary">
+                      <Text type="secondary" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
                         {p.lastSeenAt ? dayjs(p.lastSeenAt).fromNow() : '从未'}
                       </Text>
                     </Space>
@@ -191,9 +174,21 @@ export function DashboardPage() {
 
         {/* 系统信息 */}
         <Col xs={24} lg={12}>
-          <Card title="系统信息">
+          <SectionHead
+            label="系统"
+            title="系统信息"
+            extra={
+              system ? (
+                <Button type="link" size="small" onClick={() => setEditRoutes(true)}>
+                  编辑 LAN 网段
+                </Button>
+              ) : undefined
+            }
+          />
+          <Card styles={{ body: { padding: sysLoading ? 20 : 0 } }}>
             {sysError && (
               <Alert
+                style={{ margin: 16 }}
                 type="error"
                 showIcon
                 message="无法加载系统信息"
@@ -204,30 +199,52 @@ export function DashboardPage() {
             {system && (
               <Descriptions column={1} bordered size="small">
                 <Descriptions.Item label="版本">
-                  <Tag color="blue">v{system.version}</Tag>
+                  <Text code>v{system.version}</Text>
                 </Descriptions.Item>
-                <Descriptions.Item label="监听端口">{system.listenPort}</Descriptions.Item>
-                <Descriptions.Item label="VPN 子网">{system.vpnSubnet}</Descriptions.Item>
+                <Descriptions.Item label="监听端口">
+                  <Text code>{system.listenPort}</Text>
+                </Descriptions.Item>
+                <Descriptions.Item label="VPN 子网">
+                  <Text code>{system.vpnSubnet}</Text>
+                </Descriptions.Item>
                 <Descriptions.Item label="服务端 Endpoint">
-                  {system.serverEndpoint}
+                  <Text code>{system.serverEndpoint}</Text>
                 </Descriptions.Item>
                 <Descriptions.Item label="服务端公钥">
-                  <Typography.Text
-                    code
-                    copyable={{ text: system.serverPublicKey }}
-                    style={{ wordBreak: 'break-all' }}
-                  >
+                  <Typography.Text code copyable={{ text: system.serverPublicKey }} style={{ wordBreak: 'break-all' }}>
                     {system.serverPublicKey}
                   </Typography.Text>
                 </Descriptions.Item>
+                <Descriptions.Item label="服务端 LAN 网段">
+                  {(system.serverRoutes ?? []).length > 0 ? (
+                    <Space size={[4, 4]} wrap>
+                      {system.serverRoutes!.map((r) => (
+                        <Tag key={r} color="blue">
+                          {r}
+                        </Tag>
+                      ))}
+                    </Space>
+                  ) : (
+                    <Text type="secondary">未配置</Text>
+                  )}
+                </Descriptions.Item>
                 <Descriptions.Item label="启动时间">
-                  {dayjs(system.startedAt).format('YYYY-MM-DD HH:mm:ss')}
+                  <Text code>{dayjs(system.startedAt).format('YYYY-MM-DD HH:mm:ss')}</Text>
                 </Descriptions.Item>
               </Descriptions>
             )}
           </Card>
         </Col>
       </Row>
+
+      {system && (
+        <EditServerRoutesModal
+          open={editRoutes}
+          current={system.serverRoutes ?? []}
+          onClose={() => setEditRoutes(false)}
+          onSaved={() => queryClient.invalidateQueries({ queryKey: ['system-info'] })}
+        />
+      )}
     </div>
   );
 }

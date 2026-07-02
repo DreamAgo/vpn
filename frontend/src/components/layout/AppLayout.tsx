@@ -1,43 +1,133 @@
-/**
- * 主框架布局（ProLayout 包装）。
- *
- * 设计（来自 UX Spec §Visual Foundation）：
- * - 深色侧边栏（4 项主导航）+ 顶栏（项目名 + 用户菜单）
- * - 主内容区限宽 1600px 居中
- * - 用户菜单：账号设置 / 退出登录
- */
 import { ProLayout, type ProLayoutProps } from '@ant-design/pro-components';
-import { Dropdown, App } from 'antd';
+import { Dropdown, App, Button, Tooltip } from 'antd';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   DashboardOutlined,
   UserOutlined,
+  TeamOutlined,
+  PartitionOutlined,
   ApiOutlined,
   FileTextOutlined,
   SettingOutlined,
   LogoutOutlined,
   LinkOutlined,
+  MoonOutlined,
+  SunOutlined,
 } from '@ant-design/icons';
 
 import { useAuthStore } from '@/stores/authStore';
+import {
+  getThemeSurfaces,
+  type ThemeMode,
+  type ThemePalette,
+} from '@/theme';
 
 const route: ProLayoutProps['route'] = {
   path: '/',
   routes: [
     { path: '/dashboard', name: '仪表盘', icon: <DashboardOutlined /> },
     { path: '/users', name: '用户', icon: <UserOutlined /> },
+    { path: '/groups', name: '用户组', icon: <TeamOutlined /> },
+    { path: '/subnets', name: '网段', icon: <PartitionOutlined /> },
     { path: '/peers', name: '节点', icon: <ApiOutlined /> },
     { path: '/audit-logs', name: '日志', icon: <FileTextOutlined /> },
     { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
   ],
 };
 
-export function AppLayout() {
+interface AppLayoutProps {
+  palette: ThemePalette;
+  themeMode: ThemeMode;
+  onThemeModeChange: (mode: ThemeMode) => void;
+}
+
+function Brand({ collapsed, palette }: { collapsed?: boolean; palette: ThemePalette }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        minHeight: 44,
+        padding: collapsed ? 0 : '0 2px',
+      }}
+    >
+      <span
+        style={{
+          width: 30,
+          height: 30,
+          borderRadius: 7,
+          background: palette.primary,
+          color: '#fff',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          fontWeight: 700,
+          fontSize: 15,
+          flex: 'none',
+        }}
+      >
+        V
+      </span>
+      {!collapsed && (
+        <div style={{ lineHeight: 1.1 }}>
+          <div
+            style={{
+              fontWeight: 700,
+              fontSize: 17,
+              color: 'var(--ink)',
+            }}
+          >
+            VPN Console
+          </div>
+          <div
+            style={{
+              fontSize: 12,
+              color: 'var(--ink-soft)',
+              marginTop: 4,
+            }}
+          >
+            安全接入管理
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ThemeModeToggle({
+  value,
+  onChange,
+}: {
+  value: ThemeMode;
+  onChange: (mode: ThemeMode) => void;
+}) {
+  const next = value === 'dark' ? 'light' : 'dark';
+  return (
+    <Tooltip title={value === 'dark' ? '切换到浅色模式' : '切换到黑夜模式'}>
+      <Button
+        type="text"
+        aria-label={value === 'dark' ? '切换到浅色模式' : '切换到黑夜模式'}
+        icon={value === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+        onClick={() => onChange(next)}
+        style={{ color: 'var(--ink-soft)' }}
+      />
+    </Tooltip>
+  );
+}
+
+export function AppLayout({
+  palette,
+  themeMode,
+  onThemeModeChange,
+}: AppLayoutProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const { modal } = App.useApp();
   const username = useAuthStore((s) => s.username);
   const logout = useAuthStore((s) => s.logout);
+  const surfaces = getThemeSurfaces(themeMode);
+  const selectedBg = themeMode === 'dark' ? `rgba(${palette.rgb}, 0.16)` : palette.wash;
 
   const handleLogout = () => {
     modal.confirm({
@@ -54,15 +144,55 @@ export function AppLayout() {
 
   return (
     <ProLayout
-      title="vpn"
+      title=""
       logo={false}
-      layout="mix"
-      contentWidth="Fixed"
+      layout="side"
+      siderWidth={232}
+      fixSiderbar
+      fixedHeader
+      contentWidth="Fluid"
       location={{ pathname: location.pathname }}
       route={route}
-      menuItemRender={(item, dom) =>
-        item.path ? <a onClick={() => navigate(item.path!)}>{dom}</a> : dom
-      }
+      token={{
+        bgLayout: surfaces.bg,
+        header: {
+          colorBgHeader: surfaces.card,
+          colorHeaderTitle: surfaces.ink,
+          colorTextRightActionsItem: surfaces.inkSoft,
+          heightLayoutHeader: 60,
+        },
+        sider: {
+          colorMenuBackground: surfaces.card,
+          colorMenuItemDivider: surfaces.line,
+          colorTextMenu: surfaces.inkSoft,
+          colorTextMenuSecondary: surfaces.inkFaint,
+          colorTextMenuSelected: themeMode === 'dark' ? palette.primary : palette.primaryHover,
+          colorBgMenuItemSelected: selectedBg,
+          colorBgMenuItemHover: surfaces.menuHover,
+          colorTextMenuActive: themeMode === 'dark' ? palette.primary : palette.primaryHover,
+          colorTextMenuItemHover: surfaces.ink,
+        },
+        pageContainer: {
+          paddingBlockPageContainerContent: 0,
+          paddingInlinePageContainerContent: 0,
+        },
+      }}
+      menuHeaderRender={(_logo, _title, props) => <Brand collapsed={props?.collapsed} palette={palette} />}
+      actionsRender={() => [
+        <ThemeModeToggle
+          key="theme-mode"
+          value={themeMode}
+          onChange={onThemeModeChange}
+        />,
+      ]}
+      menuItemRender={(item, dom) => (
+        <a
+          onClick={() => item.path && navigate(item.path)}
+          style={{ display: 'flex', alignItems: 'center' }}
+        >
+          {dom}
+        </a>
+      )}
       avatarProps={{
         size: 'small',
         title: username ?? 'admin',
@@ -93,7 +223,9 @@ export function AppLayout() {
         ),
       }}
     >
-      <Outlet />
+      <main style={{ maxWidth: 1280, margin: '0 auto', width: '100%', padding: '24px 28px 40px' }}>
+        <Outlet />
+      </main>
     </ProLayout>
   );
 }

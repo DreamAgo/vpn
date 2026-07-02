@@ -75,6 +75,8 @@ export interface SystemInfo {
   serverEndpoint: string;
   listenPort: number;
   startedAt: number;
+  /** 服务端配置的 LAN 网段（服务端作网关下发给客户端的 allowed_routes）。 */
+  serverRoutes?: string[];
 }
 
 // ===== User management DTOs (与 vpn-api-types::user 对齐, Epic 3) =====
@@ -87,7 +89,50 @@ export interface UserDto {
   status: string; // "active" | "disabled"
   mustChangePassword: boolean;
   lastLoginAt: number | null;
+  groupIds: string[]; // 所属用户组 id 列表（可属多个组；未分组为空）
   createdAt: number;
+}
+
+// ===== 用户组 DTOs（与 vpn-api-types::group 对齐） =====
+export interface UserGroupDto {
+  id: string;
+  name: string;
+  routes: string[]; // 组可路由网段（CIDR）
+  memberCount: number;
+  createdAt: number;
+}
+
+export interface CreateUserGroupRequest {
+  name: string;
+  routes: string[];
+}
+
+export interface UpdateUserGroupRequest {
+  name?: string;
+  routes?: string[];
+}
+
+export interface AssignGroupRequest {
+  groupIds: string[]; // 全量覆盖;空数组 → 取消所有分组
+}
+
+// ===== 网段目录 DTOs（与 vpn-api-types::subnet 对齐） =====
+export interface SubnetDto {
+  id: string;
+  name: string;
+  cidr: string;
+  usageCount: number; // 被用户组/节点/服务端路由引用的次数
+  createdAt: number;
+}
+
+export interface CreateSubnetRequest {
+  name: string;
+  cidr: string;
+}
+
+export interface UpdateSubnetRequest {
+  name?: string;
+  cidr?: string;
 }
 
 export interface CreateUserRequest {

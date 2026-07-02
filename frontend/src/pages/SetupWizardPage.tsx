@@ -69,11 +69,11 @@ export function SetupWizardPage() {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'linear-gradient(135deg, #1f2a4a 0%, #2F54EB 100%)',
+        background: 'var(--bg-1)',
         padding: 24,
       }}
     >
-      <Card style={{ width: 560, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
+      <Card style={{ width: 560, boxShadow: 'var(--surface-shadow-secondary)' }}>
         <Title level={3} style={{ marginBottom: 8 }}>
           欢迎使用 vpn — 首次配置
         </Title>
