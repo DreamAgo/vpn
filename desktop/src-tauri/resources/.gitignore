@@ -1,0 +1,3 @@
+# wintun.dll 是 WireGuard 官方签名的第三方二进制,不入库。
+# Windows 构建前运行 desktop/scripts/fetch-wintun.ps1 下载到此目录。
+wintun.dll
