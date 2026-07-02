@@ -72,7 +72,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 # === 认证与加密 ===
 argon2 = "0.5"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-rand = "0.8"
+rand = "0.9"
 rsa = { version = "0.9", features = ["pem"] }
 tower_governor = "0.8"
 validator = { version = "0.20", features = ["derive"] }
