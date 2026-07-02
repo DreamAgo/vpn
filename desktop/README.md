@@ -75,6 +75,30 @@ cargo tauri build                 # 完整打包(.app/.dmg)
 cd src-tauri && cargo build       # 仅编译 Rust 侧
 ```
 
+## Auto Update
+
+桌面端已接入 Tauri updater。应用启动后会静默检查 GitHub Release 中的
+`latest.json`,设置面板里也可以手动检查并安装更新。安装完成后应用会自动重启。
+
+更新包必须签名:
+
+- 公钥写在 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`。
+- 私钥不要提交到仓库,写入 GitHub Secrets:
+  - `TAURI_SIGNING_PRIVATE_KEY`
+  - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`(无密码时可留空)
+- Release workflow 会用私钥生成 Tauri updater 签名,并生成 `latest.json`。
+
+如果要替换生产密钥:
+
+```sh
+cd desktop
+npx tauri signer generate --write-keys /secure/path/vpn-desktop-updater.key
+```
+
+把输出的 public key 更新到 `tauri.conf.json`,把 private key 写入
+`TAURI_SIGNING_PRIVATE_KEY` secret。丢失私钥后,已安装客户端无法信任后续更新,
+需要重新下载安装包。
+
 ### Windows 构建
 
 Windows 包需要 WireGuard 官方签名的 `wintun.dll`(运行时由 `tun` crate 加载来开虚拟网卡)。

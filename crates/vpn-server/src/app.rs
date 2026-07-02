@@ -70,6 +70,14 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::put(handlers::system::update_server_routes),
             )
             .route(
+                "/api/v1/admin/backup",
+                get(handlers::backup::download_backup),
+            )
+            .route(
+                "/api/v1/admin/backup/restore",
+                post(handlers::backup::restore_backup),
+            )
+            .route(
                 "/api/v1/admin/users",
                 post(handlers::users::create_user).get(handlers::users::list_users),
             )

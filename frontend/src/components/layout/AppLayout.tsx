@@ -11,6 +11,7 @@ import {
   SettingOutlined,
   LogoutOutlined,
   LinkOutlined,
+  DatabaseOutlined,
   MoonOutlined,
   SunOutlined,
 } from '@ant-design/icons';
@@ -31,6 +32,7 @@ const route: ProLayoutProps['route'] = {
     { path: '/subnets', name: '网段', icon: <PartitionOutlined /> },
     { path: '/peers', name: '节点', icon: <ApiOutlined /> },
     { path: '/audit-logs', name: '日志', icon: <FileTextOutlined /> },
+    { path: '/backup', name: '备份恢复', icon: <DatabaseOutlined /> },
     { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
   ],
 };
@@ -67,7 +69,7 @@ function Brand({ collapsed, palette }: { collapsed?: boolean; palette: ThemePale
           flex: 'none',
         }}
       >
-        V
+        易
       </span>
       {!collapsed && (
         <div style={{ lineHeight: 1.1 }}>
@@ -78,7 +80,7 @@ function Brand({ collapsed, palette }: { collapsed?: boolean; palette: ThemePale
               color: 'var(--ink)',
             }}
           >
-            VPN Console
+            易链
           </div>
           <div
             style={{
