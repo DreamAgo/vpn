@@ -77,7 +77,7 @@ rsa = { version = "0.9", features = ["pem"] }
 tower_governor = "0.8"
 validator = { version = "0.20", features = ["derive"] }
 zeroize = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # === WireGuard 数据平面 ===
 boringtun = "0.6"
