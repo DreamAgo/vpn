@@ -28,6 +28,11 @@ use crate::ipc::{ConnState, IpcRequest, IpcResponse, StatusResponse};
 /// 心跳间隔（秒）。服务端期望 30s 一次（见 vpn_api_types::peer）。
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
+/// 丢包率统计窗口：最近 N 次心跳的成败样本（约 10 分钟）。
+pub const HEARTBEAT_LOSS_WINDOW: usize = 20;
+/// 上报丢包率所需的最少样本数（不足时不上报，避免头几拍噪声）。
+pub const HEARTBEAT_LOSS_MIN_SAMPLES: usize = 5;
+
 /// WireGuard persistent-keepalive（秒），用于 NAT 保活（穿透常驻 NAT 映射）。
 pub const PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 
@@ -217,6 +222,8 @@ pub async fn connect_once(
         os_info: Some(detect_os_info()),
         // 站点网关模式：登录时 `--route` 声明的 LAN 网段（经 DaemonConfig 传入）。
         routed_subnets: routed_subnets.to_vec(),
+        // 节点健康监控：上报客户端版本。
+        client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let resp = api.register_peer(&req).await?;
 
@@ -307,6 +314,8 @@ pub async fn tear_down_tunnel(_iface: &str) {}
 pub async fn run_heartbeat(
     api: Arc<ApiClient>,
     endpoint: Option<String>,
+    // 本机 WireGuard 公钥：多终端模式下服务端据此精确定位是哪台终端在打卡。
+    wg_public_key: Option<String>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     state: Option<SharedState>,
     initial_routes: Vec<String>,
@@ -314,6 +323,10 @@ pub async fn run_heartbeat(
 ) -> CliResult<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     let mut failures: u32 = 0;
+    // 节点健康监控：最近一次心跳 RTT + 最近 N 次心跳成败窗口（用于丢包率上报）。
+    let mut last_rtt_ms: Option<i64> = None;
+    let mut samples: std::collections::VecDeque<bool> =
+        std::collections::VecDeque::with_capacity(HEARTBEAT_LOSS_WINDOW);
     // 当前已应用的 allowed_routes(排序后,用于顺序无关比对)。
     let mut current_sorted = {
         let mut v = initial_routes;
@@ -328,11 +341,28 @@ pub async fn run_heartbeat(
                 if res.is_err() || *shutdown.borrow() { break; }
             }
             _ = ticker.tick() => {
+                // 样本不足时不上报丢包率，避免头几拍的 0%/100% 噪声。
+                let loss_pct = if samples.len() >= HEARTBEAT_LOSS_MIN_SAMPLES {
+                    let lost = samples.iter().filter(|ok| !**ok).count();
+                    Some(lost as f64 * 100.0 / samples.len() as f64)
+                } else {
+                    None
+                };
                 let req = vpn_api_types::peer::PeerHeartbeatRequest {
                     endpoint: endpoint.clone(),
+                    wg_public_key: wg_public_key.clone(),
+                    rtt_ms: last_rtt_ms,
+                    loss_pct,
                 };
-                match api.heartbeat(&req).await {
+                let started = std::time::Instant::now();
+                let result = api.heartbeat(&req).await;
+                if samples.len() >= HEARTBEAT_LOSS_WINDOW {
+                    samples.pop_front();
+                }
+                samples.push_back(result.is_ok());
+                match result {
                     Ok(resp) => {
+                        last_rtt_ms = Some(started.elapsed().as_millis() as i64);
                         // P1.4:检测 allowed_routes 变化 → 下发实时路由更新。
                         let mut next_sorted = resp.allowed_routes.clone();
                         next_sorted.sort();
@@ -467,10 +497,12 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                                 // 韧性重连:瞬时失败不退出;仅致命错误(强制下线/peer 被删)才退出并置错误态。
                                 let api_hb = api.clone();
                                 let state_hb = state.clone();
+                                let hb_pubkey = keypair.public_key.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = run_heartbeat(
                                         api_hb,
                                         None,
+                                        Some(hb_pubkey),
                                         sd_rx,
                                         Some(state_hb.clone()),
                                         init_routes,

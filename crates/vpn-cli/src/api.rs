@@ -193,15 +193,13 @@ impl ApiClient {
 
     /// 周期性心跳上报（每 30s）。返回服务端实时计算的 allowed_routes(P1.4:
     /// 组/网段变更后客户端据此增量更新路由,无需重连)。
-    pub async fn heartbeat(
-        &self,
-        req: &PeerHeartbeatRequest,
-    ) -> CliResult<PeerHeartbeatResponse> {
+    pub async fn heartbeat(&self, req: &PeerHeartbeatRequest) -> CliResult<PeerHeartbeatResponse> {
         // 旧服务端心跳返回 data:null（无 allowed_routes）。用 Option 容错解析：null → None →
         // 回退默认空响应；调用方据“空 allowed_routes = 无路由信息”跳过路由下发、不动隧道，
         // 避免对结构体从 null 反序列化失败被当作瞬时错误而卡在重连。
-        let resp: Option<PeerHeartbeatResponse> =
-            self.post_json_authed("/api/v1/peers/heartbeat", req).await?;
+        let resp: Option<PeerHeartbeatResponse> = self
+            .post_json_authed("/api/v1/peers/heartbeat", req)
+            .await?;
         Ok(resp.unwrap_or_default())
     }
 

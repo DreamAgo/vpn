@@ -107,6 +107,7 @@ async fn register_peer_succeeds_with_bearer() {
         device_name: "dev".into(),
         os_info: None,
         routed_subnets: Vec::new(),
+        client_version: None,
     };
     let resp = client.register_peer(&req).await.unwrap();
     assert_eq!(resp.vpn_ip, "10.8.0.5");
@@ -178,6 +179,7 @@ async fn expired_access_token_triggers_refresh_and_retry() {
         device_name: "dev".into(),
         os_info: None,
         routed_subnets: Vec::new(),
+        client_version: None,
     };
     let resp = client.register_peer(&req).await.unwrap();
     assert_eq!(resp.vpn_ip, "10.8.0.9");
@@ -214,6 +216,9 @@ async fn heartbeat_posts_endpoint() {
     client.login("a", "b").await.unwrap();
     let req = vpn_api_types::peer::PeerHeartbeatRequest {
         endpoint: Some("1.2.3.4:1234".into()),
+        wg_public_key: None,
+        rtt_ms: None,
+        loss_pct: None,
     };
     let resp = client.heartbeat(&req).await.unwrap();
     assert_eq!(resp.allowed_routes, vec!["10.8.0.0/24", "172.31.100.0/24"]);

@@ -128,10 +128,18 @@ impl VpnManager {
         let api_hb = api.clone();
         let shared = self.shared.clone();
         let hb_state = shared.clone();
+        let hb_pubkey = self.keypair.public_key.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                daemon::run_heartbeat(api_hb, None, rx, Some(hb_state), init_routes, Some(routes_tx))
-                    .await
+            if let Err(e) = daemon::run_heartbeat(
+                api_hb,
+                None,
+                Some(hb_pubkey),
+                rx,
+                Some(hb_state),
+                init_routes,
+                Some(routes_tx),
+            )
+            .await
             {
                 let _ = hb_tx.send(true); // 停掉数据面转发任务(拆隧道、删路由)
                 let msg = if e.is_token_expired() {
