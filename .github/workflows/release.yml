@@ -52,6 +52,16 @@ jobs:
           choco install nasm -y
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
+      # 交叉目标（如 arm mac runner 上编 x86_64-apple-darwin）需显式装 target std，
+      # 否则报 error[E0463]: can't find crate for `core`。
+      - name: Ensure target std installed
+        run: rustup target add ${{ matrix.target }}
+
+      # vpn-cli 的 keyring 在 Linux 经 libdbus-sys 链接系统 libdbus（--workspace 会编 vpn-cli）。
+      - name: Install libdbus + pkg-config (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Cache Cargo deps
         uses: Swatinem/rust-cache@v2
 

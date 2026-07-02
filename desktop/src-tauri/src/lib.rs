@@ -233,10 +233,12 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
+        .run(|_app_handle, _event| {
             // 点击程序坞图标时（窗口可能已隐藏）重新唤出窗口。
-            if let tauri::RunEvent::Reopen { .. } = event {
-                show_window(app_handle);
+            // RunEvent::Reopen 仅 macOS 存在（dock 点击），其它平台无此变体，需 cfg 隔离。
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_window(_app_handle);
             }
         });
 }

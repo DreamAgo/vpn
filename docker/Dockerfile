@@ -19,6 +19,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ===== Stage 2: cacher =====
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION} AS cacher
 WORKDIR /app
+# cargo chef cook 会编译整个 workspace 依赖，含 vpn-cli 的 libdbus-sys(keyring) → 需 libdbus。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
 # 缓存所有依赖（仅在 recipe.json 变化时重建）
 RUN cargo chef cook --release --recipe-path recipe.json
@@ -34,6 +38,10 @@ RUN npm run build
 # ===== Stage 4: builder =====
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION} AS builder
 WORKDIR /app
+# 与 cacher 一致的系统库（复用其编译产物时链接阶段可能需要）。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 # 复用 cacher 的 target 目录（依赖已编译）
 COPY --from=cacher /app/target target
 COPY --from=cacher /usr/local/cargo /usr/local/cargo
