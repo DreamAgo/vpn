@@ -1,6 +1,6 @@
 name: Release
 
-# 推送 v* tag 触发：构建三平台二进制 + Windows 安装包 + Docker 镜像，发布到 GitHub Releases。
+# 推送 v* tag 触发：构建 CLI/GUI 客户端、Linux 服务端和 Docker 镜像，发布到 GitHub Releases。
 # 也支持 workflow_dispatch 手动触发（只构建+上传产物工件，不创建 Release），便于不打 tag 先验证。
 on:
   push:
@@ -18,23 +18,30 @@ env:
 
 jobs:
   # ============================================================
-  # 三平台二进制构建
+  # CLI 客户端：Windows exe、macOS amd64/arm、Linux amd64/arm
   # ============================================================
-  build-binaries:
-    name: Build ${{ matrix.target }}
+  build-cli:
+    name: CLI ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            artifact: vpn-cli-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: vpn-cli-linux-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: vpn-cli-macos-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
+            artifact: vpn-cli-macos-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            artifact: vpn-cli-windows-amd64
 
     steps:
       - uses: actions/checkout@v4
@@ -57,9 +64,67 @@ jobs:
       - name: Ensure target std installed
         run: rustup target add ${{ matrix.target }}
 
-      # vpn-cli 的 keyring 在 Linux 经 libdbus-sys 链接系统 libdbus（--workspace 会编 vpn-cli）。
+      # vpn-cli 的 keyring 在 Linux 经 libdbus-sys 链接系统 libdbus。
       - name: Install libdbus + pkg-config (Linux)
         if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Cache Cargo deps
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build vpn-cli
+        run: cargo build --release -p vpn-cli --target ${{ matrix.target }}
+
+      - name: Package CLI (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release -czf dist/${{ matrix.artifact }}.tar.gz vpn-cli
+
+      - name: Package CLI (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir dist
+          Copy-Item target/${{ matrix.target }}/release/vpn-cli.exe dist/${{ matrix.artifact }}.exe
+          Compress-Archive -Path dist/${{ matrix.artifact }}.exe -DestinationPath dist/${{ matrix.artifact }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  # ============================================================
+  # Linux 服务端：只发布 Linux amd64/arm
+  # ============================================================
+  build-linux-server:
+    name: Server ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: vpn-server-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: vpn-server-linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure target std installed
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Cache Cargo deps
@@ -72,35 +137,26 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      # 前端构建产物由 rust-embed 内嵌进 vpn-server
+      # 前端构建产物由 rust-embed 内嵌进 vpn-server。
       - name: Build frontend
         run: |
           cd frontend
           npm ci
           npm run build
 
-      - name: Build release binaries
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+      - name: Build vpn-server
+        run: cargo build --release -p vpn-server --target ${{ matrix.target }}
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Package server
+        shell: bash
         run: |
           mkdir -p dist
-          tar -C target/${{ matrix.target }}/release -czf \
-            dist/vpn-${{ matrix.target }}.tar.gz vpn-server vpn-cli
-        shell: bash
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        run: |
-          mkdir dist
-          Compress-Archive -Path target/${{ matrix.target }}/release/vpn-server.exe, target/${{ matrix.target }}/release/vpn-cli.exe -DestinationPath dist/vpn-${{ matrix.target }}.zip
-        shell: pwsh
+          tar -C target/${{ matrix.target }}/release -czf dist/${{ matrix.artifact }}.tar.gz vpn-server
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vpn-${{ matrix.target }}
+          name: ${{ matrix.artifact }}
           path: dist/*
 
   # ============================================================
@@ -230,12 +286,170 @@ jobs:
             desktop/src-tauri/target/release/bundle/nsis/*.sig
 
   # ============================================================
+  # macOS 桌面 GUI 客户端（Tauri 2）：DMG amd64 + arm64
+  # ============================================================
+  macos-desktop:
+    name: macOS desktop app ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+            arch: amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure target std installed
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache Cargo deps (desktop standalone workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Tauri build (DMG)
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: desktop
+        run: npx tauri build --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Tauri build (DMG + updater signatures)
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY secret required for tagged releases." >&2
+            exit 1
+          fi
+          npx tauri build --target ${{ matrix.target }} --bundles dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-desktop-macos-${{ matrix.arch }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.sig
+
+  # ============================================================
+  # Linux 桌面 GUI 客户端（Tauri 2）：AppImage + deb amd64/arm64
+  # ============================================================
+  linux-desktop:
+    name: Linux desktop app ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure target std installed
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: Cache Cargo deps (desktop standalone workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Tauri build (AppImage + deb)
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: desktop
+        run: npx tauri build --target ${{ matrix.target }} --bundles appimage,deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Tauri build (AppImage + deb + updater signatures)
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY secret required for tagged releases." >&2
+            exit 1
+          fi
+          npx tauri build --target ${{ matrix.target }} --bundles appimage,deb
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-desktop-linux-${{ matrix.arch }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.sig
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.sig
+
+  # ============================================================
   # 汇总产物并创建 GitHub Release（仅 tag 触发；手动 dispatch 只留工件）
   # ============================================================
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-binaries, windows-cli-installer, windows-desktop]
+    needs:
+      - build-cli
+      - build-linux-server
+      - windows-cli-installer
+      - windows-desktop
+      - macos-desktop
+      - linux-desktop
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
