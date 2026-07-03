@@ -21,7 +21,7 @@ cargo build --release --workspace
 
 `vpn-cli daemon install` 由 `vpn-platform` 的 `DaemonRuntime` 实现：
 Linux → systemd **user** service；macOS → launchd LaunchAgent
-(`com.vpn-cli.daemon`)；Windows → Windows Service (`sc.exe`)。注册时使用参数
+(`com.xeflow.vpn.cli.daemon`)；Windows → Windows Service (`sc.exe`)。注册时使用参数
 `daemon run`。安装包附带的服务单元仅作为参考模板 / 备选注册方式。
 
 ---
@@ -124,7 +124,7 @@ Linux → systemd **user** service；macOS → launchd LaunchAgent
 - 文件：
   - `build-pkg.sh`：用 `pkgbuild` + `productbuild` 生成 .pkg。
   - `scripts/postinstall`：修可执行权限并提示注册 daemon。
-  - `com.vpn-cli.daemon.plist`：LaunchAgent 模板（label / 参数与 `DaemonRuntime` 一致）。
+  - `com.xeflow.vpn.cli.daemon.plist`：LaunchAgent 模板（label / 参数与 `DaemonRuntime` 一致）。
 - daemon 注册：推荐用户登录后执行 `vpn-cli daemon install`（LaunchAgent 属于
   登录会话，root 安装上下文无法可靠 load，故 postinstall 不自动 load）。
 - 需真机/签名证书：

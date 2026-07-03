@@ -16,12 +16,12 @@ platform: "linux"
 version: "v0.1.0"        # 与 workspace 版本保持一致；CI 可用 ${GIT_TAG} 注入。
 section: "net"
 priority: "optional"
-maintainer: "Shangguanjunjie"
+maintainer: "xe-flow.com"
 description: |
   VPN 服务端（vpn-server）与客户端 CLI（vpn-cli）。
   服务端以 systemd system 服务运行，需要 CAP_NET_ADMIN 管理 WireGuard 数据平面。
-vendor: "Shangguanjunjie"
-homepage: "https://github.com/Shangguanjunjie/vpn"
+vendor: "xe-flow.com"
+homepage: "https://xe-flow.com"
 license: "MIT"
 
 # .deb / .rpm 的运行期依赖（按真机环境可增删；wireguard-tools 便于排障）。

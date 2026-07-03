@@ -16,12 +16,12 @@
 
 #define MyAppName "VPN CLI"
 #define MyAppVersion "0.1.0"
-#define MyAppPublisher "Shangguanjunjie"
-#define MyAppURL "https://github.com/Shangguanjunjie/vpn"
+#define MyAppPublisher "xe-flow.com"
+#define MyAppURL "https://xe-flow.com"
 #define MyAppExeName "vpn-cli.exe"
 
 [Setup]
-AppId={{9D2B5A1E-7C3F-4E58-9A21-VPNCLI000001}}
+AppId={{9D2B5A1E-7C3F-4E58-9A21-2F0A0C1E0001}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}

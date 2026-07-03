@@ -4,22 +4,22 @@
   vpn-cli 客户端 daemon 的 launchd LaunchAgent 模板。
 
   与 vpn-platform DaemonRuntime 约定一致：
-    - Label: com.vpn-cli.daemon（DEFAULT_LAUNCHD_LABEL）
+    - Label: com.xeflow.vpn.cli.daemon（DEFAULT_LAUNCHD_LABEL）
     - ProgramArguments: <exe> daemon run
   二进制由 .pkg 安装到 /usr/local/bin/vpn-cli。
 
   两种安装方式（README 有说明）：
     1) 推荐：用户登录后执行 `vpn-cli daemon install`，
-       由 DaemonRuntime 写入 ~/Library/LaunchAgents/com.vpn-cli.daemon.plist 并 load。
+       由 DaemonRuntime 写入 ~/Library/LaunchAgents/com.xeflow.vpn.cli.daemon.plist 并 load。
     2) 备选：将本模板放入 ~/Library/LaunchAgents/ 后手动
-       `launchctl load -w ~/Library/LaunchAgents/com.vpn-cli.daemon.plist`。
+       `launchctl load -w ~/Library/LaunchAgents/com.xeflow.vpn.cli.daemon.plist`。
   LaunchAgent 在用户登录会话内运行，因此 .pkg 的 postinstall 不直接 load
   （root 安装上下文无法可靠定位目标用户的 GUI 会话）。
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.vpn-cli.daemon</string>
+    <string>com.xeflow.vpn.cli.daemon</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/vpn-cli</string>

@@ -23,7 +23,7 @@ use crate::error::{PlatformError, Result};
 /// 默认服务标识 / 名称。
 pub const DEFAULT_SERVICE_NAME: &str = "vpn-cli";
 /// launchd label 约定。
-pub const DEFAULT_LAUNCHD_LABEL: &str = "com.vpn-cli.daemon";
+pub const DEFAULT_LAUNCHD_LABEL: &str = "com.xeflow.vpn.cli.daemon";
 
 /// 服务运行状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,13 +442,13 @@ mod tests {
     #[test]
     fn launchd_plist_is_well_formed() {
         let plist = render_launchd_plist(
-            "com.vpn-cli.daemon",
+            "com.xeflow.vpn.cli.daemon",
             Path::new("/usr/local/bin/vpn-cli"),
             &["daemon".to_string()],
         );
         assert!(plist.contains("<?xml version=\"1.0\""));
         assert!(plist.contains("<key>Label</key>"));
-        assert!(plist.contains("<string>com.vpn-cli.daemon</string>"));
+        assert!(plist.contains("<string>com.xeflow.vpn.cli.daemon</string>"));
         assert!(plist.contains("<string>/usr/local/bin/vpn-cli</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
@@ -486,10 +486,10 @@ mod tests {
 
     #[test]
     fn launchd_path_derivation() {
-        let p = launchd_plist_path(Path::new("/Users/u"), "com.vpn-cli.daemon");
+        let p = launchd_plist_path(Path::new("/Users/u"), "com.xeflow.vpn.cli.daemon");
         assert_eq!(
             p,
-            PathBuf::from("/Users/u/Library/LaunchAgents/com.vpn-cli.daemon.plist")
+            PathBuf::from("/Users/u/Library/LaunchAgents/com.xeflow.vpn.cli.daemon.plist")
         );
     }
 }

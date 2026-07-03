@@ -17,7 +17,7 @@
 set -e
 
 VERSION="${1:-0.1.0}"
-IDENTIFIER="com.vpn-cli.pkg"
+IDENTIFIER="com.xeflow.vpn.cli.pkg"
 INSTALL_LOCATION="/usr/local/bin"
 
 # 以仓库根为基准（脚本位于 packaging/macos/）。
