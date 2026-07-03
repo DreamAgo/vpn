@@ -219,7 +219,7 @@ export function DashboardPage() {
     refetchInterval: 10_000,
   });
 
-  const peers: AdminPeerView[] = peersPage?.items ?? [];
+  const peers: AdminPeerView[] = useMemo(() => peersPage?.items ?? [], [peersPage?.items]);
   const onlineCount = peers.filter((p) => p.status === 'online').length;
   const offlineCount = peers.filter((p) => p.status === 'offline').length;
   const gatewayCount = peers.filter((p) => (p.routedSubnets ?? []).length > 0).length;
@@ -230,10 +230,10 @@ export function DashboardPage() {
   const newTodayCount = peers.filter((p) => p.createdAt >= todayThreshold).length;
   const healthScore = compactPercent(onlineCount, peers.length);
 
-  const now = dayjs();
   const staleOfflineGateways = useMemo(
-    () =>
-      peers
+    () => {
+      const now = dayjs();
+      return peers
         .filter(
           (p) =>
             (p.routedSubnets ?? []).length > 0 &&
@@ -241,9 +241,9 @@ export function DashboardPage() {
             p.lastSeenAt != null &&
             now.diff(dayjs(p.lastSeenAt), 'minute') >= OFFLINE_ALERT_MINUTES
         )
-        .sort((a, b) => (a.lastSeenAt ?? 0) - (b.lastSeenAt ?? 0)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [peersPage]
+        .sort((a, b) => (a.lastSeenAt ?? 0) - (b.lastSeenAt ?? 0));
+    },
+    [peers]
   );
 
   const recentPeers = useMemo(
@@ -262,6 +262,9 @@ export function DashboardPage() {
       : peers.length > 0
         ? '接入面运行正常'
         : '等待节点接入';
+  const topRiskOfflineMinutes = topRisk?.lastSeenAt
+    ? dayjs().diff(dayjs(topRisk.lastSeenAt), 'minute')
+    : 0;
 
   return (
     <div className="dashboard-page">
@@ -317,10 +320,7 @@ export function DashboardPage() {
           className="dashboard-alert"
           type="warning"
           showIcon
-          message={`站点网关离线：${topRisk.deviceName}（${topRisk.username}）已离线 ${now.diff(
-            dayjs(topRisk.lastSeenAt),
-            'minute'
-          )} 分钟`}
+          message={`站点网关离线：${topRisk.deviceName}（${topRisk.username}）已离线 ${topRiskOfflineMinutes} 分钟`}
           description={
             staleOfflineGateways.length > 1
               ? `还有 ${staleOfflineGateways.length - 1} 个站点网关也超过离线阈值。`

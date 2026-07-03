@@ -499,6 +499,7 @@ impl NotificationService {
             .is_some())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_email_and_record(
         &self,
         event_type: &str,
@@ -576,6 +577,7 @@ impl NotificationService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_http_and_record(
         &self,
         event_type: &str,
@@ -638,6 +640,7 @@ impl NotificationService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_event(
         &self,
         event_type: &str,

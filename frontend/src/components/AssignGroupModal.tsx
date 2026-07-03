@@ -3,7 +3,7 @@
  *
  * 组决定成员的 VPN allowed_routes(访问控制,多组取并集);改动对该用户下次接入/重连生效。
  */
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Modal, Select, App, Typography, Alert } from 'antd';
 import { useQuery } from '@tanstack/react-query';
 
@@ -31,10 +31,6 @@ export function AssignGroupModal({ open, user, onClose, onSaved }: Props) {
     enabled: open,
   });
 
-  useEffect(() => {
-    if (open) setValue(user?.groupIds ?? []);
-  }, [open, user]);
-
   const handleOk = async () => {
     if (!user) return;
     setSaving(true);
@@ -59,6 +55,9 @@ export function AssignGroupModal({ open, user, onClose, onSaved }: Props) {
     <Modal
       open={open}
       title={user ? `分配用户组 · ${user.username}` : '分配用户组'}
+      afterOpenChange={(visible) => {
+        if (visible) setValue(user?.groupIds ?? []);
+      }}
       onCancel={() => !saving && onClose()}
       onOk={handleOk}
       confirmLoading={saving}

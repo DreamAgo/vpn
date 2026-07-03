@@ -533,11 +533,8 @@ impl PeerService {
             return Ok(());
         }
         let news: Vec<Ipv4Net> = new_subnets.iter().filter_map(|s| s.parse().ok()).collect();
-        // 站点网段不得**落在 VPN 子网内部或等于 VPN 子网**——那样它比 VPN 子网的连通路由
-        // 更具体,会真正劫持 VPN 子网内地址。若站点段是 VPN 子网的**超网**(如 10.0.0.0/8 ⊃
-        // 10.8.0.0/24)则放行:内核路由与 wg allowed-ips 均按**最长前缀匹配**,更具体的 VPN
-        // 子网(/24)及各客户端(/32)优先命中自身,VPN 子网可达性不受影响(仅未分配的 VPN IP 会
-        // 被导向该网关,无害)。据路由优先级判定,不再对超网一刀切拒绝。
+        // 站点网段不得落在 VPN 子网内部或等于 VPN 子网。VPN 子网的超网仍可放行:
+        // 路由表和 wg allowed-ips 采用最长前缀匹配,更具体的 VPN 子网/客户端地址会优先命中。
         for n in &news {
             if self.subnet.contains(n) {
                 return Err(AppError::Validation(format!(
@@ -1757,10 +1754,9 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_subnet_overlapping_vpn_subnet() {
         let svc = service(setup_pool().await); // VPN 子网 10.8.0.0/24
-                                               // 站点网段覆盖 VPN 子网超网（10/8）→ 拒绝：否则服务端 `ip route replace 10.0.0.0/8 dev wg0`
-                                               // 会劫持服务端整段 10/8 路由。
+                                               // 站点网段落在 VPN 子网内部（10.8.0.128/25）→ 拒绝。
         let err = svc
-            .register("user-1", &reg_with_subnets("PK1", &["10.0.0.0/8"]))
+            .register("user-1", &reg_with_subnets("PK1", &["10.8.0.128/25"]))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));

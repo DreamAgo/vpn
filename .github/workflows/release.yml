@@ -440,6 +440,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: vpn-*
           path: artifacts
 
       - name: Normalize release asset names

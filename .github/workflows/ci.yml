@@ -34,6 +34,10 @@ jobs:
       - name: Cache Cargo deps
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       # 前端先 build 一次（rust-embed 需要 frontend/dist 才能编译 vpn-server）
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -93,11 +97,11 @@ jobs:
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
-    continue-on-error: true  # MVP 阶段不阻塞，仅警告
 
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+        continue-on-error: true  # MVP 阶段不阻塞，仅警告
         with:
           command: check
           arguments: --all-features

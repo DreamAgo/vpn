@@ -4,7 +4,7 @@
  * 达上限后新终端注册会顶掉最久未活跃的**离线**终端；全部在线则被拒绝。
  * 调小不影响已注册终端，仅限制后续新终端注册。
  */
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Modal, InputNumber, App, Typography, Alert } from 'antd';
 
 import { usersApi } from '@/services/users';
@@ -25,10 +25,6 @@ export function SetMaxDevicesModal({ open, user, onClose, onSaved }: Props) {
   const [value, setValue] = useState<number>(1);
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    if (open) setValue(user?.maxDevices ?? 1);
-  }, [open, user]);
-
   const handleOk = async () => {
     if (!user) return;
     setSaving(true);
@@ -48,6 +44,9 @@ export function SetMaxDevicesModal({ open, user, onClose, onSaved }: Props) {
     <Modal
       open={open}
       title={user ? `设置终端上限 · ${user.username}` : '设置终端上限'}
+      afterOpenChange={(visible) => {
+        if (visible) setValue(user?.maxDevices ?? 1);
+      }}
       onCancel={() => !saving && onClose()}
       onOk={handleOk}
       confirmLoading={saving}

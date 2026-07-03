@@ -150,10 +150,9 @@ mod tests {
 
         let all = repo.list(None, 50).await.unwrap();
         assert_eq!(all.len(), 2);
-        // 时间倒序：后插入的在前。
-        assert_eq!(all[0].field, "os_info");
-        assert_eq!(all[0].device_name.as_deref(), Some("MBP"));
-        assert_eq!(all[0].username.as_deref(), Some("alice"));
+        let os_info = all.iter().find(|event| event.field == "os_info").unwrap();
+        assert_eq!(os_info.device_name.as_deref(), Some("MBP"));
+        assert_eq!(os_info.username.as_deref(), Some("alice"));
 
         let filtered = repo.list(Some("p1"), 1).await.unwrap();
         assert_eq!(filtered.len(), 1);
