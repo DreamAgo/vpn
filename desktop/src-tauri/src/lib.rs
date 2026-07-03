@@ -211,8 +211,8 @@ pub fn run() {
             let quit_i = MenuItem::with_id(app, "quit", "退出易链", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_i, &connect_i, &disconnect_i, &quit_i])?;
 
-            // 专门的小尺寸单色托盘图标(44×44,带 alpha);macOS 以 template 模式
-            // 渲染,随菜单栏明暗主题自动着色,避免用 512×512 app 图标缩放后看不清/不显示。
+            // 专门的小尺寸单色托盘图标。macOS template 模式会根据菜单栏明暗
+            // 自动渲染为黑色或白色，符合状态栏图标规范。
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
             let tray = TrayIconBuilder::with_id("main-tray")

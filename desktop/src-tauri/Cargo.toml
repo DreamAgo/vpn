@@ -1,6 +1,6 @@
 [package]
 name = "vpn-desktop"
-version = "0.1.0"
+version = "0.1.3"
 description = "VPN Client — Tauri 2 menu-bar desktop GUI for vpn-cli"
 authors = ["Shangguanjunjie"]
 edition = "2021"
