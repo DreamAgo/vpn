@@ -202,11 +202,22 @@ jobs:
         run: npm ci
 
       - name: Tauri build (MSI + NSIS)
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: desktop
+        run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Tauri build (MSI + NSIS + updater signatures)
+        if: startsWith(github.ref, 'refs/tags/v')
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "Missing TAURI_SIGNING_PRIVATE_KEY secret required for tagged releases."
+          }
+          npx tauri build
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
