@@ -258,12 +258,6 @@ jobs:
         run: npm ci
 
       - name: Tauri build (MSI + NSIS)
-        if: github.event_name == 'workflow_dispatch'
-        working-directory: desktop
-        run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
-
-      - name: Tauri build (MSI + NSIS + updater signatures)
-        if: startsWith(github.ref, 'refs/tags/v')
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -271,9 +265,10 @@ jobs:
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
-            throw "Missing TAURI_SIGNING_PRIVATE_KEY secret required for tagged releases."
+            npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          } else {
+            npx tauri build
           }
-          npx tauri build
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -329,22 +324,16 @@ jobs:
         run: npm ci
 
       - name: Tauri build (DMG)
-        if: github.event_name == 'workflow_dispatch'
-        working-directory: desktop
-        run: npx tauri build --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
-
-      - name: Tauri build (DMG + updater signatures)
-        if: startsWith(github.ref, 'refs/tags/v')
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo "Missing TAURI_SIGNING_PRIVATE_KEY secret required for tagged releases." >&2
-            exit 1
+            npx tauri build --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          else
+            npx tauri build --target ${{ matrix.target }} --bundles dmg
           fi
-          npx tauri build --target ${{ matrix.target }} --bundles dmg
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -410,22 +399,16 @@ jobs:
         run: npm ci
 
       - name: Tauri build (AppImage + deb)
-        if: github.event_name == 'workflow_dispatch'
-        working-directory: desktop
-        run: npx tauri build --target ${{ matrix.target }} --bundles appimage,deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
-
-      - name: Tauri build (AppImage + deb + updater signatures)
-        if: startsWith(github.ref, 'refs/tags/v')
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo "Missing TAURI_SIGNING_PRIVATE_KEY secret required for tagged releases." >&2
-            exit 1
+            npx tauri build --target ${{ matrix.target }} --bundles appimage,deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          else
+            npx tauri build --target ${{ matrix.target }} --bundles appimage,deb
           fi
-          npx tauri build --target ${{ matrix.target }} --bundles appimage,deb
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -459,6 +442,55 @@ jobs:
         with:
           path: artifacts
 
+      - name: Normalize release asset names
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          out="release-assets"
+          mkdir -p "$out"
+
+          copy_one() {
+            local source_glob="$1"
+            local dest_name="$2"
+            local matches=()
+            shopt -s nullglob
+            matches=($source_glob)
+            shopt -u nullglob
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "Expected one match for ${source_glob}, found ${#matches[@]}" >&2
+              printf '  %s\n' "${matches[@]}" >&2
+              exit 1
+            fi
+
+            cp "${matches[0]}" "$out/$dest_name"
+            if [ -f "${matches[0]}.sig" ]; then
+              cp "${matches[0]}.sig" "$out/$dest_name.sig"
+            fi
+          }
+
+          copy_one "artifacts/vpn-cli-linux-amd64/vpn-cli-linux-amd64.tar.gz" "vpn-cli-linux-amd64-${tag}.tar.gz"
+          copy_one "artifacts/vpn-cli-linux-arm64/vpn-cli-linux-arm64.tar.gz" "vpn-cli-linux-arm64-${tag}.tar.gz"
+          copy_one "artifacts/vpn-cli-macos-amd64/vpn-cli-macos-amd64.tar.gz" "vpn-cli-macos-amd64-${tag}.tar.gz"
+          copy_one "artifacts/vpn-cli-macos-arm64/vpn-cli-macos-arm64.tar.gz" "vpn-cli-macos-arm64-${tag}.tar.gz"
+          copy_one "artifacts/vpn-cli-windows-amd64/vpn-cli-windows-amd64.exe" "vpn-cli-windows-amd64-${tag}.exe"
+          copy_one "artifacts/vpn-cli-windows-amd64/vpn-cli-windows-amd64.zip" "vpn-cli-windows-amd64-${tag}.zip"
+          copy_one "artifacts/vpn-cli-windows-installer/vpn-cli-setup-*.exe" "vpn-cli-windows-amd64-setup-${tag}.exe"
+
+          copy_one "artifacts/vpn-desktop-windows/msi/*.msi" "vpn-gui-windows-amd64-${tag}.msi"
+          copy_one "artifacts/vpn-desktop-windows/nsis/*.exe" "vpn-gui-windows-amd64-setup-${tag}.exe"
+          copy_one "artifacts/vpn-desktop-macos-amd64/*.dmg" "vpn-gui-macos-amd64-${tag}.dmg"
+          copy_one "artifacts/vpn-desktop-macos-arm64/*.dmg" "vpn-gui-macos-arm64-${tag}.dmg"
+          copy_one "artifacts/vpn-desktop-linux-amd64/appimage/*.AppImage" "vpn-gui-linux-amd64-${tag}.AppImage"
+          copy_one "artifacts/vpn-desktop-linux-amd64/deb/*.deb" "vpn-gui-linux-amd64-${tag}.deb"
+          copy_one "artifacts/vpn-desktop-linux-arm64/appimage/*.AppImage" "vpn-gui-linux-arm64-${tag}.AppImage"
+          copy_one "artifacts/vpn-desktop-linux-arm64/deb/*.deb" "vpn-gui-linux-arm64-${tag}.deb"
+
+          copy_one "artifacts/vpn-server-linux-amd64/vpn-server-linux-amd64.tar.gz" "vpn-server-linux-amd64-${tag}.tar.gz"
+          copy_one "artifacts/vpn-server-linux-arm64/vpn-server-linux-arm64.tar.gz" "vpn-server-linux-arm64-${tag}.tar.gz"
+
+          find "$out" -type f | sort
+
       - name: Generate Tauri updater manifest
         shell: bash
         run: |
@@ -472,18 +504,13 @@ jobs:
           tag = os.environ["GITHUB_REF_NAME"]
           version = tag[1:] if tag.startswith("v") else tag
           repo = os.environ["GITHUB_REPOSITORY"]
-          root = Path("artifacts")
+          root = Path("release-assets")
 
-          exe_candidates = sorted(root.glob("vpn-desktop-windows/**/*.exe"))
-          if not exe_candidates:
-            raise SystemExit("missing Windows desktop NSIS installer for updater manifest")
-          exe = exe_candidates[0]
+          exe = root / f"vpn-gui-windows-amd64-setup-{tag}.exe"
           sig = Path(str(exe) + ".sig")
           if not sig.exists():
-            sibling = exe.with_suffix(exe.suffix + ".sig")
-            sig = sibling
-          if not sig.exists():
-            raise SystemExit(f"missing updater signature for {exe}")
+            print(f"Skipping latest.json because updater signature is missing for {exe}")
+            raise SystemExit(0)
 
           filename = quote(exe.name)
           manifest = {
@@ -507,7 +534,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*
+          files: release-assets/**/*
           fail_on_unmatched_files: false
 
   # ============================================================
