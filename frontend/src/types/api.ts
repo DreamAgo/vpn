@@ -79,6 +79,66 @@ export interface SystemInfo {
   serverRoutes?: string[];
 }
 
+export interface EmailNotificationSettings {
+  enabled: boolean;
+  smtpHost: string | null;
+  smtpPort: number;
+  smtpUsername: string | null;
+  smtpPasswordSet: boolean;
+  from: string | null;
+  recipients: string[];
+  quietMinutes: number;
+  gatewayOfflineEnabled: boolean;
+  gatewayRecoveredEnabled: boolean;
+  webhook: HttpNotificationChannelSettings;
+  feishu: HttpNotificationChannelSettings;
+  dingtalk: HttpNotificationChannelSettings;
+}
+
+export interface UpdateEmailNotificationSettingsRequest {
+  enabled: boolean;
+  smtpHost?: string | null;
+  smtpPort: number;
+  smtpUsername?: string | null;
+  smtpPassword?: string | null;
+  from?: string | null;
+  recipients: string[];
+  quietMinutes: number;
+  gatewayOfflineEnabled: boolean;
+  gatewayRecoveredEnabled: boolean;
+  webhook: HttpNotificationChannelSettings;
+  feishu: HttpNotificationChannelSettings;
+  dingtalk: HttpNotificationChannelSettings;
+}
+
+export interface HttpNotificationChannelSettings {
+  enabled: boolean;
+  url: string | null;
+}
+
+export interface TestEmailNotificationRequest {
+  recipient?: string | null;
+}
+
+export interface NotificationEventView {
+  id: string;
+  eventType: string;
+  channel: string;
+  target: string;
+  status: string;
+  subject: string;
+  error: string | null;
+  metadata: string | null;
+  createdAt: number;
+  sentAt: number | null;
+}
+
+export interface NotificationEventQuery {
+  eventType?: string;
+  status?: string;
+  limit?: number;
+}
+
 // ===== User management DTOs (与 vpn-api-types::user 对齐, Epic 3) =====
 
 export interface UserDto {
@@ -270,6 +330,29 @@ export interface AuditLogQuery {
   action?: string;
   page?: number;
   pageSize?: number;
+}
+
+// ===== Service account API Keys =====
+
+export interface ApiKeyDto {
+  id: string;
+  name: string;
+  scopes: string[];
+  status: string; // active | revoked
+  createdBy: string;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
+  createdAt: number;
+}
+
+export interface CreateApiKeyRequest {
+  name: string;
+  scopes?: string[];
+}
+
+export interface CreateApiKeyResponse {
+  apiKey: ApiKeyDto;
+  key: string;
 }
 
 /** 业务错误码（与 vpn-api-types::error_codes 对齐）。 */

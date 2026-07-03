@@ -23,6 +23,21 @@ interface FormValues {
   password: string;
 }
 
+const ADMIN_PATHS = [
+  '/dashboard',
+  '/users',
+  '/groups',
+  '/subnets',
+  '/peers',
+  '/audit-logs',
+  '/api-keys',
+  '/backup',
+];
+
+function isAdminPath(path: string): boolean {
+  return ADMIN_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+}
+
 export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -30,9 +45,10 @@ export function LoginPage() {
   const setSession = useAuthStore((s) => s.setSession);
 
   const loggedIn = useAuthStore((s) => !!s.accessToken);
+  const role = useAuthStore((s) => s.role);
   useEffect(() => {
-    if (loggedIn) navigate('/dashboard', { replace: true });
-  }, [loggedIn, navigate]);
+    if (loggedIn) navigate(role === 'admin' ? '/dashboard' : '/connect', { replace: true });
+  }, [loggedIn, role, navigate]);
 
   const mutation = useMutation({
     mutationFn: (values: FormValues) => authApi.login(values),
@@ -48,7 +64,9 @@ export function LoginPage() {
         navigate('/account/password', { replace: true });
       } else {
         const from = (location.state as { from?: string } | null)?.from ?? '/dashboard';
-        navigate(from, { replace: true });
+        const role = useAuthStore.getState().role;
+        const target = role === 'admin' ? from : isAdminPath(from) ? '/connect' : from;
+        navigate(target, { replace: true });
       }
     },
     onError: (err) => {

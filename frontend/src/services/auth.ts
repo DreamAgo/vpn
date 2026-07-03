@@ -6,14 +6,19 @@
 import { http } from './http';
 import type {
   ChangePasswordRequest,
+  EmailNotificationSettings,
   FirstTimeSetupRequest,
   FirstTimeSetupResponse,
   LoginRequest,
   LoginResponse,
   LogoutRequest,
+  NotificationEventQuery,
+  NotificationEventView,
   RefreshResponse,
   SetupStatusResponse,
   SystemInfo,
+  TestEmailNotificationRequest,
+  UpdateEmailNotificationSettingsRequest,
 } from '@/types/api';
 
 export const authApi = {
@@ -56,6 +61,31 @@ export const systemApi = {
   /** 更新服务端 LAN 网段（PUT /admin/system/routes），返回规整后的网段。 */
   async updateServerRoutes(routes: string[]): Promise<string[]> {
     const res = await http.put<string[]>('/admin/system/routes', { routes });
+    return res.data;
+  },
+
+  async getEmailNotificationSettings(): Promise<EmailNotificationSettings> {
+    const res = await http.get<EmailNotificationSettings>('/admin/notifications/email');
+    return res.data;
+  },
+
+  async updateEmailNotificationSettings(
+    req: UpdateEmailNotificationSettingsRequest
+  ): Promise<EmailNotificationSettings> {
+    const res = await http.put<EmailNotificationSettings>('/admin/notifications/email', req);
+    return res.data;
+  },
+
+  async sendTestEmail(req: TestEmailNotificationRequest): Promise<void> {
+    await http.post('/admin/notifications/email/test', req);
+  },
+
+  async listNotificationEvents(
+    query: NotificationEventQuery = {}
+  ): Promise<NotificationEventView[]> {
+    const res = await http.get<NotificationEventView[]>('/admin/notifications/events', {
+      params: query,
+    });
     return res.data;
   },
 };

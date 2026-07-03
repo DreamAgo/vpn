@@ -1,11 +1,12 @@
 //! 共享应用状态（注入到所有 handler）。
 
-use std::sync::Arc;
 use sqlx::SqlitePool;
+use std::sync::Arc;
 use vpn_core::time::{Clock, SystemClock};
 
 use crate::services::{
-    AuditService, AuthService, PeerService, SubnetService, UserGroupService, UserService,
+    ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService,
+    NotificationService, PeerService, SubnetService, UserGroupService, UserService,
 };
 
 /// AppState 持有所有跨 handler 共享的资源。
@@ -15,11 +16,15 @@ use crate::services::{
 pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub auth_service: Option<Arc<AuthService>>,
+    pub api_key_service: Option<Arc<ApiKeyService>>,
     pub user_service: Option<Arc<UserService>>,
     pub user_group_service: Option<Arc<UserGroupService>>,
     pub subnet_service: Option<Arc<SubnetService>>,
     pub peer_service: Option<Arc<PeerService>>,
     pub audit_service: Option<Arc<AuditService>>,
+    pub config_service: Option<Arc<ConfigService>>,
+    pub domain_event_service: Option<Arc<DomainEventService>>,
+    pub notification_service: Option<Arc<NotificationService>>,
     pub db_pool: Option<SqlitePool>,
 }
 
@@ -29,17 +34,26 @@ impl AppState {
         Self {
             clock: Arc::new(SystemClock),
             auth_service: None,
+            api_key_service: None,
             user_service: None,
             user_group_service: None,
             subnet_service: None,
             peer_service: None,
             audit_service: None,
+            config_service: None,
+            domain_event_service: None,
+            notification_service: None,
             db_pool: None,
         }
     }
 
     pub fn with_auth_service(mut self, svc: Arc<AuthService>) -> Self {
         self.auth_service = Some(svc);
+        self
+    }
+
+    pub fn with_api_key_service(mut self, svc: Arc<ApiKeyService>) -> Self {
+        self.api_key_service = Some(svc);
         self
     }
 
@@ -68,6 +82,21 @@ impl AppState {
         self
     }
 
+    pub fn with_config_service(mut self, svc: Arc<ConfigService>) -> Self {
+        self.config_service = Some(svc);
+        self
+    }
+
+    pub fn with_domain_event_service(mut self, svc: Arc<DomainEventService>) -> Self {
+        self.domain_event_service = Some(svc);
+        self
+    }
+
+    pub fn with_notification_service(mut self, svc: Arc<NotificationService>) -> Self {
+        self.notification_service = Some(svc);
+        self
+    }
+
     pub fn with_db_pool(mut self, pool: SqlitePool) -> Self {
         self.db_pool = Some(pool);
         self
@@ -78,6 +107,12 @@ impl AppState {
         self.auth_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("auth_service 未初始化".to_string()))
+    }
+
+    pub fn api_key_service(&self) -> Result<Arc<ApiKeyService>, vpn_core::AppError> {
+        self.api_key_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("api_key_service 未初始化".to_string()))
     }
 
     /// 获取 UserService，未初始化则返回错误（启动顺序问题）。
@@ -113,6 +148,24 @@ impl AppState {
         self.audit_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("audit_service 未初始化".to_string()))
+    }
+
+    pub fn notification_service(&self) -> Result<Arc<NotificationService>, vpn_core::AppError> {
+        self.notification_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("notification_service 未初始化".to_string()))
+    }
+
+    pub fn config_service(&self) -> Result<Arc<ConfigService>, vpn_core::AppError> {
+        self.config_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("config_service 未初始化".to_string()))
+    }
+
+    pub fn domain_event_service(&self) -> Result<Arc<DomainEventService>, vpn_core::AppError> {
+        self.domain_event_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("domain_event_service 未初始化".to_string()))
     }
 
     pub fn db_pool(&self) -> Result<SqlitePool, vpn_core::AppError> {

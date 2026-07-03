@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ConfigProvider, App as AntdApp } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -26,6 +26,8 @@ import { PeersPage } from './pages/PeersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { ConnectionGuidePage } from './pages/ConnectionGuidePage';
 import { BackupPage } from './pages/BackupPage';
+import { ApiKeysPage } from './pages/ApiKeysPage';
+import { NotificationSettingsPage } from './pages/NotificationSettingsPage';
 import { useAuthStore } from './stores/authStore';
 
 const queryClient = new QueryClient({
@@ -39,6 +41,19 @@ const queryClient = new QueryClient({
 });
 
 const THEME_MODE_STORAGE_KEY = 'vpn-console-theme-mode';
+const ADMIN_HOME = '/dashboard';
+const USER_HOME = '/connect';
+
+function DefaultRedirect() {
+  const role = useAuthStore((s) => s.role);
+  return <Navigate to={role === 'admin' ? ADMIN_HOME : USER_HOME} replace />;
+}
+
+function RequireAdminRoute({ children }: { children: ReactNode }) {
+  const role = useAuthStore((s) => s.role);
+  if (role !== 'admin') return <Navigate to={USER_HOME} replace />;
+  return children;
+}
 
 function getInitialThemeMode(): ThemeMode {
   if (typeof window === 'undefined') return DEFAULT_THEME_MODE;
@@ -87,21 +102,86 @@ function App() {
                     />
                   }
                 >
-                  <Route path="/" element={<Navigate to="/dashboard" replace />} />
-                  <Route path="/dashboard" element={<DashboardPage />} />
+                  <Route path="/" element={<DefaultRedirect />} />
+                  <Route
+                    path="/dashboard"
+                    element={
+                      <RequireAdminRoute>
+                        <DashboardPage />
+                      </RequireAdminRoute>
+                    }
+                  />
                   <Route path="/account" element={<AccountSettingsPage />} />
                   <Route path="/account/password" element={<AccountSettingsPage />} />
-                  <Route path="/users" element={<UsersPage />} />
-                  <Route path="/groups" element={<GroupsPage />} />
-                  <Route path="/subnets" element={<SubnetsPage />} />
-                  <Route path="/peers" element={<PeersPage />} />
-                  <Route path="/audit-logs" element={<AuditLogsPage />} />
-                  <Route path="/backup" element={<BackupPage />} />
+                  <Route
+                    path="/users"
+                    element={
+                      <RequireAdminRoute>
+                        <UsersPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/groups"
+                    element={
+                      <RequireAdminRoute>
+                        <GroupsPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/subnets"
+                    element={
+                      <RequireAdminRoute>
+                        <SubnetsPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/peers"
+                    element={
+                      <RequireAdminRoute>
+                        <PeersPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/audit-logs"
+                    element={
+                      <RequireAdminRoute>
+                        <AuditLogsPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/api-keys"
+                    element={
+                      <RequireAdminRoute>
+                        <ApiKeysPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/backup"
+                    element={
+                      <RequireAdminRoute>
+                        <BackupPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/notifications"
+                    element={
+                      <RequireAdminRoute>
+                        <NotificationSettingsPage />
+                      </RequireAdminRoute>
+                    }
+                  />
                   <Route path="/connect" element={<ConnectionGuidePage />} />
                 </Route>
               </Route>
 
-              <Route path="*" element={<Navigate to="/dashboard" replace />} />
+              <Route path="*" element={<DefaultRedirect />} />
             </Routes>
           </BrowserRouter>
         </QueryClientProvider>

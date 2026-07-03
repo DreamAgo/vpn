@@ -321,6 +321,24 @@ impl SqlitePeerRepository {
         Ok(result.rows_affected())
     }
 
+    /// 列出即将被离线扫描标记为 offline 的站点网关。
+    pub async fn list_stale_online_gateways(&self, cutoff_ms: i64) -> Result<Vec<PeerRow>> {
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM peers
+             WHERE status = 'online'
+               AND last_seen_at IS NOT NULL
+               AND last_seen_at < ?1
+               AND routed_subnets != ''
+             ORDER BY last_seen_at ASC"
+        );
+        let rows = sqlx::query_as(&sql)
+            .bind(cutoff_ms)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(rows)
+    }
+
     /// 按 id 查询 peer（Story 5.5：admin 强制下线前定位）。
     pub async fn find_by_id(&self, id: &str) -> Result<Option<PeerRow>> {
         let sql = format!("SELECT {SELECT_COLUMNS} FROM peers WHERE id = ?1");

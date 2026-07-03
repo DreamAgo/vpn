@@ -102,10 +102,12 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
 }
 
 .brand {
   min-width: 0;
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -122,6 +124,10 @@ button:disabled {
   font-family: var(--display);
   font-weight: 700;
   box-shadow: 0 8px 18px rgba(37, 99, 235, 0.24);
+}
+
+.brand-copy {
+  min-width: 0;
 }
 
 .brand-name {
@@ -831,6 +837,11 @@ button:disabled {
   cursor: default;
   -webkit-user-select: none;
   user-select: none;
+}
+
+[data-tauri-drag-region="false"],
+[data-tauri-drag-region="false"] * {
+  -webkit-app-region: no-drag;
 }
 
 @keyframes spin {

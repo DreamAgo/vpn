@@ -30,6 +30,7 @@ export function AccountSettingsPage() {
   const location = useLocation();
   const { message } = App.useApp();
   const username = useAuthStore((s) => s.username);
+  const role = useAuthStore((s) => s.role);
   const mustChangePassword = useAuthStore((s) => s.mustChangePassword);
   const clearSession = useAuthStore((s) => s.clearSession);
 
@@ -79,7 +80,7 @@ export function AccountSettingsPage() {
       <Card title="账号信息" style={{ marginBottom: 16 }}>
         <Descriptions column={1} size="small">
           <Descriptions.Item label="用户名">{username ?? '—'}</Descriptions.Item>
-          <Descriptions.Item label="角色">管理员</Descriptions.Item>
+          <Descriptions.Item label="角色">{role === 'admin' ? '管理员' : '普通用户'}</Descriptions.Item>
         </Descriptions>
       </Card>
 

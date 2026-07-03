@@ -40,6 +40,28 @@ pub const OFFLINE_THRESHOLD_MS: i64 = 90_000;
 /// 节点变更记录保留期（毫秒）：30 天，随离线扫描任务定期清理。
 pub const EVENT_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GatewayOfflineNotice {
+    pub peer_id: String,
+    pub user_id: String,
+    pub device_name: String,
+    pub vpn_ip: String,
+    pub routed_subnets: Vec<String>,
+    pub last_seen_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeartbeatResult {
+    pub allowed_routes: Vec<String>,
+    pub recovered_gateway: Option<GatewayOfflineNotice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OfflineScanResult {
+    pub marked: u64,
+    pub gateways: Vec<GatewayOfflineNotice>,
+}
+
 /// 校验并归一化客户端声明的 LAN 网段。
 ///
 /// 每项必须是合法 IPv4 CIDR；归一化为网络地址形式（如 `192.168.10.5/24` → `192.168.10.0/24`）。
@@ -76,6 +98,22 @@ fn parse_csv_subnets(csv: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
+}
+
+fn gateway_recovered_notice(
+    peer: &crate::repositories::peer_repo_sqlite::PeerRow,
+) -> Option<GatewayOfflineNotice> {
+    if peer.status == "online" || peer.routed_subnets.is_empty() {
+        return None;
+    }
+    Some(GatewayOfflineNotice {
+        peer_id: peer.id.clone(),
+        user_id: peer.user_id.clone(),
+        device_name: peer.device_name.clone(),
+        vpn_ip: peer.vpn_ip.clone(),
+        routed_subnets: parse_csv_subnets(&peer.routed_subnets),
+        last_seen_at: peer.last_seen_at,
+    })
 }
 
 /// 宽松归一化 server_routes(env 默认值 / DB 种子两条路径共用)。
@@ -625,7 +663,26 @@ impl PeerService {
     /// 离线检测：把心跳超过阈值的 online peer 标记为 offline。返回标记行数。
     /// 顺带治理变更记录保留期（删除超期历史，best-effort）。
     pub async fn scan_offline(&self, now_ms: i64) -> Result<u64> {
+        Ok(self.scan_offline_with_gateways(now_ms).await?.marked)
+    }
+
+    /// 离线检测，并返回本轮刚离线的站点网关，用于事件通知。
+    pub async fn scan_offline_with_gateways(&self, now_ms: i64) -> Result<OfflineScanResult> {
         let cutoff = now_ms - OFFLINE_THRESHOLD_MS;
+        let gateways = self
+            .peer_repo
+            .list_stale_online_gateways(cutoff)
+            .await?
+            .into_iter()
+            .map(|p| GatewayOfflineNotice {
+                peer_id: p.id,
+                user_id: p.user_id,
+                device_name: p.device_name,
+                vpn_ip: p.vpn_ip,
+                routed_subnets: parse_csv_subnets(&p.routed_subnets),
+                last_seen_at: p.last_seen_at,
+            })
+            .collect();
         let marked = self.peer_repo.mark_stale_offline(cutoff).await?;
         if let Err(e) = self
             .event_repo
@@ -634,7 +691,7 @@ impl PeerService {
         {
             tracing::warn!(error = %e, "变更记录保留期清理失败（忽略）");
         }
-        Ok(marked)
+        Ok(OfflineScanResult { marked, gateways })
     }
 
     /// 变更记录落库（best-effort：失败仅告警，不影响注册/心跳主流程）。
@@ -692,6 +749,18 @@ impl PeerService {
         req: &PeerHeartbeatRequest,
         now_ms: i64,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .heartbeat_checked_with_notice(user_id, req, now_ms)
+            .await?
+            .allowed_routes)
+    }
+
+    pub async fn heartbeat_checked_with_notice(
+        &self,
+        user_id: &str,
+        req: &PeerHeartbeatRequest,
+        now_ms: i64,
+    ) -> Result<HeartbeatResult> {
         let endpoint = req.endpoint.as_deref();
         if let Some(pk) = req.wg_public_key.as_deref() {
             let peer = self
@@ -722,7 +791,12 @@ impl PeerService {
                 return Err(AppError::PeerNotFound);
             }
             let own = parse_csv_subnets(&peer.routed_subnets);
-            return self.compute_allowed_routes(user_id, &own).await;
+            let allowed_routes = self.compute_allowed_routes(user_id, &own).await?;
+            let recovered_gateway = gateway_recovered_notice(&peer);
+            return Ok(HeartbeatResult {
+                allowed_routes,
+                recovered_gateway,
+            });
         }
         // touch_heartbeat 的 SQL 排除 status='deleted'，但 force_removed 仍会被更新；
         // 故先显式检查活跃 peer 状态。这次查到的 peer 直接复用,避免 heartbeat 内再查一次。
@@ -737,11 +811,18 @@ impl PeerService {
                     .await;
             }
         }
+        let recovered_gateway = peer.as_ref().and_then(gateway_recovered_notice);
         let own = peer
+            .as_ref()
             .map(|p| parse_csv_subnets(&p.routed_subnets))
             .unwrap_or_default();
-        self.heartbeat_with_own(user_id, endpoint, now_ms, &own)
-            .await
+        let allowed_routes = self
+            .heartbeat_with_own(user_id, endpoint, now_ms, &own)
+            .await?;
+        Ok(HeartbeatResult {
+            allowed_routes,
+            recovered_gateway,
+        })
     }
 
     /// Story 5.5：admin 强制下线指定 peer。
@@ -2098,6 +2179,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_offline_returns_gateway_notices() {
+        let svc = service(setup_pool().await);
+        let mut req = reg("PKGW");
+        req.routed_subnets = vec!["192.168.10.0/24".to_string()];
+        svc.register("user-1", &req).await.unwrap();
+        svc.heartbeat_checked("user-1", &hb(Some("PKGW"), Some("1.2.3.4:99")), 100)
+            .await
+            .unwrap();
+
+        let result = svc
+            .scan_offline_with_gateways(100 + OFFLINE_THRESHOLD_MS + 1)
+            .await
+            .unwrap();
+
+        assert_eq!(result.marked, 1);
+        assert_eq!(result.gateways.len(), 1);
+        assert_eq!(result.gateways[0].device_name, "MBP");
+        assert_eq!(
+            result.gateways[0].routed_subnets,
+            vec!["192.168.10.0/24".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn gateway_route_supernet_of_vpn_allowed_but_inside_rejected() {
         // VPN 子网 = 10.8.0.0/24（见 service() helper）。
         // 超网 10.0.0.0/8 ⊃ VPN 子网 → 放行（靠最长前缀保护 VPN 子网）。
@@ -2112,6 +2217,9 @@ mod tests {
         let mut bad = reg("PKBAD");
         bad.routed_subnets = vec!["10.8.0.128/25".to_string()];
         let err = svc2.register("user-2", &bad).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "VPN 子网内应拒绝，实际: {err:?}");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "VPN 子网内应拒绝，实际: {err:?}"
+        );
     }
 }

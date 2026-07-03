@@ -23,6 +23,7 @@ use vpn_api_types::{
 use crate::{
     auth::{CurrentUser, RequireAdmin},
     error::ApiError,
+    services::domain_event_service,
     state::AppState,
 };
 
@@ -56,10 +57,34 @@ pub async fn heartbeat(
     let svc = state.peer_service()?;
     // Story 5.5：若该 peer 已被 admin 强制下线，心跳被拒（TokenExpired → 401，提示重新登录）。
     // 多终端模式：请求带 wg_public_key 时精确定位该终端打卡（含 RTT/丢包等健康指标）。
-    let allowed_routes = svc
-        .heartbeat_checked(&current.user_id, &body, state.clock.now_unix_ms())
+    let heartbeat = svc
+        .heartbeat_checked_with_notice(&current.user_id, &body, state.clock.now_unix_ms())
         .await?;
-    Ok(success(&state, PeerHeartbeatResponse { allowed_routes }))
+    if let Some(gateway) = heartbeat.recovered_gateway {
+        if let Some(events) = state.domain_event_service.clone() {
+            events
+                .publish_best_effort(
+                    domain_event_service::EVENT_GATEWAY_RECOVERED,
+                    "peer",
+                    &gateway.peer_id,
+                    &gateway,
+                )
+                .await;
+        }
+        if let Some(notifications) = state.notification_service.clone() {
+            tokio::spawn(async move {
+                if let Err(e) = notifications.notify_gateway_recovered(&[gateway]).await {
+                    tracing::error!(error = ?e, "站点网关恢复邮件通知发送失败");
+                }
+            });
+        }
+    }
+    Ok(success(
+        &state,
+        PeerHeartbeatResponse {
+            allowed_routes: heartbeat.allowed_routes,
+        },
+    ))
 }
 
 /// Story 4.7：DELETE /api/v1/peers/me

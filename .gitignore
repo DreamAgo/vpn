@@ -36,3 +36,6 @@ Thumbs.db
 
 # Windows 打包时按需拉取的 WireGuard wintun.dll（不入库，见 packaging/windows、desktop/scripts/fetch-wintun.ps1）
 /packaging/windows/wintun.dll
+
+# 本地 Claude 配置 / skills(不入库)
+.claude/

@@ -84,6 +84,7 @@ boringtun = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ipnet = "2"
 base64 = "0.22"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 
 # === HTTP 客户端（vpn-cli 用） ===
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

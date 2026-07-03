@@ -20,7 +20,7 @@ const { Text } = Typography;
 const FIELD_LABELS: Record<string, string> = {
   os_info: 'OS',
   endpoint: 'Endpoint',
-  vpn_ip: 'VPN IP',
+  vpn_ip: '虚拟 IP',
   device_name: '设备名',
   client_version: '客户端版本',
 };
@@ -136,30 +136,35 @@ export function PeerHealthTable({ peers }: { peers: AdminPeerView[] }) {
         size="small"
         dataSource={peers}
         pagination={peers.length > 10 ? { pageSize: 10, showSizeChanger: false } : false}
+        scroll={{ x: 1020 }}
+        tableLayout="fixed"
         columns={[
           {
             title: '状态',
             dataIndex: 'status',
-            width: 70,
+            width: 72,
             render: (_, p) => <NodeStatusDot status={p.status} size="sm" />,
           },
           {
             title: '设备 / 用户',
             dataIndex: 'deviceName',
+            width: 190,
             ellipsis: true,
             render: (_, p) => (
-              <Space size={6}>
-                <Text strong>{p.deviceName}</Text>
-                <Text type="secondary" style={{ fontSize: 12 }}>
+              <div className="peer-health-device">
+                <Text strong ellipsis={{ tooltip: p.deviceName }} className="peer-health-device-name">
+                  {p.deviceName}
+                </Text>
+                <Text type="secondary" className="peer-health-device-user" ellipsis={{ tooltip: p.username }}>
                   {p.username}
                 </Text>
-              </Space>
+              </div>
             ),
           },
           {
-            title: 'VPN IP',
+            title: '虚拟 IP',
             dataIndex: 'vpnIp',
-            width: 110,
+            width: 120,
             render: (v) => <Text code>{v}</Text>,
           },
           {
@@ -178,7 +183,7 @@ export function PeerHealthTable({ peers }: { peers: AdminPeerView[] }) {
           {
             title: '最近心跳',
             dataIndex: 'lastSeenAt',
-            width: 110,
+            width: 120,
             render: (_, p) =>
               p.lastSeenAt ? (
                 <span title={dayjs(p.lastSeenAt).format('YYYY-MM-DD HH:mm:ss')}>
@@ -203,13 +208,13 @@ export function PeerHealthTable({ peers }: { peers: AdminPeerView[] }) {
           {
             title: '版本',
             dataIndex: 'clientVersion',
-            width: 90,
+            width: 100,
             render: (v) => (v ? <Tag>{v}</Tag> : <Text type="secondary">—</Text>),
           },
           {
             title: '',
             key: 'events',
-            width: 110,
+            width: 128,
             render: (_, p) => (
               <Button
                 type="link"

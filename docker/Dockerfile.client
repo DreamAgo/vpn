@@ -4,7 +4,8 @@
 #
 # 客户端数据面为用户态 boringtun（单二进制，零外部 wg 工具），仅需
 # root/CAP_NET_ADMIN + /dev/net/tun。headless 容器用 VPN_CLI_CRED_BACKEND=file
-# 走加密文件凭证后端（无需 keyring/libdbus）。reqwest 用 rustls，无需 OpenSSL。
+# 走加密文件凭证后端。reqwest 用 rustls 无需 OpenSSL；但 keyring 经 libdbus-sys
+# 链接 libdbus，故 build 需 libdbus-1-dev、runtime 需 libdbus-1-3。
 
 ARG RUST_VERSION=1.90
 
@@ -12,20 +13,25 @@ ARG RUST_VERSION=1.90
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake make perl pkg-config \
+    && apt-get install -y --no-install-recommends cmake make perl pkg-config libdbus-1-dev \
     && rm -rf /var/lib/apt/lists/*
-# 国内网络加速：走 rsproxy.cn 镜像源
-ENV RUSTUP_DIST_SERVER=https://rsproxy.cn \
-    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+# 国内网络加速：crates 走阿里云 sparse 源（比 rsproxy 稳）。Rosetta 模拟下 sparse
+# 易报 "unexpected eof"，关 HTTP/2 多路复用 + 提高重试规避。
+ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
 RUN cat > "${CARGO_HOME:-/usr/local/cargo}/config.toml" <<'EOF'
 [source.crates-io]
-replace-with = "rsproxy-sparse"
-[source.rsproxy-sparse]
-registry = "sparse+https://rsproxy.cn/index/"
+replace-with = "aliyun"
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
 [net]
+retry = 10
 git-fetch-with-cli = true
+[http]
+multiplexing = false
 EOF
 COPY . .
+# 删掉仓库钉的 rust-toolchain.toml（要 rustfmt/clippy 组件会触发 rustup 拉取而失败）。
+RUN rm -f rust-toolchain.toml
 ENV SQLX_OFFLINE=true
 RUN cargo build --release --bin vpn-cli
 
@@ -34,7 +40,7 @@ FROM debian:bookworm-slim AS runtime
 # iproute2/iputils-ping 仅用于容器内手工排查与 ping 验证；数据面本身不依赖它们。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates iproute2 iputils-ping \
+        ca-certificates libdbus-1-3 iproute2 iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/vpn-cli /usr/local/bin/vpn-cli

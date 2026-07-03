@@ -318,7 +318,7 @@ export default function App() {
     <div className="app-shell" data-state={state} data-tauri-drag-region>
       <header className="appbar" data-tauri-drag-region>
         <Brand />
-        <div className="top-actions">
+        <div className="top-actions" data-tauri-drag-region="false">
           <IconButton
             title="设置"
             onClick={() => setShowSettings(true)}
@@ -430,10 +430,10 @@ export default function App() {
 function Brand() {
   return (
     <div className="brand" data-tauri-drag-region>
-      <div className="brand-mark">易</div>
-      <div>
-        <div className="brand-name">易链</div>
-        <div className="brand-sub">安全接入中枢</div>
+      <div className="brand-mark" data-tauri-drag-region>易</div>
+      <div className="brand-copy" data-tauri-drag-region>
+        <div className="brand-name" data-tauri-drag-region>易链</div>
+        <div className="brand-sub" data-tauri-drag-region>安全接入中枢</div>
       </div>
     </div>
   );
@@ -442,7 +442,7 @@ function Brand() {
 function BootView() {
   return (
     <div className="app-shell boot" data-state="disconnected" data-tauri-drag-region>
-      <div className="boot-controls">
+      <div className="boot-controls" data-tauri-drag-region="false">
         <WindowControls />
       </div>
       <div className="boot-card">
@@ -459,7 +459,7 @@ function WindowControls() {
   };
 
   return (
-    <div className="window-controls">
+    <div className="window-controls" data-tauri-drag-region="false">
       <IconButton title="最小化到托盘" onClick={hideToTray}>
         <MinimizeIcon />
       </IconButton>

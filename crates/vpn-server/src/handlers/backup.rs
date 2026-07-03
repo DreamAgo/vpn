@@ -33,6 +33,8 @@ pub struct BackupTables {
     peers: Vec<PeerRow>,
     system_config: Vec<SystemConfigRow>,
     audit_logs: Vec<AuditLogRow>,
+    #[serde(default)]
+    api_keys: Vec<ApiKeyRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -111,6 +113,19 @@ struct AuditLogRow {
     created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+struct ApiKeyRow {
+    id: String,
+    name: String,
+    key_hash: String,
+    scopes: String,
+    status: String,
+    created_by: String,
+    last_used_at: Option<i64>,
+    revoked_at: Option<i64>,
+    created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreResponse {
     restored_at: i64,
@@ -119,6 +134,7 @@ pub struct RestoreResponse {
     user_groups: usize,
     subnets: usize,
     audit_logs: usize,
+    api_keys: usize,
     requires_restart: bool,
 }
 
@@ -136,14 +152,16 @@ pub async fn download_backup(
 ) -> Result<Response, ApiError> {
     let pool = state.db_pool()?;
     let archive = create_backup(&pool).await?;
-    let bytes = serde_json::to_vec_pretty(&archive)
-        .map_err(|e| AppError::Internal(Box::new(e)))?;
+    let bytes = serde_json::to_vec_pretty(&archive).map_err(|e| AppError::Internal(Box::new(e)))?;
     let filename = format!("yilian-backup-{}.json", Utc::now().format("%Y%m%d-%H%M%S"));
 
     Ok((
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "application/json; charset=utf-8".to_string()),
+            (
+                header::CONTENT_TYPE,
+                "application/json; charset=utf-8".to_string(),
+            ),
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{}\"", filename),
@@ -160,11 +178,9 @@ pub async fn restore_backup(
     Json(archive): Json<BackupArchive>,
 ) -> Result<Json<ApiResponse<RestoreResponse>>, ApiError> {
     if archive.format_version != BACKUP_FORMAT_VERSION {
-        return Err(AppError::Validation(format!(
-            "不支持的备份版本: {}",
-            archive.format_version
-        ))
-        .into());
+        return Err(
+            AppError::Validation(format!("不支持的备份版本: {}", archive.format_version)).into(),
+        );
     }
     if archive.tables.users.is_empty() {
         return Err(AppError::Validation("备份中没有用户数据".to_string()).into());
@@ -182,6 +198,7 @@ pub async fn restore_backup(
             user_groups: archive.tables.user_groups.len(),
             subnets: archive.tables.subnets.len(),
             audit_logs: archive.tables.audit_logs.len(),
+            api_keys: archive.tables.api_keys.len(),
             requires_restart: true,
         },
     ))
@@ -236,6 +253,13 @@ async fn create_backup(pool: &SqlitePool) -> Result<BackupArchive, AppError> {
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?,
+        api_keys: sqlx::query_as::<_, ApiKeyRow>(
+            "SELECT id, name, key_hash, scopes, status, created_by, last_used_at, revoked_at, created_at
+               FROM api_keys ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?,
     };
 
     Ok(BackupArchive {
@@ -259,6 +283,7 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
 
     for table in [
         "audit_logs",
+        "api_keys",
         "sessions",
         "user_group_members",
         "subnets",
@@ -281,6 +306,7 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
     insert_peers(&mut tx, &archive.tables.peers).await?;
     insert_system_config(&mut tx, &archive.tables.system_config).await?;
     insert_audit_logs(&mut tx, &archive.tables.audit_logs).await?;
+    insert_api_keys(&mut tx, &archive.tables.api_keys).await?;
 
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&mut *tx)
@@ -436,6 +462,32 @@ async fn insert_audit_logs(
         .bind(&row.user_agent)
         .bind(&row.metadata)
         .bind(row.status_code)
+        .bind(row.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+    }
+    Ok(())
+}
+
+async fn insert_api_keys(
+    tx: &mut Transaction<'_, Sqlite>,
+    rows: &[ApiKeyRow],
+) -> Result<(), AppError> {
+    for row in rows {
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, key_hash, scopes, status, created_by,
+                last_used_at, revoked_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(&row.id)
+        .bind(&row.name)
+        .bind(&row.key_hash)
+        .bind(&row.scopes)
+        .bind(&row.status)
+        .bind(&row.created_by)
+        .bind(row.last_used_at)
+        .bind(row.revoked_at)
         .bind(row.created_at)
         .execute(&mut **tx)
         .await

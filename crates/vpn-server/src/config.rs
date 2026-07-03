@@ -37,6 +37,19 @@ pub struct ServerConfig {
     /// 服务端自身网关的网段（CIDR 列表，如所在 Docker 网络），
     /// 会作为 allowed_routes 下发给客户端，使其经隧道访问这些网段。默认空。
     pub server_routes: Vec<String>,
+    /// 事件通知配置（SMTP 邮件）。
+    pub notifications: NotificationConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationConfig {
+    pub email_enabled: bool,
+    pub smtp_host: Option<String>,
+    pub smtp_port: u16,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub email_from: Option<String>,
+    pub email_to: Vec<String>,
 }
 
 impl ServerConfig {
@@ -84,6 +97,26 @@ impl ServerConfig {
                     .collect()
             })
             .unwrap_or_default();
+        let notifications = NotificationConfig {
+            email_enabled: env_bool("VPN_NOTIFY_EMAIL_ENABLED", false),
+            smtp_host: env::var("VPN_SMTP_HOST").ok(),
+            smtp_port: env::var("VPN_SMTP_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(587),
+            smtp_username: env::var("VPN_SMTP_USERNAME").ok(),
+            smtp_password: env::var("VPN_SMTP_PASSWORD").ok(),
+            email_from: env::var("VPN_NOTIFY_EMAIL_FROM").ok(),
+            email_to: env::var("VPN_NOTIFY_EMAIL_TO")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
 
         Ok(Self {
             bind_addr,
@@ -98,8 +131,15 @@ impl ServerConfig {
             wg_backend,
             wg_interface,
             server_routes,
+            notifications,
         })
     }
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(default)
 }
 
 #[cfg(test)]

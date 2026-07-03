@@ -10,13 +10,15 @@ use vpn_server::{
     build_router,
     ratelimit::LoginAttempts,
     repositories::{
-        SqliteAuditLogRepository, SqlitePeerRepository, SqliteSessionRepository,
+        SqliteApiKeyRepository, SqliteAuditLogRepository, SqliteDomainEventRepository,
+        SqliteNotificationEventRepository, SqlitePeerRepository, SqliteSessionRepository,
         SqliteSubnetRepository, SqliteSystemConfigRepository, SqliteUserGroupRepository,
         SqliteUserRepository,
     },
     services::{
-        build_peer_service_with_backend, Argon2Hasher, AuditService, AuthService, JwtTokenIssuer,
-        PeerService, SubnetService, UserGroupService, UserService,
+        build_peer_service_with_backend, domain_event_service, ApiKeyService, Argon2Hasher,
+        AuditService, AuthService, ConfigService, DomainEventService, JwtTokenIssuer,
+        NotificationService, PeerService, SubnetService, UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -79,10 +81,14 @@ async fn main() -> anyhow::Result<()> {
         issuer,
         login_attempts: LoginAttempts::new(),
     });
+    let api_key_service = Arc::new(ApiKeyService::new(SqliteApiKeyRepository::new(
+        pool.clone(),
+    )));
 
     // Epic 4：装配 PeerService（load-or-generate 服务端 WG 密钥 + IpPool 回填 + Noop control）
     let peer_repo = SqlitePeerRepository::new(pool.clone());
     let config_repo = SqliteSystemConfigRepository::new(pool.clone());
+    let config_service = Arc::new(ConfigService::new(config_repo.clone()));
     let subnet: ipnet::Ipv4Net = config
         .vpn_subnet
         .parse()
@@ -111,9 +117,21 @@ async fn main() -> anyhow::Result<()> {
     // Epic 5：审计服务 + 清理任务
     let audit_repo = SqliteAuditLogRepository::new(pool.clone());
     let audit_service = Arc::new(AuditService::new(audit_repo));
+    let domain_event_service = Arc::new(DomainEventService::new(SqliteDomainEventRepository::new(
+        pool.clone(),
+    )));
+    let notification_service = Arc::new(NotificationService::new_with_config_service(
+        config.notifications.clone(),
+        config_service.as_ref().clone(),
+        SqliteNotificationEventRepository::new(pool.clone()),
+    ));
 
     // Story 4.6：后台离线检测任务（每 30s 扫描；panic/错误不影响主进程）
-    spawn_offline_scanner(peer_service.clone());
+    spawn_offline_scanner(
+        peer_service.clone(),
+        notification_service.clone(),
+        domain_event_service.clone(),
+    );
 
     // Story 5.3：审计日志清理任务（每 24h 删除超过保留期的日志）
     spawn_audit_cleanup(audit_service.clone(), config.audit_retention_days);
@@ -121,11 +139,15 @@ async fn main() -> anyhow::Result<()> {
     // 构造 AppState + Router
     let state = AppState::new()
         .with_auth_service(auth_service)
+        .with_api_key_service(api_key_service)
         .with_user_service(user_service)
         .with_user_group_service(user_group_service)
         .with_subnet_service(subnet_service)
         .with_peer_service(peer_service)
         .with_audit_service(audit_service)
+        .with_config_service(config_service)
+        .with_domain_event_service(domain_event_service)
+        .with_notification_service(notification_service)
         .with_db_pool(pool.clone());
     let app = build_router(state);
 
@@ -149,7 +171,11 @@ async fn main() -> anyhow::Result<()> {
 /// Story 4.6：每 30s 扫描一次，把心跳超时的 online peer 标记为 offline。
 ///
 /// 任务独立运行，单次扫描出错仅记录日志不退出循环；进程退出时随 runtime 一并终止。
-fn spawn_offline_scanner(peer_service: Arc<PeerService>) {
+fn spawn_offline_scanner(
+    peer_service: Arc<PeerService>,
+    notification_service: Arc<NotificationService>,
+    domain_event_service: Arc<DomainEventService>,
+) {
     const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SCAN_INTERVAL);
@@ -158,9 +184,34 @@ fn spawn_offline_scanner(peer_service: Arc<PeerService>) {
         loop {
             ticker.tick().await;
             let now = chrono::Utc::now().timestamp_millis();
-            match peer_service.scan_offline(now).await {
-                Ok(n) if n > 0 => {
-                    tracing::info!(marked_offline = n, "离线检测：标记节点为 offline")
+            match peer_service.scan_offline_with_gateways(now).await {
+                Ok(result) if result.marked > 0 => {
+                    tracing::info!(
+                        marked_offline = result.marked,
+                        "离线检测：标记节点为 offline"
+                    );
+                    if !result.gateways.is_empty() {
+                        tracing::warn!(
+                            gateways = result.gateways.len(),
+                            "站点网关离线，触发事件通知"
+                        );
+                        for gateway in &result.gateways {
+                            domain_event_service
+                                .publish_best_effort(
+                                    domain_event_service::EVENT_GATEWAY_OFFLINE,
+                                    "peer",
+                                    &gateway.peer_id,
+                                    gateway,
+                                )
+                                .await;
+                        }
+                        if let Err(e) = notification_service
+                            .notify_gateway_offline(&result.gateways)
+                            .await
+                        {
+                            tracing::error!(error = ?e, "站点网关离线邮件通知发送失败");
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => tracing::error!(error = ?e, "离线检测扫描失败"),

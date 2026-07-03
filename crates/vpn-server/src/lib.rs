@@ -1,5 +1,7 @@
 //! vpn-server library 入口（main.rs 仅做启动调度）。
 
+#![recursion_limit = "512"]
+
 pub mod app;
 pub mod auth;
 pub mod config;

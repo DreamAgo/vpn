@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { ProLayout, type ProLayoutProps } from '@ant-design/pro-components';
 import { Dropdown, App, Button, Tooltip } from 'antd';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
@@ -12,30 +13,43 @@ import {
   LogoutOutlined,
   LinkOutlined,
   DatabaseOutlined,
+  KeyOutlined,
+  BellOutlined,
   MoonOutlined,
   SunOutlined,
 } from '@ant-design/icons';
 
 import { useAuthStore } from '@/stores/authStore';
+import { EventNotifications } from '@/components/EventNotifications';
 import {
   getThemeSurfaces,
   type ThemeMode,
   type ThemePalette,
 } from '@/theme';
 
-const route: ProLayoutProps['route'] = {
-  path: '/',
-  routes: [
-    { path: '/dashboard', name: '仪表盘', icon: <DashboardOutlined /> },
-    { path: '/users', name: '用户', icon: <UserOutlined /> },
-    { path: '/groups', name: '用户组', icon: <TeamOutlined /> },
-    { path: '/subnets', name: '网段', icon: <PartitionOutlined /> },
-    { path: '/peers', name: '节点', icon: <ApiOutlined /> },
-    { path: '/audit-logs', name: '日志', icon: <FileTextOutlined /> },
-    { path: '/backup', name: '备份恢复', icon: <DatabaseOutlined /> },
-    { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
-  ],
-};
+const adminRoutes: NonNullable<ProLayoutProps['route']>['routes'] = [
+  { path: '/dashboard', name: '仪表盘', icon: <DashboardOutlined /> },
+  { path: '/users', name: '用户', icon: <UserOutlined /> },
+  { path: '/groups', name: '用户组', icon: <TeamOutlined /> },
+  { path: '/subnets', name: '网段', icon: <PartitionOutlined /> },
+  { path: '/peers', name: '节点', icon: <ApiOutlined /> },
+  { path: '/audit-logs', name: '日志', icon: <FileTextOutlined /> },
+  { path: '/api-keys', name: 'API Key', icon: <KeyOutlined /> },
+  { path: '/notifications', name: '通知设置', icon: <BellOutlined /> },
+  { path: '/backup', name: '备份恢复', icon: <DatabaseOutlined /> },
+  { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
+];
+
+const userRoutes: NonNullable<ProLayoutProps['route']>['routes'] = [
+  { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
+];
+
+function routeForRole(role: string | null): ProLayoutProps['route'] {
+  return {
+    path: '/',
+    routes: role === 'admin' ? adminRoutes : userRoutes,
+  };
+}
 
 interface AppLayoutProps {
   palette: ThemePalette;
@@ -127,9 +141,11 @@ export function AppLayout({
   const navigate = useNavigate();
   const { modal } = App.useApp();
   const username = useAuthStore((s) => s.username);
+  const role = useAuthStore((s) => s.role);
   const logout = useAuthStore((s) => s.logout);
   const surfaces = getThemeSurfaces(themeMode);
   const selectedBg = themeMode === 'dark' ? `rgba(${palette.rgb}, 0.16)` : palette.wash;
+  const route = useMemo(() => routeForRole(role), [role]);
 
   const handleLogout = () => {
     modal.confirm({
@@ -181,6 +197,7 @@ export function AppLayout({
       }}
       menuHeaderRender={(_logo, _title, props) => <Brand collapsed={props?.collapsed} palette={palette} />}
       actionsRender={() => [
+        role === 'admin' ? <EventNotifications key="events" /> : null,
         <ThemeModeToggle
           key="theme-mode"
           value={themeMode}

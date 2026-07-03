@@ -1,7 +1,5 @@
 //! Axum Router 工厂。
 
-use std::sync::Arc;
-
 use axum::{
     middleware::from_fn_with_state,
     routing::{delete, get, patch, post},
@@ -10,9 +8,9 @@ use axum::{
 use tower::ServiceBuilder;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    services::ServeDir,
     trace::TraceLayer,
 };
-use vpn_core::service::TokenIssuer;
 
 use crate::{handlers, middleware, state::AppState};
 
@@ -41,6 +39,7 @@ pub fn build_router(state: AppState) -> Router {
     // 公开路由（无需认证）
     let public_routes = Router::new()
         .route("/health", get(handlers::health::health_handler))
+        .route("/api/v1/openapi.json", get(handlers::openapi::openapi_json))
         .route(
             "/api/v1/auth/setup-status",
             get(handlers::auth::setup_status),
@@ -53,8 +52,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/refresh", post(handlers::auth::refresh));
 
     // 认证路由（需要 JWT）
-    let authed_routes = if let Some(svc) = &state.auth_service {
-        let issuer: Arc<dyn TokenIssuer> = svc.issuer.clone();
+    let authed_routes = if state.auth_service.is_some() {
         Router::new()
             .route("/api/v1/auth/logout", post(handlers::auth::logout))
             .route(
@@ -68,6 +66,19 @@ pub fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/admin/system/routes",
                 axum::routing::put(handlers::system::update_server_routes),
+            )
+            .route(
+                "/api/v1/admin/notifications/email",
+                get(handlers::system::email_notification_settings)
+                    .put(handlers::system::update_email_notification_settings),
+            )
+            .route(
+                "/api/v1/admin/notifications/email/test",
+                post(handlers::system::test_email_notification),
+            )
+            .route(
+                "/api/v1/admin/notifications/events",
+                get(handlers::system::list_notification_events),
             )
             .route(
                 "/api/v1/admin/backup",
@@ -121,6 +132,14 @@ pub fn build_router(state: AppState) -> Router {
                 get(handlers::audit::list_audit_logs),
             )
             .route(
+                "/api/v1/admin/api-keys",
+                get(handlers::api_keys::list_api_keys).post(handlers::api_keys::create_api_key),
+            )
+            .route(
+                "/api/v1/admin/api-keys/{id}",
+                delete(handlers::api_keys::revoke_api_key),
+            )
+            .route(
                 "/api/v1/admin/peers",
                 get(handlers::peers::list_admin_peers),
             )
@@ -139,15 +158,26 @@ pub fn build_router(state: AppState) -> Router {
             )
             // 审计中间件（内层）：在 require_auth 之后运行，故 extensions 已含 CurrentUser。
             .layer(from_fn_with_state(state.clone(), middleware::audit_layer))
-            .layer(from_fn_with_state(issuer, middleware::auth::require_auth))
+            .layer(from_fn_with_state(
+                state.clone(),
+                middleware::auth::require_auth,
+            ))
     } else {
         // AuthService 未初始化（如健康检查测试场景）：不注册认证路由
         Router::new()
     };
 
+    // 自动更新静态目录（VPN_DATA_DIR/updates），公开免鉴权：Tauri updater 拉 latest.json + 更新包。
+    let updates_dir = format!(
+        "{}/updates",
+        std::env::var("VPN_DATA_DIR").unwrap_or_else(|_| "./data".to_string())
+    );
+    let _ = std::fs::create_dir_all(&updates_dir);
+
     Router::new()
         .merge(public_routes)
         .merge(authed_routes)
+        .nest_service("/updates", ServeDir::new(&updates_dir))
         .with_state(state)
         .fallback(handlers::static_files::static_handler)
         .layer(middleware)
@@ -164,6 +194,17 @@ mod tests {
         let app = build_router(AppState::new());
         let req = Request::builder()
             .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn openapi_endpoint_returns_200() {
+        let app = build_router(AppState::new());
+        let req = Request::builder()
+            .uri("/api/v1/openapi.json")
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();

@@ -2,31 +2,66 @@
 //!
 //! Story 2.7。
 
-use std::sync::Arc;
+use axum::{
+    extract::Request,
+    http::{header::AUTHORIZATION, HeaderName},
+    middleware::Next,
+    response::Response,
+};
+use vpn_core::AppError;
 
-use axum::{extract::Request, http::header::AUTHORIZATION, middleware::Next, response::Response};
-use vpn_core::{service::TokenIssuer, AppError};
+use crate::{auth::CurrentUser, error::ApiError, state::AppState};
 
-use crate::{auth::CurrentUser, error::ApiError};
+const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 
 /// 必须认证的中间件。
 ///
 /// 用法：`.layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))`
 pub async fn require_auth(
-    axum::extract::State(issuer): axum::extract::State<Arc<dyn TokenIssuer>>,
+    axum::extract::State(state): axum::extract::State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let token = request
+    let bearer = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::from(AppError::MissingAuth))?;
+        .and_then(|v| v.strip_prefix("Bearer "));
 
-    let (user_id, role) = issuer.verify_access(token).await?;
-    request
-        .extensions_mut()
-        .insert(CurrentUser { user_id, role });
-    Ok(next.run(request).await)
+    if let Some(token) = bearer {
+        if token.starts_with("ylk_") {
+            if let Some(api_key) = state.api_key_service()?.verify(token).await? {
+                request.extensions_mut().insert(CurrentUser {
+                    user_id: format!("api_key:{}", api_key.id),
+                    role: "admin".to_string(),
+                });
+                return Ok(next.run(request).await);
+            }
+            return Err(ApiError::from(AppError::TokenExpired));
+        }
+
+        let svc = state.auth_service()?;
+        let (user_id, role) = svc.issuer.verify_access(token).await?;
+        request
+            .extensions_mut()
+            .insert(CurrentUser { user_id, role });
+        return Ok(next.run(request).await);
+    }
+
+    if let Some(key) = request
+        .headers()
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(api_key) = state.api_key_service()?.verify(key).await? {
+            request.extensions_mut().insert(CurrentUser {
+                user_id: format!("api_key:{}", api_key.id),
+                role: "admin".to_string(),
+            });
+            return Ok(next.run(request).await);
+        }
+        return Err(ApiError::from(AppError::TokenExpired));
+    }
+
+    Err(ApiError::from(AppError::MissingAuth))
 }
