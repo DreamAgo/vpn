@@ -24,7 +24,7 @@ tokio = { version = "1.52", features = ["full"] }
 # === Web 框架 ===
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "request-id", "util", "cors", "fs"] }
+tower-http = { version = "0.7", features = ["trace", "request-id", "util", "cors", "fs"] }
 mime_guess = "2"
 rust-embed = "8"
 
