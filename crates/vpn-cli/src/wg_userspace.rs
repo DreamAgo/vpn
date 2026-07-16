@@ -93,7 +93,7 @@ impl UserspaceTunnel {
         // 实时路由更新：心跳检测到 allowed_routes 变化时推送新集合,转发循环据此增量
         // 增删本地路由(P1.4);None 时不支持热更新。
         routes_rx: Option<watch::Receiver<Vec<String>>>,
-    ) -> CliResult<tokio::task::JoinHandle<()>> {
+    ) -> CliResult<tokio::task::JoinHandle<CliResult<()>>> {
         // 1) boringtun 状态机：本地私钥 + 服务端公钥。
         let static_private = StaticSecret::from(decode_key(client_private_key)?);
         let peer_public = PublicKey::from(decode_key(server_public_key)?);
@@ -234,7 +234,7 @@ async fn forward_loop(
     shutdown_tx: watch::Sender<bool>,
     traffic: Option<SharedState>,
     mut routes_rx: Option<watch::Receiver<Vec<String>>>,
-) {
+) -> CliResult<()> {
     // 三个方向各用独立缓冲，避免 select! 多分支对同一缓冲的可变借用冲突。
     let mut tun_read_buf = [0u8; BUF_SIZE];
     let mut enc_buf = [0u8; BUF_SIZE];
@@ -246,17 +246,22 @@ async fn forward_loop(
     // 实际转发量），而非含 WireGuard 封装开销的 UDP 字节。
     let mut tx_acc: u64 = 0; // 出站：写入隧道的明文（Sent）
     let mut rx_acc: u64 = 0; // 入站：从隧道收到的明文（Received）
+    let mut udp_send_failures: u64 = 0;
+    let mut udp_recv_failures: u64 = 0;
+    let mut last_udp_error_log = std::time::Instant::now();
 
     // 立即发起握手（无 src 触发 handshake initiation）。
     if let TunnResult::WriteToNetwork(p) = tunn.encapsulate(&[], &mut enc_buf) {
-        let _ = udp.send(p).await;
+        if udp.send(p).await.is_err() {
+            udp_send_failures += 1;
+        }
     }
 
-    loop {
+    let outcome = loop {
         tokio::select! {
             res = shutdown.changed() => {
                 // 显式置位 true，或 sender 被 drop（通道关闭）→ 退出并在循环末尾清理路由。
-                if res.is_err() || *shutdown.borrow() { break; }
+                if res.is_err() || *shutdown.borrow() { break Ok(()); }
             }
             // 出站：TUN → 加密 → UDP
             r = device.recv(&mut tun_read_buf) => {
@@ -265,7 +270,9 @@ async fn forward_loop(
                         if let TunnResult::WriteToNetwork(p) =
                             tunn.encapsulate(&tun_read_buf[..n], &mut enc_buf)
                         {
-                            let _ = udp.send(p).await;
+                            if udp.send(p).await.is_err() {
+                                udp_send_failures = udp_send_failures.saturating_add(1);
+                            }
                             tx_acc = tx_acc.saturating_add(n as u64);
                         }
                     }
@@ -278,7 +285,7 @@ async fn forward_loop(
                                 .await;
                         }
                         let _ = shutdown_tx.send(true);
-                        break;
+                        break Err(CliError::Other(format!("TUN 读取失败: {e}")));
                     }
                 }
             }
@@ -286,16 +293,24 @@ async fn forward_loop(
             r = udp.recv(&mut udp_read_buf) => {
                 match r {
                     Ok(n) => {
-                        rx_acc = rx_acc.saturating_add(
-                            handle_incoming(&mut tunn, &udp, &device, &udp_read_buf[..n]).await,
-                        );
+                        match handle_incoming(&mut tunn, &udp, &device, &udp_read_buf[..n]).await {
+                            Ok(bytes) => rx_acc = rx_acc.saturating_add(bytes),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "写入 TUN 失败，数据面停止");
+                                if let Some(s) = &traffic {
+                                    s.set_error(format!("数据面中断: {e}"), crate::daemon::now_unix()).await;
+                                }
+                                let _ = shutdown_tx.send(true);
+                                break Err(e);
+                            }
+                        }
                     }
                     // UDP 瞬时错误**不拆隧道**：connected UDP socket 在对端暂不可达时会收到
                     // ICMP port-unreachable → recv 返回 ConnectionRefused;网络切换/抖动同理。
                     // 忽略续跑，boringtun 的定时器(下方 ticker)会自动重握手恢复。短暂 sleep
                     // 避免错误持续返回时空转占 CPU。
-                    Err(e) => {
-                        tracing::debug!(error = %e, "UDP 读瞬时错误,保持隧道续跑");
+                    Err(_) => {
+                        udp_recv_failures = udp_recv_failures.saturating_add(1);
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
@@ -313,7 +328,17 @@ async fn forward_loop(
             _ = ticker.tick() => {
                 let mut tbuf = [0u8; BUF_SIZE];
                 if let TunnResult::WriteToNetwork(p) = tunn.update_timers(&mut tbuf) {
-                    let _ = udp.send(p).await;
+                    if udp.send(p).await.is_err() {
+                        udp_send_failures = udp_send_failures.saturating_add(1);
+                    }
+                }
+                if (udp_send_failures > 0 || udp_recv_failures > 0)
+                    && last_udp_error_log.elapsed() >= Duration::from_secs(10)
+                {
+                    tracing::debug!(send_failures = udp_send_failures, recv_failures = udp_recv_failures, "隧道 UDP 暂时不可用，保持连接等待恢复");
+                    udp_send_failures = 0;
+                    udp_recv_failures = 0;
+                    last_udp_error_log = std::time::Instant::now();
                 }
                 if (tx_acc | rx_acc) != 0 {
                     if let Some(t) = &traffic {
@@ -324,7 +349,7 @@ async fn forward_loop(
                 }
             }
         }
-    }
+    };
 
     // 退出前最后一次刷新（落袋未统计的尾包）。
     if (tx_acc | rx_acc) != 0 {
@@ -334,10 +359,27 @@ async fn forward_loop(
     }
 
     // 清理：删除本任务加的路由（TUN 设备随 device drop 关闭）。
-    for (_cidr, route) in &added_routes {
-        let _ = handle.delete(route).await;
+    let mut cleanup_failures = 0;
+    for (cidr, route) in &added_routes {
+        if let Err(error) = handle.delete(route).await {
+            cleanup_failures += 1;
+            tracing::warn!(route = %cidr, error = %error, "删除 VPN 路由失败");
+        }
     }
-    tracing::info!("用户态 WireGuard 转发循环已退出，路由已清理");
+    if cleanup_failures == 0 {
+        tracing::info!("用户态 WireGuard 转发循环已退出，路由已清理");
+    } else {
+        tracing::warn!(
+            cleanup_failures,
+            "用户态 WireGuard 已退出，但部分路由清理失败"
+        );
+        if outcome.is_ok() {
+            return Err(CliError::Other(format!(
+                "VPN 路由清理失败: {cleanup_failures} 条"
+            )));
+        }
+    }
+    outcome
 }
 
 /// 等待路由更新通道有新值;通道为 None(不支持热更新)时永不就绪——该 select 分支不触发。
@@ -411,7 +453,7 @@ async fn handle_incoming(
     udp: &UdpSocket,
     device: &tun::AsyncDevice,
     packet: &[u8],
-) -> u64 {
+) -> CliResult<u64> {
     let mut out = [0u8; BUF_SIZE];
     match tunn.decapsulate(None, packet, &mut out) {
         TunnResult::WriteToNetwork(p) => {
@@ -423,20 +465,29 @@ async fn handle_incoming(
                     TunnResult::WriteToNetwork(p) => {
                         let _ = udp.send(p).await;
                     }
+                    TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
+                        device
+                            .send(p)
+                            .await
+                            .map_err(|e| CliError::Other(format!("写入 TUN 失败: {e}")))?;
+                    }
                     _ => break,
                 }
             }
-            0
+            Ok(0)
         }
         TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
             let n = p.len() as u64;
-            let _ = device.send(p).await;
-            n
+            device
+                .send(p)
+                .await
+                .map_err(|e| CliError::Other(format!("写入 TUN 失败: {e}")))?;
+            Ok(n)
         }
-        TunnResult::Done => 0,
+        TunnResult::Done => Ok(0),
         TunnResult::Err(e) => {
             tracing::debug!(?e, "decapsulate 错误（忽略单包）");
-            0
+            Ok(0)
         }
     }
 }

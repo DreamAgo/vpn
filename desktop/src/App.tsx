@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ConnState,
+  DiagnosticsInfo,
   StatusResponse,
   changePassword,
   checkForUpdate,
   connect,
   disconnect,
   getLaunchOnStartup,
+  getDiagnosticsInfo,
   getStatus,
   hideWindow,
   installPendingUpdate,
@@ -22,6 +24,7 @@ import {
 import { formatBytes, formatDuration } from "./format";
 
 const POLL_MS = 2500;
+const BACKEND_FAILURE_THRESHOLD = 2;
 
 const STATE_META: Record<ConnState, { label: string; detail: string }> = {
   connected: { label: "已连接", detail: "流量正在通过安全链路转发" },
@@ -62,11 +65,15 @@ export default function App() {
   const [launchOnStartup, setLaunchOnStartupState] = useState(false);
   const [startupBusy, setStartupBusy] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsInfo | null>(null);
+  const [backendUnavailable, setBackendUnavailable] = useState(false);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   const prevStateRef = useRef<ConnState | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const backendFailuresRef = useRef(0);
+  const refreshIdRef = useRef(0);
 
   const addActivity = useCallback((title: string, detail?: string) => {
     setActivity((items) => [
@@ -81,16 +88,23 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const requestId = ++refreshIdRef.current;
     try {
       const [li, saved] = await Promise.all([isLoggedIn(), savedServer()]);
+      if (requestId !== refreshIdRef.current) return;
       setServer(saved ?? "");
       if (!li) {
+        backendFailuresRef.current = 0;
+        setBackendUnavailable(false);
         void syncTrayState("disconnected");
         setLoggedIn(false);
         return;
       }
 
       const s = await getStatus();
+      if (requestId !== refreshIdRef.current) return;
+      backendFailuresRef.current = 0;
+      setBackendUnavailable(false);
       const prev = prevStateRef.current;
       void syncTrayState(s.state);
 
@@ -129,7 +143,12 @@ export default function App() {
       setStatus(s);
       setLoggedIn(true);
     } catch {
-      // Keep the previous UI state if the backend command temporarily fails.
+      // 旧状态仅保留作诊断展示，不能继续把绿色 Connected 当作实时可信状态。
+      if (requestId !== refreshIdRef.current) return;
+      backendFailuresRef.current += 1;
+      if (backendFailuresRef.current >= BACKEND_FAILURE_THRESHOLD) {
+        setBackendUnavailable(true);
+      }
     }
   }, [addActivity]);
 
@@ -153,6 +172,10 @@ export default function App() {
     getLaunchOnStartup()
       .then(setLaunchOnStartupState)
       .catch(() => setLaunchOnStartupState(false));
+  }, []);
+
+  useEffect(() => {
+    getDiagnosticsInfo().then(setDiagnostics).catch(() => setDiagnostics(null));
   }, []);
 
   const checkUpdates = useCallback(async (manual = false) => {
@@ -307,12 +330,13 @@ export default function App() {
     );
   }
 
-  const state: ConnState = status?.state ?? "disconnected";
+  const actualState: ConnState = status?.state ?? "disconnected";
+  const state: ConnState = backendUnavailable ? "error" : actualState;
   const meta = STATE_META[state];
-  const connected = state === "connected";
-  const reconnecting = state === "reconnecting";
+  const connected = actualState === "connected";
+  const reconnecting = actualState === "reconnecting";
   const tunnelUp = connected || reconnecting;
-  const connecting = state === "connecting";
+  const connecting = actualState === "connecting";
 
   return (
     <div className="app-shell" data-state={state} data-tauri-drag-region>
@@ -338,7 +362,11 @@ export default function App() {
               <div className="status-kicker">链路状态</div>
               <div className="status-title">{meta.label}</div>
               <div className="status-detail">
-                {state === "error" && status?.last_error ? status.last_error : meta.detail}
+                {backendUnavailable
+                  ? "客户端后端无响应，显示状态可能已过期"
+                  : state === "error" && status?.last_error
+                    ? status.last_error
+                    : meta.detail}
               </div>
             </div>
           </div>
@@ -353,6 +381,7 @@ export default function App() {
         </section>
 
         {reconnecting && <div className="notice">网络异常,正在自动恢复连接。</div>}
+        {backendUnavailable && <div className="notice">无法读取实时状态，请重新打开客户端并查看本地日志。</div>}
 
         <section className="metric-grid">
           <Metric label="专属地址" value={status?.vpn_ip ?? "--"} onCopy={() => onCopy(status?.vpn_ip, "专属地址")} />
@@ -397,6 +426,8 @@ export default function App() {
           startupBusy={startupBusy}
           lastError={lastError}
           activity={activity}
+          diagnostics={diagnostics}
+          backendUnavailable={backendUnavailable}
           onRefresh={refresh}
           onCheckUpdates={() => checkUpdates(true)}
           onInstallUpdate={onInstallUpdate}
@@ -526,6 +557,8 @@ function SettingsPanel({
   startupBusy,
   lastError,
   activity,
+  diagnostics,
+  backendUnavailable,
   onRefresh,
   onCheckUpdates,
   onInstallUpdate,
@@ -549,6 +582,8 @@ function SettingsPanel({
   startupBusy: boolean;
   lastError: string | null;
   activity: ActivityEntry[];
+  diagnostics: DiagnosticsInfo | null;
+  backendUnavailable: boolean;
   onRefresh: () => void;
   onCheckUpdates: () => void;
   onInstallUpdate: () => void;
@@ -560,12 +595,18 @@ function SettingsPanel({
   const state = status?.state ?? "disconnected";
   const stateLabel = STATE_META[state].label;
   const copyDiagnostics = async () => {
+    const currentDiagnostics = await getDiagnosticsInfo().catch(() => diagnostics);
     const diagnostic = [
       `产品: 易链`,
       `状态: ${stateLabel}`,
       `服务端: ${server || "--"}`,
       `专属地址: ${status?.vpn_ip ?? "--"}`,
       `最后错误: ${lastError ?? status?.last_error ?? "--"}`,
+      `后端状态: ${backendUnavailable ? "不可用（状态可能过期）" : "正常"}`,
+      `客户端版本: ${currentDiagnostics?.app_version ?? "--"}`,
+      `平台: ${currentDiagnostics ? `${currentDiagnostics.os}/${currentDiagnostics.arch}` : "--"}`,
+      `日志目录: ${currentDiagnostics?.log_dir ?? "--"}`,
+      `日志状态: ${currentDiagnostics ? (currentDiagnostics.log_error ?? "正常") : "未知（无法读取诊断信息）"}`,
       `时间: ${new Date().toISOString()}`,
     ].join("\n");
     await navigator.clipboard?.writeText(diagnostic).catch(() => {});
@@ -614,11 +655,17 @@ function SettingsPanel({
                 <div className="inline-card error-card">
                   <div className="inline-title">错误详情</div>
                   <div className="inline-note">{lastError ?? status?.last_error}</div>
-                  <button className="secondary-action compact" onClick={copyDiagnostics}>
-                    复制诊断信息
-                  </button>
                 </div>
               )}
+              <div className={`inline-card ${diagnostics?.log_error ? "error-card" : ""}`}>
+                <div className="inline-title">运行诊断</div>
+                <div className="inline-note">
+                  {diagnostics?.log_error ?? "可复制客户端版本、平台、日志目录和当前错误。"}
+                </div>
+                <button className="secondary-action compact" onClick={copyDiagnostics}>
+                  复制诊断信息
+                </button>
+              </div>
               <div className="inline-card">
                 <div className="inline-title">连接日志</div>
                 {activity.length > 0 ? (
