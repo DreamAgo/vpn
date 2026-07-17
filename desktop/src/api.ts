@@ -76,7 +76,7 @@ export function getStatus(): Promise<StatusResponse> {
 export function getDiagnosticsInfo(): Promise<DiagnosticsInfo> {
   if (!isTauriRuntime()) {
     return Promise.resolve({
-      app_version: "0.1.4",
+      app_version: "0.1.5",
       os: "preview",
       arch: "browser",
       log_dir: null,
