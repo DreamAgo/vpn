@@ -37,12 +37,11 @@ pub async fn disconnect(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<(), St
     mgr.disconnect().await
 }
 
-/// Log in and persist credentials. `routes` intentionally empty (desktop client
-/// is not a site-gateway). Returns Err(message) on failure.
+/// Log in and persist credentials. Returns Err(message) on failure.
 #[tauri::command]
 pub async fn login(server: String, username: String, password: String) -> Result<(), String> {
     let repo = repo()?;
-    run_login(&server, Some(&username), Some(&password), &[], &repo)
+    run_login(&server, Some(&username), Some(&password), &repo)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

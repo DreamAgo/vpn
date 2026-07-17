@@ -266,7 +266,7 @@ pub async fn openapi_json() -> Json<Value> {
                     "tags": ["AdminPeers"],
                     "summary": "更新节点站点网关网段",
                     "parameters": [{ "$ref": "#/components/parameters/Id" }],
-                    "requestBody": { "$ref": "#/components/requestBodies/Routes" },
+                    "requestBody": { "$ref": "#/components/requestBodies/PeerRoutes" },
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
                 },
                 "delete": {
@@ -397,6 +397,7 @@ pub async fn openapi_json() -> Json<Value> {
                 "Group": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GroupRequest" } } } },
                 "Subnet": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubnetRequest" } } } },
                 "Routes": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["routes"], "properties": { "routes": { "type": "array", "items": { "type": "string", "example": "192.168.10.0/24" } } } } } } },
+                "PeerRoutes": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["routed_subnets"], "properties": { "routed_subnets": { "type": "array", "items": { "type": "string", "example": "192.168.10.0/24" } } } } } } },
                 "PeerRegister": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PeerRegisterRequest" } } } },
                 "PeerHeartbeat": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PeerHeartbeatRequest" } } } }
             },
@@ -514,8 +515,7 @@ pub async fn openapi_json() -> Json<Value> {
                         "device_name": { "type": "string" },
                         "wg_public_key": { "type": "string" },
                         "os_info": { "type": "string" },
-                        "client_version": { "type": "string" },
-                        "routed_subnets": { "type": "array", "items": { "type": "string" } }
+                        "client_version": { "type": "string" }
                     }
                 },
                 "PeerHeartbeatRequest": {

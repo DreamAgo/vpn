@@ -53,7 +53,7 @@
     0% 丢包（ttl=64）、`ping 172.31.100.2`（docker 网段 nginx，经服务端网关）3/3 0% 丢包（ttl=63，分流路由也通）。
     Linux 上 `10.8.0.0/24` 显式加路由会报 `File exists`（接口地址已自动产生连通路由），**无害**，已忽略。
   - 188.89 是 Proxmox LXC，无 `/dev/net/tun` 且无法 modprobe，不能在其上验证用户态（故改用 188.54）。Windows 待验证。
-  - **公网异地组网端到端（✅ 2026-05-26）**：服务端映射到公网 `223.84.157.49`，Linux 网关(188.54)声明 `--route 192.168.186.0/24`，
+  - **公网异地组网端到端（✅ 2026-05-26）**：服务端映射到公网 `223.84.157.49`，管理员在后台为 Linux 网关(188.54)配置 `192.168.186.0/24`，
     mac 从**真外网(蜂窝)**经公网登录+建隧道 → ping 内网 `192.168.186.1`：连前 100% 丢包、连后 4/4 0% 丢包 ttl=61(三跳转发)。
     链路 mac(外网)→公网→服务端→Linux网关→内网，全程零依赖用户态。
   - 新增 `VPN_ENDPOINT_OVERRIDE` env（split-horizon）：内网节点用内网 endpoint 避开公网 UDP NAT 回环；外网节点用服务端下发的公网 endpoint。
@@ -66,11 +66,12 @@
   - `iptables -I FORWARD -i wg0 -o wg0 -j ACCEPT` —— **关键**：装了 Docker 的主机 `FORWARD` 链默认策略是 `DROP`，不加这条规则 peer 间转发会被全部丢弃（排查耗时点）。
   - 若客户端需访问公网/内网（全隧道），还需对出口网卡做 MASQUERADE：`iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o <eth> -j MASQUERADE`。
   - 生产建议：把这些规则放进部署脚本 / systemd `ExecStartPost`（见 `packaging/linux`），或由运维固化；应用本身不擅自改主机防火墙。
-- [x] **站点 LAN 网段路由（可配置路由，非全转发）已真机验证（2026-05-25）**：peer 注册时 `routed_subnets` 声明背后 LAN（如 `192.168.20.0/24`），服务端 `KernelWireGuardControl` 自动把网段加入该 peer 的 allowed-ips **并加 `ip route <subnet> dev wg0`**（`wg set` 不像 `wg-quick` 自动加路由，这是关键）。客户端从注册响应的 `allowed_routes` 获知应路由的网段（VPN 子网 + 各站点 LAN），实现分隧道。验证：clientA 经服务端中转 + 站点网关 B 转发，ping 通 B 内网主机 192.168.20.1，0% 丢包。
+- [x] **站点 LAN 网段路由（可配置路由，非全转发）已真机验证（2026-05-25）**：管理员通过 `PATCH /api/v1/admin/peers/{id}` 为 peer 配置背后 LAN（如 `192.168.20.0/24`），服务端 `KernelWireGuardControl` 自动把网段加入该 peer 的 allowed-ips **并加 `ip route <subnet> dev wg0`**（`wg set` 不像 `wg-quick` 自动加路由，这是关键）。客户端从注册响应的 `allowed_routes` 获知应路由的网段（VPN 子网 + 各站点 LAN），实现分隧道。验证：clientA 经服务端中转 + 站点网关 B 转发，ping 通 B 内网主机 192.168.20.1，0% 丢包。
   - 站点网关侧仍需自行开 `ip_forward` 并把 VPN 流量转发/MASQUERADE 进其本地 LAN。
-  - **真实 vpn-cli 客户端端到端复测（2026-05-25）**：网关节点 `vpn-cli login --route 172.31.101.0/24` + daemon up 声明 routed_subnets；
+  - **真实 vpn-cli 客户端端到端复测（2026-05-25）**：网关节点登录并连接后，管理员在后台配置 `172.31.101.0/24`；
     消费端 vpn-cli 节点重连后 `allowed_routes` 自动含该 LAN，`ping 172.31.101.2`（站点 nginx）0% 丢包、**ttl=62（服务端 −1 + 网关 −1，两跳转发）**、HTTP 200。
     两端均为真实 `vpn-cli` daemon（非裸 wg），靠自动心跳保持 online。网关容器内手动加 `ip_forward=1` + `iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE`。
+  - 站点网段仅能由 admin API 设置、替换或用空数组清空；客户端注册不接受该配置，重连也不会覆盖已有后台路由。
 - [ ] Story 4.4 boringtun timer task：仅当选用户态后端时需要；内核后端不涉及。
 - [ ] 容器化部署内核后端：容器需 `--cap-add NET_ADMIN` + host 内核 WireGuard；UDP 端口建议 `network_mode: host` 避免 NAT 破坏握手。
 

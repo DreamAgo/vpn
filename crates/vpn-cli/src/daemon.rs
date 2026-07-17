@@ -209,7 +209,6 @@ pub async fn connect_once(
     api: &ApiClient,
     keypair: &vpn_wireguard::WgKeypair,
     device_name: &str,
-    routed_subnets: &[String],
 ) -> CliResult<TunnelParams> {
     // 1) 确保有可用 access token：优先用 refresh。
     if api.access_token().is_none() {
@@ -221,8 +220,6 @@ pub async fn connect_once(
         wg_public_key: keypair.public_key.clone(),
         device_name: device_name.to_string(),
         os_info: Some(detect_os_info()),
-        // 站点网关模式：登录时 `--route` 声明的 LAN 网段（经 DaemonConfig 传入）。
-        routed_subnets: routed_subnets.to_vec(),
         // 节点健康监控：上报客户端版本。
         client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
@@ -536,9 +533,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
         match msg {
             ControlMsg::Connect => {
                 state.set_state(ConnState::Connecting, now_unix()).await;
-                match connect_once(&api, &keypair, &config.device_name, &config.routed_subnets)
-                    .await
-                {
+                match connect_once(&api, &keypair, &config.device_name).await {
                     Ok(params) => {
                         // 注册成功后再拆旧连接（先提交后拆）：避免一次冗余 Connect 叠加瞬时失败
                         // 把正在工作的隧道毁掉。先发关停信号，再**等待**旧转发任务退出（它会删自己

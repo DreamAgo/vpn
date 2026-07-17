@@ -128,6 +128,17 @@ curl -sS 'http://127.0.0.1:8080/api/v1/admin/users?page=1&page_size=20' \
   -H "authorization: Bearer $YILIAN_API_KEY"
 ```
 
+为站点网关 peer 设置承载网段（替换语义；传空数组即清空）：
+
+```bash
+curl -sS -X PATCH http://127.0.0.1:8080/api/v1/admin/peers/$PEER_ID \
+  -H "authorization: Bearer $ACCESS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"routed_subnets":["192.168.188.0/24"]}'
+```
+
+`routed_subnets` 仅能通过该 admin API 修改。客户端注册不接受路由声明；旧客户端继续发送同名字段时，服务端会忽略它并保留现有后台配置。
+
 吊销 API Key：
 
 ```bash

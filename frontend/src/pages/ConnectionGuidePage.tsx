@@ -260,10 +260,9 @@ export function ConnectionGuidePage() {
           </Step>
           <Step n={5}>
             <Paragraph style={{ color: 'var(--ink-soft)', margin: 0 }}>
-              <Text style={{ color: 'var(--ink)' }}>站点网关（异地组网）</Text>：登录时用 <Text code>--route</Text>
-              声明本机背后的 LAN 网段，其它节点即可经本机访问该内网：
+              <Text style={{ color: 'var(--ink)' }}>站点网关（异地组网）</Text>：节点连接后，由管理员在
+              “节点管理”中配置该节点承载的 LAN 网段；客户端不能自行声明网段。
             </Paragraph>
-            <CodeBlock>{`vpn-cli login --server ${SERVER} --route 192.168.10.0/24`}</CodeBlock>
           </Step>
         </Card>
 

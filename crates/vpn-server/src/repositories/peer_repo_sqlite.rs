@@ -189,6 +189,8 @@ impl SqlitePeerRepository {
 
     /// 复用既有 peer：更新 wg_public_key / device_name / os_info（保留 vpn_ip）。
     /// wg_public_key 与别的 peer 冲突返回 DuplicateResource。
+    /// `clear_routed_subnets` 仅由服务端在“新设备接管旧槽位”时设置；普通重注册
+    /// 始终保留 admin 管理的路由。
     ///
     /// 「强制下线」语义=踢下线 + 强制重连:若该 peer 当前是 `force_removed`,重新注册
     /// 时把状态清回 `offline`(下次心跳即恢复 `online`),使节点重连后可再次上线。
@@ -201,22 +203,23 @@ impl SqlitePeerRepository {
         wg_public_key: &str,
         os_info: Option<&str>,
         client_version: Option<&str>,
-        routed_subnets: &str,
+        clear_routed_subnets: bool,
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         let result = sqlx::query(
-            r#"UPDATE peers SET device_name = ?1, wg_public_key = ?2, os_info = ?3, routed_subnets = ?4, updated_at = ?5,
-                   client_version = COALESCE(?7, client_version),
+            r#"UPDATE peers SET device_name = ?1, wg_public_key = ?2, os_info = ?3, updated_at = ?4,
+                   client_version = COALESCE(?6, client_version),
+                   routed_subnets = CASE WHEN ?7 THEN '' ELSE routed_subnets END,
                    status = CASE WHEN status = 'force_removed' THEN 'offline' ELSE status END
-               WHERE id = ?6"#,
+               WHERE id = ?5"#,
         )
         .bind(device_name)
         .bind(wg_public_key)
         .bind(os_info)
-        .bind(routed_subnets)
         .bind(now)
         .bind(id)
         .bind(client_version)
+        .bind(clear_routed_subnets)
         .execute(&self.pool)
         .await;
 
@@ -594,7 +597,7 @@ mod tests {
         repo.insert("p1", "user-1", "MBP", "PK1", "10.8.0.2", None, None, "")
             .await
             .unwrap();
-        repo.update_registration("p1", "MBP2", "PK2", Some("linux"), None, "")
+        repo.update_registration("p1", "MBP2", "PK2", Some("linux"), None, false)
             .await
             .unwrap();
         let row = repo.find_active_by_user("user-1").await.unwrap().unwrap();
@@ -602,6 +605,55 @@ mod tests {
         assert_eq!(row.wg_public_key, "PK2");
         assert_eq!(row.device_name, "MBP2");
         assert_eq!(row.os_info.as_deref(), Some("linux"));
+    }
+
+    #[tokio::test]
+    async fn update_registration_preserves_admin_routes() {
+        let repo = SqlitePeerRepository::new(setup_pool().await);
+        repo.insert(
+            "p1",
+            "user-1",
+            "Gateway",
+            "PK1",
+            "10.8.0.2",
+            None,
+            None,
+            "192.168.188.0/24",
+        )
+        .await
+        .unwrap();
+
+        repo.update_registration("p1", "Gateway", "PK2", Some("linux"), Some("0.2.0"), false)
+            .await
+            .unwrap();
+
+        let row = repo.find_active_by_user("user-1").await.unwrap().unwrap();
+        assert_eq!(row.routed_subnets, "192.168.188.0/24");
+    }
+
+    #[tokio::test]
+    async fn slot_takeover_clears_admin_routes_atomically() {
+        let repo = SqlitePeerRepository::new(setup_pool().await);
+        repo.insert(
+            "p1",
+            "user-1",
+            "Gateway",
+            "PK1",
+            "10.8.0.2",
+            None,
+            None,
+            "192.168.188.0/24",
+        )
+        .await
+        .unwrap();
+
+        repo.update_registration("p1", "New Device", "PK2", None, None, true)
+            .await
+            .unwrap();
+
+        let row = repo.find_active_by_user("user-1").await.unwrap().unwrap();
+        assert_eq!(row.device_name, "New Device");
+        assert!(row.routed_subnets.is_empty());
     }
 
     #[tokio::test]

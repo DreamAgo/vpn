@@ -77,8 +77,6 @@ impl VpnManager {
             .refresh_token()
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "未登录:请先登录".to_string())?;
-        let routes = repo.routes().map_err(|e| e.to_string())?;
-
         let api = Arc::new(ApiClient::new(&server).map_err(|e| e.to_string())?);
         api.set_refresh_token(refresh);
         let device = default_device_name();
@@ -92,7 +90,7 @@ impl VpnManager {
         // 错误不应毁掉正在工作的连接。注册失败时旧隧道原封不动。
         let params = match tokio::time::timeout(
             CONNECT_TIMEOUT,
-            daemon::connect_once(&api, &self.keypair, &device, &routes),
+            daemon::connect_once(&api, &self.keypair, &device),
         )
         .await
         {

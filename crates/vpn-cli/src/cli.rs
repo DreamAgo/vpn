@@ -36,9 +36,6 @@ pub enum Command {
         /// 密码（不建议命令行传入；缺省则交互式安全读入）。
         #[arg(long)]
         password: Option<String>,
-        /// 站点网关模式：声明本机背后的 LAN 网段（CIDR，可重复），如 --route 192.168.10.0/24。
-        #[arg(long = "route", value_name = "CIDR")]
-        routes: Vec<String>,
     },
     /// 注销并清除本地凭证。
     Logout,
@@ -117,7 +114,6 @@ pub async fn run_login(
     server: &str,
     username: Option<&str>,
     password: Option<&str>,
-    routes: &[String],
     repo: &CredentialRepo,
 ) -> CliResult<String> {
     let username = match username {
@@ -132,12 +128,8 @@ pub async fn run_login(
     let api = crate::api::ApiClient::new(server)?;
     let resp = api.login(&username, &password).await?;
     repo.save_login(server, &resp.refresh_token, Some(&username))?;
-    repo.save_routes(routes)?;
 
     let mut msg = format!("登录成功，凭证已保存（服务端 {server}）。");
-    if !routes.is_empty() {
-        msg.push_str(&format!("\n站点网关网段: {}", routes.join(", ")));
-    }
     if resp.must_change_password {
         msg.push_str("\n注意: 账户要求首次登录后修改密码。");
     }
@@ -259,24 +251,16 @@ mod tests {
     }
 
     #[test]
-    fn login_parses_repeatable_routes() {
-        let cli = Cli::try_parse_from([
+    fn login_rejects_removed_route_flag() {
+        assert!(Cli::try_parse_from([
             "vpn-cli",
             "login",
             "--server",
             "https://s",
             "--route",
             "192.168.10.0/24",
-            "--route",
-            "10.20.0.0/16",
         ])
-        .unwrap();
-        match cli.command {
-            Command::Login { routes, .. } => {
-                assert_eq!(routes, vec!["192.168.10.0/24", "10.20.0.0/16"]);
-            }
-            other => panic!("expected Login, got {other:?}"),
-        }
+        .is_err());
     }
 
     #[test]

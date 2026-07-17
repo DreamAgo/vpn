@@ -17,10 +17,6 @@ pub struct PeerRegisterRequest {
     /// 可选：操作系统信息（如 "macOS 15.4 arm64"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_info: Option<String>,
-    /// 可选：该节点背后路由的 LAN 网段（站点内网 CIDR，如 "192.168.10.0/24"）。
-    /// 作为站点网关时声明，服务端会把这些网段路由到本节点。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routed_subnets: Vec<String>,
     /// 可选：客户端版本（如 "0.1.0"，节点健康监控展示用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
@@ -167,4 +163,24 @@ pub struct AdminPeerQuery {
     /// 按状态筛选
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeerRegisterRequest;
+
+    #[test]
+    fn register_request_ignores_legacy_routed_subnets() {
+        let request: PeerRegisterRequest = serde_json::from_value(serde_json::json!({
+            "wg_public_key": "pk",
+            "device_name": "gateway",
+            "routed_subnets": ["192.168.188.0/24"]
+        }))
+        .unwrap();
+
+        assert_eq!(request.wg_public_key, "pk");
+        assert_eq!(request.device_name, "gateway");
+        let serialized = serde_json::to_value(request).unwrap();
+        assert!(serialized.get("routed_subnets").is_none());
+    }
 }

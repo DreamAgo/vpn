@@ -165,6 +165,9 @@ pub struct PeerService {
     /// 服务端自身网关的网段（如所在 Docker 网络），下发给**未分组**客户端的默认 allowed_routes。
     /// 运行时可变（admin 后台编辑），变更持久化到 system_config。
     server_routes: Arc<RwLock<Vec<String>>>,
+    /// 串行化 peer 注册/槽位接管与 admin 路由修改，避免数据库和 WireGuard
+    /// 使用不同时间点的 routed_subnets 快照。
+    peer_route_lock: Arc<Mutex<()>>,
 }
 
 impl PeerService {
@@ -193,6 +196,7 @@ impl PeerService {
             subnet,
             server_endpoint,
             server_routes: Arc::new(RwLock::new(server_routes)),
+            peer_route_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -252,16 +256,14 @@ impl PeerService {
         user_id: &str,
         req: &PeerRegisterRequest,
     ) -> Result<PeerRegisterResponse> {
-        // 校验并归一化客户端声明的 LAN 网段（站点网关）。
-        let subnets = normalize_subnets(&req.routed_subnets)?;
-        let subnets_csv = subnets.join(",");
-
+        let _route_guard = self.peer_route_lock.lock().await;
         let peers = self.peer_repo.list_active_by_user(user_id).await?;
         // 终端匹配：公钥优先（同一运行内重连），其次设备名（重启后换了密钥对）。
         let matched = peers
             .iter()
             .find(|p| p.wg_public_key == req.wg_public_key)
             .or_else(|| peers.iter().find(|p| p.device_name == req.device_name));
+        let matched_existing = matched.is_some();
 
         // 复用槽位的目标终端：匹配到的既有终端，或达上限时被接管的离线终端。
         let target = match matched {
@@ -294,18 +296,27 @@ impl PeerService {
             }
         };
 
-        // 站点网段不得与其他节点重叠（否则 wg allowed-ips 互抢、站点静默不可达）。
-        // 多终端下同一用户的其他终端也算"其他节点"，仅排除本次复用的目标终端。
-        self.ensure_no_subnet_collision(&subnets, target.as_ref().map(|p| p.id.as_str()), None)
-            .await?;
-
-        // 重注册前留存旧公钥/旧网段：换公钥时摘除幽灵 peer、缩减网段时清理残留路由。
-        let target_id = target.as_ref().map(|p| p.id.clone());
+        let slot_takeover = !matched_existing && target.is_some();
+        // 仅真正匹配到的既有终端继承 admin 配置。达到设备上限后的槽位接管
+        // 代表新终端，必须从空路由开始，等待管理员重新授权。
         let old_pubkey = target.as_ref().map(|p| p.wg_public_key.clone());
-        let old_routed: Vec<String> = target
+        let target_id = target.as_ref().map(|p| p.id.clone());
+        let old_routed_subnets = target
             .as_ref()
             .map(|p| parse_csv_subnets(&p.routed_subnets))
             .unwrap_or_default();
+        let routed_subnets = if matched_existing {
+            old_routed_subnets.clone()
+        } else {
+            Vec::new()
+        };
+
+        // 被强制下线的网关可能已由其他 peer 接管相同网段；恢复前必须重新
+        // 做碰撞校验，不能让重注册静默抢回 AllowedIPs。
+        if matched_existing {
+            self.ensure_no_subnet_collision(&routed_subnets, target_id.as_deref(), None)
+                .await?;
+        }
 
         let vpn_ip: String = match target {
             Some(peer) => {
@@ -317,7 +328,7 @@ impl PeerService {
                         &req.wg_public_key,
                         req.os_info.as_deref(),
                         req.client_version.as_deref(),
-                        &subnets_csv,
+                        slot_takeover,
                     )
                     .await?;
                 // 变更记录（节点健康监控）：设备名（槽位接管/改名）、OS、客户端版本。
@@ -370,7 +381,7 @@ impl PeerService {
                         &ip_str,
                         req.os_info.as_deref(),
                         req.client_version.as_deref(),
-                        &subnets_csv,
+                        "",
                     )
                     .await
                 {
@@ -397,7 +408,7 @@ impl PeerService {
                 public_key: req.wg_public_key.clone(),
                 vpn_ip: vpn_ip_parsed,
                 endpoint: None,
-                allowed_subnets: subnets.clone(),
+                allowed_subnets: routed_subnets.clone(),
             })
             .await?;
 
@@ -407,26 +418,23 @@ impl PeerService {
                 let _ = self.control.remove_peer(old).await;
             }
         }
-        // 缩减网段：删除不再声明的站点网段的残留 OS 路由（best-effort，避免黑洞）。
-        // 但保留仍被其他活跃网关接管的网段，避免删掉别人正在用的路由。
-        let removed: Vec<String> = old_routed
-            .into_iter()
-            .filter(|s| !subnets.contains(s))
-            .collect();
-        let removed = self
-            .filter_releasable_routes(removed, target_id.as_deref(), None)
-            .await?;
-        if !removed.is_empty() {
-            let _ = self.control.remove_routes(&removed).await;
+        if slot_takeover && !old_routed_subnets.is_empty() {
+            let removed = self
+                .filter_releasable_routes(old_routed_subnets, target_id.as_deref(), None)
+                .await?;
+            if !removed.is_empty() {
+                let _ = self.control.remove_routes(&removed).await;
+            }
         }
-
         Ok(PeerRegisterResponse {
             vpn_ip,
             server_public_key: self.server_public_key().to_string(),
             server_endpoint: self.server_endpoint.clone(),
             vpn_subnet: self.subnet_cidr(),
-            // 客户端应路由：VPN 子网 + 组网段(或全局默认) + 其他站点的 LAN 网段（不含自己声明的）。
-            allowed_routes: self.compute_allowed_routes(user_id, &subnets).await?,
+            // 客户端应路由：VPN 子网 + 组网段(或全局默认) + 其他站点的 LAN 网段。
+            allowed_routes: self
+                .compute_allowed_routes(user_id, &routed_subnets)
+                .await?,
         })
     }
 
@@ -906,6 +914,7 @@ impl PeerService {
     /// 校验/归一化 CIDR → 持久化 → 重新下发 WireGuard 配置（更新 allowed-ips 与路由）。
     /// peer 不存在 → PeerNotFound；非法 CIDR → Config。
     pub async fn update_peer_routes(&self, peer_id: &str, subnets: &[String]) -> Result<()> {
+        let _route_guard = self.peer_route_lock.lock().await;
         let peer = self
             .peer_repo
             .find_by_id(peer_id)
@@ -1364,17 +1373,6 @@ mod tests {
             wg_public_key: pk.to_string(),
             device_name: "MBP".to_string(),
             os_info: Some("macOS".to_string()),
-            routed_subnets: Vec::new(),
-            client_version: None,
-        }
-    }
-
-    fn reg_with_subnets(pk: &str, subnets: &[&str]) -> PeerRegisterRequest {
-        PeerRegisterRequest {
-            wg_public_key: pk.to_string(),
-            device_name: "GW".to_string(),
-            os_info: None,
-            routed_subnets: subnets.iter().map(|s| s.to_string()).collect(),
             client_version: None,
         }
     }
@@ -1384,7 +1382,6 @@ mod tests {
             wg_public_key: pk.to_string(),
             device_name: device.to_string(),
             os_info: None,
-            routed_subnets: Vec::new(),
             client_version: None,
         }
     }
@@ -1444,14 +1441,25 @@ mod tests {
             .register("user-1", &reg_named("PK1", "MBP"))
             .await
             .unwrap();
+        let old_peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.update_peer_routes(&old_peer.id, &["192.168.188.0/24".to_string()])
+            .await
+            .unwrap();
         let r2 = svc
             .register("user-1", &reg_named("PK2", "iPhone"))
             .await
             .unwrap();
         assert_eq!(r1.vpn_ip, r2.vpn_ip);
+        assert!(!r2.allowed_routes.contains(&"192.168.188.0/24".to_string()));
         let peers = svc.peer_repo.list_active_by_user("user-1").await.unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].device_name, "iPhone");
+        assert!(peers[0].routed_subnets.is_empty());
     }
 
     #[tokio::test]
@@ -1590,7 +1598,6 @@ mod tests {
             wg_public_key: "PK1".into(),
             device_name: "MBP".into(),
             os_info: Some("macOS 14".into()),
-            routed_subnets: Vec::new(),
             client_version: Some("0.1.0".into()),
         };
         svc.register("user-1", &req1).await.unwrap();
@@ -1688,10 +1695,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_rejects_invalid_subnet() {
+    async fn admin_routes_reject_invalid_subnet() {
         let svc = service(setup_pool().await);
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
         let err = svc
-            .register("user-1", &reg_with_subnets("PK1", &["not-a-cidr"]))
+            .update_peer_routes(&peer.id, &["not-a-cidr".to_string()])
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
@@ -1700,8 +1714,17 @@ mod tests {
     #[tokio::test]
     async fn site_to_site_routes_are_access_controlled() {
         let svc = service(setup_pool().await);
-        // 站点网关 B 声明 LAN 192.168.20.0/24（会被归一化）。
-        svc.register("user-2", &reg_with_subnets("PKB", &["192.168.20.5/24"]))
+        // 管理员为站点网关 B 配置 LAN 192.168.20.0/24（会被归一化）。
+        svc.register("user-2", &reg_named("PKB", "GW"))
+            .await
+            .unwrap();
+        let gateway = svc
+            .peer_repo
+            .find_active_by_user("user-2")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.update_peer_routes(&gateway.id, &["192.168.20.5/24".to_string()])
             .await
             .unwrap();
         // 访问控制：未在 server_routes / 组路由中放行该 LAN 的客户端 A，只拿到 VPN 子网，
@@ -1726,43 +1749,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_rejects_overlapping_site_subnet() {
+    async fn admin_routes_reject_overlapping_site_subnet() {
         let svc = service(setup_pool().await);
-        // 网关 B 声明 192.168.20.0/24。
-        svc.register("user-2", &reg_with_subnets("PKB", &["192.168.20.0/24"]))
+        svc.register("user-2", &reg_named("PKB", "GW-B"))
             .await
             .unwrap();
-        // 另一节点声明重叠网段（更大范围覆盖之）→ 拒绝，避免 wg allowed-ips 互抢致静默黑洞。
+        let gateway_b = svc
+            .peer_repo
+            .find_active_by_user("user-2")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.update_peer_routes(&gateway_b.id, &["192.168.20.0/24".to_string()])
+            .await
+            .unwrap();
+
+        svc.register("user-1", &reg_named("PKC", "GW-C"))
+            .await
+            .unwrap();
+        let gateway_c = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        // 管理员为另一节点配置重叠网段（更大范围覆盖之）→ 拒绝。
         let err = svc
-            .register("user-3", &reg_with_subnets("PKC", &["192.168.0.0/16"]))
+            .update_peer_routes(&gateway_c.id, &["192.168.0.0/16".to_string()])
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 
     #[tokio::test]
-    async fn register_rejects_default_route_subnet() {
+    async fn admin_routes_reject_default_route_subnet() {
         let svc = service(setup_pool().await);
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
         // 0.0.0.0/0（全隧道）暂不支持，路由校验处直接拒绝，避免用户态客户端回环瘫痪。
         let err = svc
-            .register("user-1", &reg_with_subnets("PK1", &["0.0.0.0/0"]))
+            .update_peer_routes(&peer.id, &["0.0.0.0/0".to_string()])
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 
     #[tokio::test]
-    async fn register_rejects_subnet_overlapping_vpn_subnet() {
+    async fn admin_routes_reject_subnet_overlapping_vpn_subnet() {
         let svc = service(setup_pool().await); // VPN 子网 10.8.0.0/24
-                                               // 站点网段落在 VPN 子网内部（10.8.0.128/25）→ 拒绝。
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        let peer1 = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        // 站点网段落在 VPN 子网内部（10.8.0.128/25）→ 拒绝。
         let err = svc
-            .register("user-1", &reg_with_subnets("PK1", &["10.8.0.128/25"]))
+            .update_peer_routes(&peer1.id, &["10.8.0.128/25".to_string()])
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
         // 精确等于 VPN 子网亦拒绝。
+        svc.register("user-2", &reg("PK2")).await.unwrap();
+        let peer2 = svc
+            .peer_repo
+            .find_active_by_user("user-2")
+            .await
+            .unwrap()
+            .unwrap();
         let err = svc
-            .register("user-2", &reg_with_subnets("PK2", &["10.8.0.0/24"]))
+            .update_peer_routes(&peer2.id, &["10.8.0.0/24".to_string()])
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
@@ -2098,8 +2160,12 @@ mod tests {
 
     #[tokio::test]
     async fn update_peer_routes_persists_and_validates() {
-        let svc = service(setup_pool().await);
+        let svc =
+            service_with_server_routes(setup_pool().await, vec!["192.168.0.0/16".to_string()]);
         svc.register("user-1", &reg("PK1")).await.unwrap();
+        svc.register("user-2", &reg_named("PK2", "Consumer"))
+            .await
+            .unwrap();
         let peer = svc
             .peer_repo
             .find_active_by_user("user-1")
@@ -2112,6 +2178,20 @@ mod tests {
             .unwrap();
         let updated = svc.peer_repo.find_by_id(&peer.id).await.unwrap().unwrap();
         assert_eq!(updated.routed_subnets, "192.168.10.0/24");
+        let with_route = svc
+            .heartbeat_checked("user-2", &hb(Some("PK2"), None), 1_000)
+            .await
+            .unwrap();
+        assert!(with_route.contains(&"192.168.10.0/24".to_string()));
+        // 空数组显式清空。
+        svc.update_peer_routes(&peer.id, &[]).await.unwrap();
+        let cleared = svc.peer_repo.find_by_id(&peer.id).await.unwrap().unwrap();
+        assert!(cleared.routed_subnets.is_empty());
+        let without_route = svc
+            .heartbeat_checked("user-2", &hb(Some("PK2"), None), 2_000)
+            .await
+            .unwrap();
+        assert!(!without_route.contains(&"192.168.10.0/24".to_string()));
         // 非法网段被拒。
         let err = svc
             .update_peer_routes(&peer.id, &["bad".to_string()])
@@ -2177,9 +2257,16 @@ mod tests {
     #[tokio::test]
     async fn scan_offline_returns_gateway_notices() {
         let svc = service(setup_pool().await);
-        let mut req = reg("PKGW");
-        req.routed_subnets = vec!["192.168.10.0/24".to_string()];
-        svc.register("user-1", &req).await.unwrap();
+        svc.register("user-1", &reg("PKGW")).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.update_peer_routes(&peer.id, &["192.168.10.0/24".to_string()])
+            .await
+            .unwrap();
         svc.heartbeat_checked("user-1", &hb(Some("PKGW"), Some("1.2.3.4:99")), 100)
             .await
             .unwrap();
@@ -2203,19 +2290,101 @@ mod tests {
         // VPN 子网 = 10.8.0.0/24（见 service() helper）。
         // 超网 10.0.0.0/8 ⊃ VPN 子网 → 放行（靠最长前缀保护 VPN 子网）。
         let svc = service(setup_pool().await);
-        let mut r = reg("PKGW");
-        r.routed_subnets = vec!["10.0.0.0/8".to_string()];
-        let resp = svc.register("user-1", &r).await;
+        svc.register("user-1", &reg("PKGW")).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let resp = svc
+            .update_peer_routes(&peer.id, &["10.0.0.0/8".to_string()])
+            .await;
         assert!(resp.is_ok(), "VPN 子网的超网应放行，实际: {:?}", resp.err());
 
         // 落在 VPN 子网内部 10.8.0.128/25 ⊂ 10.8.0.0/24 → 拒绝（会用更具体路由劫持 VPN 子网）。
         let svc2 = service(setup_pool().await);
-        let mut bad = reg("PKBAD");
-        bad.routed_subnets = vec!["10.8.0.128/25".to_string()];
-        let err = svc2.register("user-2", &bad).await.unwrap_err();
+        svc2.register("user-2", &reg("PKBAD")).await.unwrap();
+        let peer2 = svc2
+            .peer_repo
+            .find_active_by_user("user-2")
+            .await
+            .unwrap()
+            .unwrap();
+        let err = svc2
+            .update_peer_routes(&peer2.id, &["10.8.0.128/25".to_string()])
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, AppError::Validation(_)),
             "VPN 子网内应拒绝，实际: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn new_peer_has_no_routes_and_reregister_preserves_admin_routes() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg_named("PK1", "Gateway"))
+            .await
+            .unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(peer.routed_subnets.is_empty());
+
+        svc.update_peer_routes(&peer.id, &["192.168.188.0/24".to_string()])
+            .await
+            .unwrap();
+        svc.register("user-1", &reg_named("PK2", "Gateway"))
+            .await
+            .unwrap();
+
+        let reregistered = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reregistered.routed_subnets, "192.168.188.0/24");
+    }
+
+    #[tokio::test]
+    async fn force_removed_gateway_cannot_reclaim_route_assigned_to_another_peer() {
+        let svc = service(setup_pool().await);
+        svc.register("user-1", &reg_named("PK1", "Gateway"))
+            .await
+            .unwrap();
+        let old_gateway = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.update_peer_routes(&old_gateway.id, &["192.168.188.0/24".to_string()])
+            .await
+            .unwrap();
+        svc.force_remove(&old_gateway.id).await.unwrap();
+
+        svc.register("user-2", &reg_named("PK2", "Replacement"))
+            .await
+            .unwrap();
+        let replacement = svc
+            .peer_repo
+            .find_active_by_user("user-2")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.update_peer_routes(&replacement.id, &["192.168.188.0/24".to_string()])
+            .await
+            .unwrap();
+
+        let err = svc
+            .register("user-1", &reg_named("PK1b", "Gateway"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 }
