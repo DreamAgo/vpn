@@ -172,6 +172,7 @@ pub fn run() {
             commands::change_password,
             commands::is_logged_in,
             commands::saved_server,
+            commands::saved_username,
             commands::diagnostics_info,
             hide_window,
             quit_app,

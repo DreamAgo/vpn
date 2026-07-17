@@ -129,6 +129,11 @@ export function savedServer(): Promise<string | null> {
   return invoke<string | null>("saved_server");
 }
 
+export function savedUsername(): Promise<string | null> {
+  if (!isTauriRuntime()) return Promise.resolve("演示用户");
+  return invoke<string | null>("saved_username");
+}
+
 export function hideWindow(): Promise<void> {
   if (!isTauriRuntime()) return Promise.resolve();
   return invoke<void>("hide_window");

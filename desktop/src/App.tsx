@@ -18,6 +18,7 @@ import {
   notify,
   quitApp,
   savedServer,
+  savedUsername,
   setLaunchOnStartup,
   syncTrayState,
 } from "./api";
@@ -52,6 +53,7 @@ export default function App() {
   const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [server, setServer] = useState<string>("");
+  const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
@@ -74,6 +76,7 @@ export default function App() {
   const toastTimerRef = useRef<number | null>(null);
   const backendFailuresRef = useRef(0);
   const refreshIdRef = useRef(0);
+  const sessionEndingRef = useRef(false);
 
   const addActivity = useCallback((title: string, detail?: string) => {
     setActivity((items) => [
@@ -88,31 +91,42 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    if (sessionEndingRef.current) return;
     const requestId = ++refreshIdRef.current;
     try {
-      const [li, saved] = await Promise.all([isLoggedIn(), savedServer()]);
-      if (requestId !== refreshIdRef.current) return;
+      const [li, saved, username] = await Promise.all([
+        isLoggedIn(),
+        savedServer(),
+        savedUsername().catch(() => null),
+      ]);
+      if (sessionEndingRef.current || requestId !== refreshIdRef.current) return;
       setServer(saved ?? "");
       if (!li) {
         backendFailuresRef.current = 0;
         setBackendUnavailable(false);
         void syncTrayState("disconnected");
+        setCurrentUser(null);
+        setStatus(null);
         setLoggedIn(false);
         return;
       }
+      setCurrentUser(username);
 
       const s = await getStatus();
-      if (requestId !== refreshIdRef.current) return;
+      if (sessionEndingRef.current || requestId !== refreshIdRef.current) return;
       backendFailuresRef.current = 0;
       setBackendUnavailable(false);
       const prev = prevStateRef.current;
       void syncTrayState(s.state);
 
       if (s.state === "error" && (s.last_error ?? "").includes("强制下线")) {
+        sessionEndingRef.current = true;
+        ++refreshIdRef.current;
         prevStateRef.current = null;
         void syncTrayState("disconnected");
-        await logout().catch(() => {});
+        setCurrentUser(null);
         setStatus(null);
+        await logout().catch(() => {});
         setLoggedIn(false);
         void notify("已被强制下线", "管理员已将你强制下线,请重新登录后再连接。");
         return;
@@ -144,7 +158,7 @@ export default function App() {
       setLoggedIn(true);
     } catch {
       // 旧状态仅保留作诊断展示，不能继续把绿色 Connected 当作实时可信状态。
-      if (requestId !== refreshIdRef.current) return;
+      if (sessionEndingRef.current || requestId !== refreshIdRef.current) return;
       backendFailuresRef.current += 1;
       if (backendFailuresRef.current >= BACKEND_FAILURE_THRESHOLD) {
         setBackendUnavailable(true);
@@ -247,6 +261,9 @@ export default function App() {
 
   const onLogout = async () => {
     setBusy(true);
+    sessionEndingRef.current = true;
+    ++refreshIdRef.current;
+    setCurrentUser(null);
     try {
       await logout();
       addActivity("已登出账号");
@@ -254,6 +271,8 @@ export default function App() {
       setLoggedIn(false);
       setStatus(null);
     } catch (e) {
+      sessionEndingRef.current = false;
+      void refresh();
       void notify("登出失败", String(e));
     } finally {
       setBusy(false);
@@ -323,6 +342,8 @@ export default function App() {
     return (
       <LoginView
         onLoggedIn={() => {
+          sessionEndingRef.current = false;
+          setCurrentUser(null);
           setLoggedIn(true);
           refresh();
         }}
@@ -368,6 +389,7 @@ export default function App() {
                     ? status.last_error
                     : meta.detail}
               </div>
+              <CurrentAccount username={currentUser} />
             </div>
           </div>
 
@@ -416,6 +438,7 @@ export default function App() {
           onClose={() => setShowSettings(false)}
           status={status}
           server={server}
+          currentUser={currentUser}
           busy={busy}
           updateBusy={updateBusy}
           updateVersion={updateVersion}
@@ -445,9 +468,12 @@ export default function App() {
         <ChangePasswordSheet
           onClose={() => setShowChangePwd(false)}
           onChanged={async () => {
+            sessionEndingRef.current = true;
+            ++refreshIdRef.current;
             setShowChangePwd(false);
-            await logout().catch(() => {});
+            setCurrentUser(null);
             setStatus(null);
+            await logout().catch(() => {});
             setLoggedIn(false);
           }}
         />
@@ -541,12 +567,31 @@ function InfoRow({ label, value, onCopy }: { label: string; value: string; onCop
   );
 }
 
+function CurrentAccount({
+  username,
+  card = false,
+}: {
+  username: string | null;
+  card?: boolean;
+}) {
+  const displayUsername = username?.trim() || "未知账号";
+  return (
+    <div className={`current-account${card ? " account-card" : ""}`}>
+      <span className="current-account-label">当前账号</span>
+      <strong className="current-account-value" title={displayUsername}>
+        {displayUsername}
+      </strong>
+    </div>
+  );
+}
+
 function SettingsPanel({
   tab,
   onTabChange,
   onClose,
   status,
   server,
+  currentUser,
   busy,
   updateBusy,
   updateVersion,
@@ -572,6 +617,7 @@ function SettingsPanel({
   onClose: () => void;
   status: StatusResponse | null;
   server: string;
+  currentUser: string | null;
   busy: boolean;
   updateBusy: boolean;
   updateVersion: string | null;
@@ -710,6 +756,7 @@ function SettingsPanel({
 
           {tab === "account" && (
             <div className="stack">
+              <CurrentAccount username={currentUser} card />
               <label className="toggle-row">
                 <span>
                   <strong>开机自启</strong>
@@ -808,7 +855,11 @@ function ChangePasswordSheet({
   );
 }
 
-function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
+function LoginView({
+  onLoggedIn,
+}: {
+  onLoggedIn: () => void;
+}) {
   const [server, setServer] = useState("https://");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
