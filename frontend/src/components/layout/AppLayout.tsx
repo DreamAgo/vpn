@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { ProLayout, type ProLayoutProps } from '@ant-design/pro-components';
+import { useQuery } from '@tanstack/react-query';
 import { Dropdown, App, Button, Tooltip } from 'antd';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
@@ -21,6 +22,7 @@ import {
 
 import { useAuthStore } from '@/stores/authStore';
 import { EventNotifications } from '@/components/EventNotifications';
+import { systemApi } from '@/services/auth';
 import {
   getThemeSurfaces,
   type ThemeMode,
@@ -49,6 +51,12 @@ function routeForRole(role: string | null): ProLayoutProps['route'] {
     path: '/',
     routes: role === 'admin' ? adminRoutes : userRoutes,
   };
+}
+
+function formatVersion(version: string | null | undefined): string | null {
+  const value = version?.trim();
+  if (!value) return null;
+  return value.startsWith('v') ? value : `v${value}`;
 }
 
 interface AppLayoutProps {
@@ -146,6 +154,14 @@ export function AppLayout({
   const surfaces = getThemeSurfaces(themeMode);
   const selectedBg = themeMode === 'dark' ? `rgba(${palette.rgb}, 0.16)` : palette.wash;
   const route = useMemo(() => routeForRole(role), [role]);
+  const { data: systemInfo, isError: systemInfoError } = useQuery({
+    queryKey: ['system-info'],
+    queryFn: () => systemApi.getSystemInfo(),
+    enabled: role === 'admin',
+    staleTime: 60_000,
+  });
+  const serverVersion = formatVersion(systemInfo?.version);
+  const serverVersionLabel = serverVersion ?? (systemInfoError ? '读取失败' : '读取中');
 
   const handleLogout = () => {
     modal.confirm({
@@ -196,6 +212,26 @@ export function AppLayout({
         },
       }}
       menuHeaderRender={(_logo, _title, props) => <Brand collapsed={props?.collapsed} palette={palette} />}
+      menuFooterRender={(props) =>
+        role === 'admin' ? (
+          <div
+            aria-label={`服务端版本 ${serverVersionLabel}`}
+            title={`服务端版本 ${serverVersionLabel}`}
+            style={{
+              padding: props?.collapsed ? '12px 4px' : '12px 20px',
+              color: 'var(--ink-faint)',
+              fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+              fontSize: 11,
+              textAlign: props?.collapsed ? 'center' : 'left',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }}
+          >
+            {props?.collapsed ? serverVersionLabel : `服务端 ${serverVersionLabel}`}
+          </div>
+        ) : null
+      }
       actionsRender={() => [
         role === 'admin' ? <EventNotifications key="events" /> : null,
         <ThemeModeToggle

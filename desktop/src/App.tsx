@@ -49,6 +49,12 @@ async function copyText(value: string | null | undefined): Promise<void> {
   await navigator.clipboard?.writeText(text).catch(() => {});
 }
 
+function formatVersion(version: string | null | undefined): string | null {
+  const value = version?.trim();
+  if (!value) return null;
+  return value.startsWith("v") ? value : `v${value}`;
+}
+
 export default function App() {
   const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -341,6 +347,7 @@ export default function App() {
   if (!loggedIn) {
     return (
       <LoginView
+        appVersion={diagnostics?.app_version ?? null}
         onLoggedIn={() => {
           sessionEndingRef.current = false;
           setCurrentUser(null);
@@ -362,7 +369,7 @@ export default function App() {
   return (
     <div className="app-shell" data-state={state} data-tauri-drag-region>
       <header className="appbar" data-tauri-drag-region>
-        <Brand />
+        <Brand version={diagnostics?.app_version ?? null} />
         <div className="top-actions" data-tauri-drag-region="false">
           <IconButton
             title="设置"
@@ -484,12 +491,16 @@ export default function App() {
   );
 }
 
-function Brand() {
+function Brand({ version }: { version?: string | null }) {
+  const displayVersion = formatVersion(version);
   return (
     <div className="brand" data-tauri-drag-region>
       <div className="brand-mark" data-tauri-drag-region>易</div>
       <div className="brand-copy" data-tauri-drag-region>
-        <div className="brand-name" data-tauri-drag-region>易链</div>
+        <div className="brand-title" data-tauri-drag-region>
+          <div className="brand-name" data-tauri-drag-region>易链</div>
+          {displayVersion && <span className="brand-version" title={displayVersion} data-tauri-drag-region>{displayVersion}</span>}
+        </div>
         <div className="brand-sub" data-tauri-drag-region>安全接入中枢</div>
       </div>
     </div>
@@ -736,6 +747,7 @@ function SettingsPanel({
 
           {tab === "updates" && (
             <div className="stack">
+              <InfoRow label="当前版本" value={formatVersion(diagnostics?.app_version) ?? "--"} />
               <div className="update-card">
                 <div className="update-title">
                   {updateVersion ? `发现新版本 ${updateVersion}` : updateMessage ?? "自动检查已启用"}
@@ -856,8 +868,10 @@ function ChangePasswordSheet({
 }
 
 function LoginView({
+  appVersion,
   onLoggedIn,
 }: {
+  appVersion: string | null;
   onLoggedIn: () => void;
 }) {
   const [server, setServer] = useState("https://");
@@ -889,7 +903,7 @@ function LoginView({
   return (
     <div className="app-shell auth-shell" data-state="disconnected" data-tauri-drag-region>
       <header className="appbar" data-tauri-drag-region>
-        <Brand />
+        <Brand version={appVersion} />
         <WindowControls />
       </header>
       <main className="login-content">
