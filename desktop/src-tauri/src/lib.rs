@@ -7,12 +7,15 @@
 
 mod commands;
 mod manager;
+mod observability;
 
 use std::sync::Arc;
 
 use manager::VpnManager;
+#[cfg(target_os = "macos")]
+use tauri::menu::{PredefinedMenuItem, Submenu};
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     Manager, WindowEvent,
 };
@@ -59,7 +62,11 @@ fn sync_tray_state(app: tauri::AppHandle, state: String) {
             "error" => "连接异常",
             _ => "未连接",
         };
-        let suffix = if errored { " · 请查看错误详情" } else { "" };
+        let suffix = if errored {
+            " · 请查看错误详情"
+        } else {
+            ""
+        };
         let _ = ui.tray.set_tooltip(Some(format!("易链 · {label}{suffix}")));
     }
 }
@@ -68,7 +75,10 @@ fn sync_tray_state(app: tauri::AppHandle, state: String) {
 fn spawn_connect(app: &tauri::AppHandle) {
     let mgr = app.state::<Arc<VpnManager>>().inner().clone();
     tauri::async_runtime::spawn(async move {
-        let _ = mgr.connect().await;
+        if let Err(error) = mgr.connect().await {
+            let error = vpn_cli::error::redact_sensitive(&error);
+            tracing::warn!(%error, "托盘连接操作失败");
+        }
     });
 }
 
@@ -76,7 +86,10 @@ fn spawn_connect(app: &tauri::AppHandle) {
 fn spawn_disconnect(app: &tauri::AppHandle) {
     let mgr = app.state::<Arc<VpnManager>>().inner().clone();
     tauri::async_runtime::spawn(async move {
-        let _ = mgr.disconnect().await;
+        if let Err(error) = mgr.disconnect().await {
+            let error = vpn_cli::error::redact_sensitive(&error);
+            tracing::warn!(%error, "托盘断开操作失败");
+        }
     });
 }
 
@@ -101,7 +114,10 @@ fn maybe_elevate() {
     // 当前(非 root)实例的真实用户 uid —— 用它把提权后的 root 实例拉回该用户的 GUI 会话。
     // SAFETY: getuid 无副作用、始终安全。
     let uid = unsafe { libc::getuid() };
-    let exe = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let exe = exe
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     // 经 osascript 弹管理员密码框,以 root 启动自己。**关键**:用 `launchctl asuser <uid>`
     // 在该用户的 GUI(Aqua)会话上下文里启动——否则经 osascript 提权的 root 进程会脱离用户的
     // WindowServer 会话,菜单栏/程序坞图标都不显示、编辑菜单 Cmd+V 也失效。asuser 只改 Mach
@@ -122,9 +138,7 @@ fn maybe_elevate() {
     // 提权被取消或失败(如用户点了「取消」、osascript 出错):**不退出**。保留当前非 root
     // 实例继续运行,让用户至少看到界面;后续 Connect 会在面板内报权限错误,而不是
     // 整个应用静默消失、零反馈(原先无条件 exit(0) 会导致取消提权后应用「打不开」)。
-    eprintln!(
-        "[vpn-desktop] 管理员提权未完成,以非特权模式继续运行;连接将因缺少权限而失败"
-    );
+    eprintln!("[vpn-desktop] 管理员提权未完成,以非特权模式继续运行;连接将因缺少权限而失败");
 }
 
 /// 其它平台 / dev 构建:不在此处运行时自提权。
@@ -135,10 +149,11 @@ fn maybe_elevate() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _diagnostics = observability::init();
     // 必须在创建任何窗口/事件循环之前完成提权(否则会出现两个实例的窗口)。
     maybe_elevate();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
@@ -157,6 +172,8 @@ pub fn run() {
             commands::change_password,
             commands::is_logged_in,
             commands::saved_server,
+            commands::saved_username,
+            commands::diagnostics_info,
             hide_window,
             quit_app,
             sync_tray_state,
@@ -167,7 +184,10 @@ pub fn run() {
             // 的 "wintun.dll" 搜索(由 wg_userspace.rs 处理 VPN_WINTUN_PATH 未设置的情况)。
             #[cfg(target_os = "windows")]
             if let Ok(res) = app.path().resource_dir() {
-                for cand in [res.join("wintun.dll"), res.join("resources").join("wintun.dll")] {
+                for cand in [
+                    res.join("wintun.dll"),
+                    res.join("resources").join("wintun.dll"),
+                ] {
                     if cand.exists() {
                         std::env::set_var("VPN_WINTUN_PATH", &cand);
                         break;
@@ -271,14 +291,26 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|_app_handle, _event| {
-            // 点击程序坞图标时（窗口可能已隐藏）重新唤出窗口。
-            // RunEvent::Reopen 仅 macOS 存在（dock 点击），其它平台无此变体，需 cfg 隔离。
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = _event {
-                show_window(_app_handle);
-            }
-        });
+        .build(tauri::generate_context!());
+
+    let app = match app {
+        Ok(app) => app,
+        Err(error) => {
+            tracing::error!(%error, "构建 Tauri 应用失败");
+            eprintln!("vpn-desktop: 构建应用失败: {error}");
+            return;
+        }
+    };
+
+    app.run(|_app_handle, _event| {
+        // 点击程序坞图标时（窗口可能已隐藏）重新唤出窗口。
+        // RunEvent::Reopen 仅 macOS 存在（dock 点击），其它平台无此变体，需 cfg 隔离。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event {
+            show_window(_app_handle);
+        }
+        if matches!(_event, tauri::RunEvent::Exit) {
+            tracing::info!("桌面客户端正常退出");
+        }
+    });
 }

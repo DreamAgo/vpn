@@ -73,6 +73,69 @@ impl CliError {
             }
         )
     }
+
+    /// 适合持久化日志的错误文本：敏感标记出现时整段遮蔽，并限制长度。
+    pub fn safe_diagnostic(&self) -> String {
+        match self {
+            // 服务端 message 属于不可信任的任意文本；日志只保留固定错误码。
+            CliError::Api { code, .. } => format!("服务端错误 [code={code}]"),
+            other => redact_sensitive(&other.to_string()),
+        }
+    }
+}
+
+/// 对可能来自 panic、服务端响应或第三方库的文本做保守脱敏。
+pub fn redact_sensitive(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    const SENSITIVE: &[&str] = &[
+        "password",
+        "token",
+        "authorization",
+        "bearer",
+        "private_key",
+        "private key",
+        "refresh_token",
+        "access_token",
+        "client_secret",
+        "api_key",
+        "set-cookie",
+        "cookie:",
+        "credential",
+        "secret",
+    ];
+    if SENSITIVE.iter().any(|needle| lower.contains(needle))
+        || contains_url_userinfo(value)
+        || contains_jwt_like_value(value)
+    {
+        return "[REDACTED sensitive diagnostic]".to_string();
+    }
+    value.chars().take(1024).collect()
+}
+
+fn contains_url_userinfo(value: &str) -> bool {
+    let Some((_, after_scheme)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    authority.contains('@')
+}
+
+fn contains_jwt_like_value(value: &str) -> bool {
+    value
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';'))
+        .any(|word| {
+            let segments: Vec<_> = word.split('.').collect();
+            segments.len() == 3
+                && segments.iter().all(|segment| {
+                    segment.len() >= 8
+                        && segment
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                })
+        })
 }
 
 impl From<reqwest::Error> for CliError {
@@ -119,5 +182,29 @@ mod tests {
         assert!(!e2.is_token_expired());
 
         assert!(!CliError::NotLoggedIn.is_token_expired());
+    }
+
+    #[test]
+    fn diagnostic_text_is_redacted_and_bounded() {
+        assert_eq!(
+            redact_sensitive("Authorization: Bearer secret"),
+            "[REDACTED sensitive diagnostic]"
+        );
+        assert_eq!(redact_sensitive("ordinary failure"), "ordinary failure");
+        assert_eq!(
+            redact_sensitive("https://user:pass@example.com/api"),
+            "[REDACTED sensitive diagnostic]"
+        );
+        assert_eq!(
+            redact_sensitive("aaaaaaaa.bbbbbbbb.cccccccc"),
+            "[REDACTED sensitive diagnostic]"
+        );
+        assert_eq!(redact_sensitive(&"x".repeat(2048)).len(), 1024);
+
+        let api_error = CliError::Api {
+            code: 4001,
+            message: "bare-sensitive-value".to_string(),
+        };
+        assert_eq!(api_error.safe_diagnostic(), "服务端错误 [code=4001]");
     }
 }

@@ -75,6 +75,16 @@ cargo tauri build                 # 完整打包(.app/.dmg)
 cd src-tauri && cargo build       # 仅编译 Rust 侧
 ```
 
+GitHub Actions 的 `CI` 工作流会在每次 `main` 推送和 Pull Request 上，用
+Windows、macOS、Linux 原生 runner 分别构建前端并执行桌面 Rust 测试与 Clippy。
+需要可下载的安装包时，在 GitHub Actions 手动运行 `Release`，或推送 `v*` tag：
+
+- Windows：MSI、NSIS 安装器；
+- macOS：Intel 与 Apple Silicon DMG；
+- Linux：amd64/arm64 AppImage 与 deb。
+
+手动运行只把结果保留为 Actions artifacts；`v*` tag 才创建 GitHub Release。
+
 ## Auto Update
 
 桌面端已接入 Tauri updater。应用启动后会静默检查 GitHub Release 中的
@@ -127,4 +137,24 @@ cargo tauri build
   **不**属于仓库根 workspace,故重型 Tauri/webview 依赖不影响其它 crate 的
   `cargo build`/clippy/test;经 `path` 依赖 `vpn-cli` + `vpn-wireguard`。
 - 图标是占位图(`src-tauri/icons/`);用 `cargo tauri icon path/to/icon.png` 换正式图标。
-```
+
+## 日志与故障排查
+
+桌面客户端在 Tauri 初始化前启用本地文件日志，默认记录 INFO 级别；设置
+`RUST_LOG=debug` 可临时增加细节。为避免 HTTP 依赖泄露认证信息，只接受
+`off/error/warn/info/debug/trace` 全局级别且仅启用本项目日志目标。日志按日滚动并保留 7 天，日志系统初始化失败
+不会阻止 VPN 启动，设置页“复制诊断信息”会注明日志目录或失败原因。
+
+- Windows：`%LOCALAPPDATA%\vpn-cli\logs\vpn-desktop.log.YYYY-MM-DD`
+- macOS：本地应用数据目录下的 `vpn-cli/logs/`
+- Linux：`$XDG_DATA_HOME/vpn-cli/logs/`，未设置时通常为
+  `~/.local/share/vpn-cli/logs/`
+
+排查“连接一会后退出”时，先复制设置页诊断信息，再收集退出当天及前一天的
+`vpn-desktop.log.*`。日志记录启动版本/平台、连接阶段、TUN/路由事件、心跳与
+后台任务退出，以及 Rust panic 的线程、位置和回溯。密码、Access/Refresh Token、
+WireGuard 私钥和认证头不得写入日志。
+
+panic hook 只能捕获 Rust panic；操作系统直接终止、断电，以及 WinTun/WebView2
+原生 access violation 可能来不及写出崩溃原因。此时日志末尾仍可用于判断最后成功
+阶段，完整原生崩溃转储需另行启用 Windows Error Reporting/minidump。

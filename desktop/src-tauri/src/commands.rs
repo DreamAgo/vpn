@@ -12,6 +12,7 @@ use vpn_cli::config::CredentialRepo;
 use vpn_cli::ipc::StatusResponse;
 
 use crate::manager::VpnManager;
+use crate::observability::{self, DiagnosticsInfo};
 
 /// Open a file-backed credential repo (most reliable, no keyring prompts).
 fn repo() -> Result<CredentialRepo, String> {
@@ -95,4 +96,21 @@ pub async fn is_logged_in() -> bool {
 #[tauri::command]
 pub async fn saved_server() -> Option<String> {
     repo().ok().and_then(|r| r.server_url().ok().flatten())
+}
+
+/// The currently saved login username, if an active local session and the
+/// optional username key both exist.
+#[tauri::command]
+pub async fn saved_username() -> Result<Option<String>, String> {
+    let repo = repo()?;
+    if repo.refresh_token().map_err(|e| e.to_string())?.is_none() {
+        return Ok(None);
+    }
+    repo.username().map_err(|e| e.to_string())
+}
+
+/// 返回不含凭证与密钥的本地诊断元数据。
+#[tauri::command]
+pub fn diagnostics_info() -> DiagnosticsInfo {
+    observability::diagnostics()
 }

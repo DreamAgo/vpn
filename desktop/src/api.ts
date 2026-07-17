@@ -42,6 +42,14 @@ export interface UpdateProgress {
   total: number | null;
 }
 
+export interface DiagnosticsInfo {
+  app_version: string;
+  os: string;
+  arch: string;
+  log_dir: string | null;
+  log_error: string | null;
+}
+
 let pendingUpdate: Update | null = null;
 const PREVIEW_AUTOSTART_KEY = "yilian-preview-autostart";
 
@@ -63,6 +71,19 @@ function previewStatus(): StatusResponse {
 export function getStatus(): Promise<StatusResponse> {
   if (!isTauriRuntime()) return Promise.resolve(previewStatus());
   return invoke<StatusResponse>("get_status");
+}
+
+export function getDiagnosticsInfo(): Promise<DiagnosticsInfo> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({
+      app_version: "0.1.5",
+      os: "preview",
+      arch: "browser",
+      log_dir: null,
+      log_error: "预览模式不写本地日志",
+    });
+  }
+  return invoke<DiagnosticsInfo>("diagnostics_info");
 }
 
 export function connect(): Promise<void> {
@@ -106,6 +127,11 @@ export function isLoggedIn(): Promise<boolean> {
 export function savedServer(): Promise<string | null> {
   if (!isTauriRuntime()) return Promise.resolve("https://access.example.com");
   return invoke<string | null>("saved_server");
+}
+
+export function savedUsername(): Promise<string | null> {
+  if (!isTauriRuntime()) return Promise.resolve("演示用户");
+  return invoke<string | null>("saved_username");
 }
 
 export function hideWindow(): Promise<void> {

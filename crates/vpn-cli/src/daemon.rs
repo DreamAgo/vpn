@@ -15,6 +15,7 @@
 //! 单测覆盖**纯逻辑**（状态转移、心跳间隔常量、allowed-ips 计算、CIDR 推断）；
 //! 真正建隧道需 root + TUN 设备 + 真实对端，在真机/容器验证。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -263,7 +264,7 @@ pub async fn bring_up_tunnel(
     traffic: Option<SharedState>,
     // 实时路由更新接收端(P1.4);None 时不支持热更新。
     routes_rx: Option<tokio::sync::watch::Receiver<Vec<String>>>,
-) -> CliResult<tokio::task::JoinHandle<()>> {
+) -> CliResult<tokio::task::JoinHandle<CliResult<()>>> {
     let vpn_ip: std::net::Ipv4Addr = params
         .vpn_ip
         .parse()
@@ -363,6 +364,11 @@ pub async fn run_heartbeat(
                 match result {
                     Ok(resp) => {
                         last_rtt_ms = Some(started.elapsed().as_millis() as i64);
+                        tracing::info!(
+                            rtt_ms = last_rtt_ms.unwrap_or_default(),
+                            routes = resp.allowed_routes.len(),
+                            "VPN 心跳成功"
+                        );
                         // P1.4:检测 allowed_routes 变化 → 下发实时路由更新。
                         let mut next_sorted = resp.allowed_routes.clone();
                         next_sorted.sort();
@@ -395,7 +401,7 @@ pub async fn run_heartbeat(
                     // 瞬时网络错误:保持隧道,标记重连,下个 tick 再试。
                     Err(e) => {
                         failures = failures.saturating_add(1);
-                        tracing::warn!(error = %e, failures, "心跳失败,保持隧道并重试");
+                        tracing::warn!(error = %e.safe_diagnostic(), failures, "心跳失败,保持隧道并重试");
                         if let Some(s) = &state {
                             s.set_state(ConnState::Reconnecting, now_unix()).await;
                         }
@@ -405,6 +411,82 @@ pub async fn run_heartbeat(
         }
     }
     Ok(())
+}
+
+/// 同时监督数据面与心跳任务。内部故障广播 shutdown 并进入 Error；主动停止只记录退出。
+pub async fn supervise_connection_tasks(
+    mut forward: tokio::task::JoinHandle<CliResult<()>>,
+    mut heartbeat: tokio::task::JoinHandle<CliResult<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    stop_requested: Arc<AtomicBool>,
+    shared: SharedState,
+) {
+    tokio::select! {
+        result = &mut forward => {
+            let requested = stop_requested.load(Ordering::Acquire);
+            report_connection_task("数据面", result, requested, &shared).await;
+            let _ = shutdown_tx.send(true);
+            await_connection_peer("心跳", &mut heartbeat).await;
+        }
+        result = &mut heartbeat => {
+            let requested = stop_requested.load(Ordering::Acquire);
+            report_connection_task("心跳", result, requested, &shared).await;
+            let _ = shutdown_tx.send(true);
+            await_connection_peer("数据面", &mut forward).await;
+        }
+    }
+}
+
+async fn await_connection_peer(task: &str, handle: &mut tokio::task::JoinHandle<CliResult<()>>) {
+    match handle.await {
+        Ok(Ok(())) => tracing::info!(task, "关联 VPN 任务已停止"),
+        Ok(Err(error)) => {
+            tracing::warn!(task, error = %error.safe_diagnostic(), "关联 VPN 任务返回错误")
+        }
+        Err(error) => {
+            let error = crate::error::redact_sensitive(&error.to_string());
+            tracing::warn!(task, %error, "关联 VPN 任务 panic")
+        }
+    }
+}
+
+async fn report_connection_task(
+    task: &str,
+    result: Result<CliResult<()>, tokio::task::JoinError>,
+    stop_requested: bool,
+    shared: &SharedState,
+) {
+    if stop_requested {
+        match result {
+            Ok(Ok(())) => tracing::info!(task, "VPN 后台任务按请求退出"),
+            Ok(Err(error)) => {
+                tracing::warn!(task, error = %error.safe_diagnostic(), "VPN 后台任务关停时返回错误")
+            }
+            Err(error) => {
+                let error = crate::error::redact_sensitive(&error.to_string());
+                tracing::warn!(task, %error, "VPN 后台任务关停时 panic")
+            }
+        }
+        return;
+    }
+
+    let message = match result {
+        Ok(Ok(())) => format!("{task}任务意外提前退出"),
+        Ok(Err(error)) if error.is_token_expired() => {
+            "已被管理员强制下线,请重新登录后再连接".to_string()
+        }
+        Ok(Err(error)) => format!("{task}任务失败:{}", error.safe_diagnostic()),
+        Err(error) if error.is_panic() => format!(
+            "{task}任务 panic:{}",
+            crate::error::redact_sensitive(&error.to_string())
+        ),
+        Err(error) => format!(
+            "{task}任务异常结束:{}",
+            crate::error::redact_sensitive(&error.to_string())
+        ),
+    };
+    tracing::error!(task, error = %message, "VPN 后台任务异常退出");
+    shared.set_error(message, now_unix()).await;
 }
 
 /// 推断本机 OS 信息字符串（用于 register 的 os_info）。
@@ -447,9 +529,10 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
     let keypair = vpn_wireguard::generate_keypair();
     // 每条活跃连接持有一个心跳任务关停信号；重连/断开时替换或清空。
     let mut active_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
-    // 当前活跃连接的转发任务句柄；重连时等它清完路由再建新隧道，避免删掉新隧道的同 CIDR 路由。
-    let mut active_forward: Option<tokio::task::JoinHandle<()>> = None;
-    while let Some(msg) = ctrl_rx.recv().await {
+    // supervisor 持有转发与心跳任务；重连前必须等它完成路由清理。
+    let mut active_supervisor: Option<tokio::task::JoinHandle<()>> = None;
+    let mut active_stop_requested: Option<Arc<AtomicBool>> = None;
+    'control: while let Some(msg) = ctrl_rx.recv().await {
         match msg {
             ControlMsg::Connect => {
                 state.set_state(ConnState::Connecting, now_unix()).await;
@@ -461,12 +544,30 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         // 把正在工作的隧道毁掉。先发关停信号，再**等待**旧转发任务退出（它会删自己
                         // 加的路由）——否则旧任务的 `route delete` 可能删掉下面新隧道刚加的同 CIDR
                         // 路由，导致重连黑洞；固定 TUN 名也可能因旧设备未释放而 EBUSY。
+                        if let Some(requested) = active_stop_requested.take() {
+                            requested.store(true, Ordering::Release);
+                        }
                         if let Some(tx) = active_shutdown.take() {
                             let _ = tx.send(true);
                         }
-                        if let Some(old) = active_forward.take() {
-                            let _ =
-                                tokio::time::timeout(std::time::Duration::from_secs(3), old).await;
+                        if let Some(mut old) = active_supervisor.take() {
+                            match tokio::time::timeout(Duration::from_secs(5), &mut old).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    let error = crate::error::redact_sensitive(&error.to_string());
+                                    state
+                                        .set_error(format!("旧 VPN 任务异常: {error}"), now_unix())
+                                        .await;
+                                    continue 'control;
+                                }
+                                Err(_) => {
+                                    active_supervisor = Some(old);
+                                    state
+                                        .set_error("旧 VPN 任务停止超时，已阻止重连", now_unix())
+                                        .await;
+                                    continue 'control;
+                                }
+                            }
                         }
                         // 关停信号：隧道转发任务与心跳任务共用，Disconnect 一并停止。
                         let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
@@ -485,21 +586,16 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         )
                         .await
                         {
-                            Ok(task) => {
-                                active_forward = Some(task);
+                            Ok(forward) => {
                                 state.set_vpn_ip(Some(params.vpn_ip.clone())).await;
                                 state.set_state(ConnState::Connected, now_unix()).await;
-                                // 心跳任务在致命错误时需主动拆数据面隧道，故克隆一份关停发送端
-                                // 给它（主关停端仍存 active_shutdown 供 Disconnect 使用）。
-                                let hb_sd_tx = sd_tx.clone();
-                                active_shutdown = Some(sd_tx);
                                 // 启动心跳任务：每 30s 上报，daemon 在线即自动保活。
                                 // 韧性重连:瞬时失败不退出;仅致命错误(强制下线/peer 被删)才退出并置错误态。
                                 let api_hb = api.clone();
                                 let state_hb = state.clone();
                                 let hb_pubkey = keypair.public_key.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = run_heartbeat(
+                                let heartbeat = tokio::spawn(async move {
+                                    run_heartbeat(
                                         api_hb,
                                         None,
                                         Some(hb_pubkey),
@@ -509,19 +605,18 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                                         Some(routes_tx),
                                     )
                                     .await
-                                    {
-                                        // 致命错误：主动停掉数据面转发循环（删路由、关设备），
-                                        // 避免转发任务成孤儿、把已失效隧道的路由继续黑洞流量。
-                                        let _ = hb_sd_tx.send(true);
-                                        tracing::warn!(error = %e, "心跳任务退出，已拆除隧道");
-                                        let msg = if e.is_token_expired() {
-                                            "已被管理员强制下线,请重新登录后再连接".to_string()
-                                        } else {
-                                            format!("连接已断开:{e}")
-                                        };
-                                        state_hb.set_error(msg, now_unix()).await;
-                                    }
                                 });
+                                let stop_requested = Arc::new(AtomicBool::new(false));
+                                let supervisor = tokio::spawn(supervise_connection_tasks(
+                                    forward,
+                                    heartbeat,
+                                    sd_tx.clone(),
+                                    stop_requested.clone(),
+                                    state.clone(),
+                                ));
+                                active_shutdown = Some(sd_tx);
+                                active_stop_requested = Some(stop_requested);
+                                active_supervisor = Some(supervisor);
                                 tracing::info!(vpn_ip = %params.vpn_ip, iface = %config.interface, "已连接，心跳已启动");
                             }
                             Err(e) => {
@@ -536,11 +631,28 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                 }
             }
             ControlMsg::Disconnect => {
+                if let Some(requested) = active_stop_requested.take() {
+                    requested.store(true, Ordering::Release);
+                }
                 if let Some(tx) = active_shutdown.take() {
                     let _ = tx.send(true);
                 }
-                if let Some(old) = active_forward.take() {
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), old).await;
+                if let Some(mut old) = active_supervisor.take() {
+                    match tokio::time::timeout(Duration::from_secs(5), &mut old).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            let error = crate::error::redact_sensitive(&error.to_string());
+                            state
+                                .set_error(format!("VPN 后台任务异常: {error}"), now_unix())
+                                .await;
+                            continue 'control;
+                        }
+                        Err(_) => {
+                            active_supervisor = Some(old);
+                            state.set_error("VPN 后台任务停止超时", now_unix()).await;
+                            continue 'control;
+                        }
+                    }
                 }
                 tear_down_tunnel(&config.interface).await;
                 state.set_state(ConnState::Disconnected, now_unix()).await;
@@ -557,6 +669,34 @@ pub(crate) fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn supervisor_reports_unexpected_completion() {
+        let shared = SharedState::new();
+        report_connection_task("数据面", Ok(Ok(())), false, &shared).await;
+        let status = shared.snapshot().await;
+        assert_eq!(status.state, ConnState::Error);
+        assert_eq!(status.last_error.as_deref(), Some("数据面任务意外提前退出"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_ignores_requested_completion() {
+        let shared = SharedState::new();
+        report_connection_task("数据面", Ok(Ok(())), true, &shared).await;
+        let status = shared.snapshot().await;
+        assert_eq!(status.state, ConnState::Disconnected);
+        assert!(status.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_redacts_panic_payload() {
+        let shared = SharedState::new();
+        let result = tokio::spawn(async { panic!("token=synthetic-secret") }).await;
+        report_connection_task("心跳", result.map(|_| Ok(())), false, &shared).await;
+        let message = shared.snapshot().await.last_error.unwrap();
+        assert!(message.contains("[REDACTED sensitive diagnostic]"));
+        assert!(!message.contains("synthetic-secret"));
+    }
 
     #[test]
     fn heartbeat_interval_is_30s() {
