@@ -1,7 +1,7 @@
 {
   "name": "vpn-desktop",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "description": "VPN Client — Tauri 2 menu-bar desktop GUI front-end for vpn-cli",
   "scripts": {
