@@ -50,6 +50,12 @@ export interface DiagnosticsInfo {
   log_error: string | null;
 }
 
+export interface LogSnapshot {
+  content: string;
+  line_count: number;
+  truncated: boolean;
+}
+
 let pendingUpdate: Update | null = null;
 const PREVIEW_AUTOSTART_KEY = "yilian-preview-autostart";
 
@@ -84,6 +90,38 @@ export function getDiagnosticsInfo(): Promise<DiagnosticsInfo> {
     });
   }
   return invoke<DiagnosticsInfo>("diagnostics_info");
+}
+
+export function readRecentLogs(): Promise<LogSnapshot> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({
+      content: [
+        "2026-07-18T09:42:01 INFO vpn_connection{attempt_id=7}: 读取本地连接凭证 stage=credentials result=succeeded elapsed_ms=2",
+        "2026-07-18T09:42:01 INFO vpn_connection{attempt_id=7}: 节点注册响应已接收 stage=peer_register_request result=succeeded elapsed_ms=84 routes=3",
+        "2026-07-18T09:42:01 INFO vpn_connection{attempt_id=7}: TUN 设备已就绪 stage=tun_open result=succeeded elapsed_ms=12 ifindex=18",
+        "2026-07-18T09:42:01 INFO vpn_connection{attempt_id=7}: 用户态 WireGuard 数据面已就绪，启动转发循环（尚未确认握手） stage=data_plane_ready result=succeeded elapsed_ms=31",
+      ].join("\n"),
+      line_count: 4,
+      truncated: false,
+    });
+  }
+  return withTimeout(invoke<LogSnapshot>("read_recent_logs"), 5000, "读取日志超时");
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 export function connect(): Promise<void> {

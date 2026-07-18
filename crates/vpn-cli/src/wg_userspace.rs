@@ -23,6 +23,7 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use net_route::{Handle, Route};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
+use tracing::Instrument;
 use tun::AbstractDevice;
 
 use crate::daemon::SharedState;
@@ -94,9 +95,21 @@ impl UserspaceTunnel {
         // 增删本地路由(P1.4);None 时不支持热更新。
         routes_rx: Option<watch::Receiver<Vec<String>>>,
     ) -> CliResult<tokio::task::JoinHandle<CliResult<()>>> {
+        let bring_up_started = std::time::Instant::now();
+        tracing::info!(
+            stage = "wireguard_engine",
+            result = "started",
+            "初始化用户态 WireGuard 引擎"
+        );
         // 1) boringtun 状态机：本地私钥 + 服务端公钥。
-        let static_private = StaticSecret::from(decode_key(client_private_key)?);
-        let peer_public = PublicKey::from(decode_key(server_public_key)?);
+        let static_private = StaticSecret::from(decode_key(client_private_key).map_err(|error| {
+            tracing::warn!(stage = "wireguard_engine", result = "failed", elapsed_ms = bring_up_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "初始化客户端 WireGuard 密钥失败");
+            error
+        })?);
+        let peer_public = PublicKey::from(decode_key(server_public_key).map_err(|error| {
+            tracing::warn!(stage = "wireguard_engine", result = "failed", elapsed_ms = bring_up_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "初始化服务端 WireGuard 公钥失败");
+            error
+        })?);
         let tunn = Tunn::new(
             static_private,
             peer_public,
@@ -107,17 +120,49 @@ impl UserspaceTunnel {
         );
 
         // 2) 解析服务端 endpoint（可能得到多个地址 / IPv4+IPv6,稍后逐个尝试连接）。
-        let server_addrs: Vec<SocketAddr> = tokio::net::lookup_host(server_endpoint)
-            .await
-            .map_err(|e| CliError::Other(format!("解析服务端 endpoint 失败: {e}")))?
-            .collect();
+        let endpoint_started = std::time::Instant::now();
+        tracing::info!(
+            stage = "endpoint_resolution",
+            result = "started",
+            "解析 VPN endpoint"
+        );
+        let server_addrs: Vec<SocketAddr> = match tokio::net::lookup_host(server_endpoint).await {
+            Ok(addresses) => addresses.collect(),
+            Err(error) => {
+                tracing::warn!(stage = "endpoint_resolution", result = "failed", elapsed_ms = endpoint_started.elapsed().as_millis(), error = %crate::error::redact_sensitive(&error.to_string()), "解析 VPN endpoint 失败");
+                return Err(CliError::Other(format!(
+                    "解析服务端 endpoint 失败: {error}"
+                )));
+            }
+        };
         if server_addrs.is_empty() {
+            tracing::warn!(
+                stage = "endpoint_resolution",
+                result = "failed",
+                elapsed_ms = endpoint_started.elapsed().as_millis(),
+                reason = "no_addresses",
+                "VPN endpoint 未解析到地址"
+            );
             return Err(CliError::Other(format!(
                 "无法解析 endpoint: {server_endpoint}"
             )));
         }
+        tracing::info!(
+            stage = "endpoint_resolution",
+            result = "succeeded",
+            elapsed_ms = endpoint_started.elapsed().as_millis(),
+            addresses = server_addrs.len(),
+            "VPN endpoint 解析完成"
+        );
 
         // 3) 打开并配置 TUN 设备（地址用子网掩码 → 自动连通 VPN 子网）。
+        let tun_started = std::time::Instant::now();
+        tracing::info!(
+            stage = "tun_open",
+            result = "started",
+            iface,
+            "开始创建 TUN 设备"
+        );
         let mut cfg = tun::Configuration::default();
         cfg.address(vpn_ip)
             .netmask(prefix_to_netmask_v4(subnet_prefix))
@@ -135,16 +180,32 @@ impl UserspaceTunnel {
                 p.wintun_file(dll);
             });
         }
-        let device = tun::create_as_async(&cfg)
-            .map_err(|e| CliError::Other(format!("打开 TUN 设备失败（需 root/管理员）: {e}")))?;
-        let ifindex = device
-            .tun_index()
-            .map_err(|e| CliError::Other(format!("获取 TUN ifindex 失败: {e}")))?
-            as u32;
+        let device = tun::create_as_async(&cfg).map_err(|error| {
+            tracing::warn!(stage = "tun_open", result = "failed", elapsed_ms = tun_started.elapsed().as_millis(), error = %crate::error::redact_sensitive(&error.to_string()), "创建 TUN 设备失败");
+            CliError::Other(format!("打开 TUN 设备失败（需 root/管理员）: {error}"))
+        })?;
+        let ifindex = device.tun_index().map_err(|error| {
+            tracing::warn!(stage = "tun_open", result = "failed", elapsed_ms = tun_started.elapsed().as_millis(), error = %crate::error::redact_sensitive(&error.to_string()), "读取 TUN 设备索引失败");
+            CliError::Other(format!("获取 TUN ifindex 失败: {error}"))
+        })? as u32;
+        tracing::info!(
+            stage = "tun_open",
+            result = "succeeded",
+            elapsed_ms = tun_started.elapsed().as_millis(),
+            ifindex,
+            "TUN 设备已就绪"
+        );
 
         // 4) UDP socket，连到服务端。按解析地址的协议族绑定对应 socket(IPv4→0.0.0.0、
         // IPv6→[::]),逐个尝试直到 connect 成功——避免「只绑 IPv4 socket 却拿到 IPv6 地址」
         // 直接失败,以及首个地址不可达时不回退其余地址。
+        let udp_started = std::time::Instant::now();
+        tracing::info!(
+            stage = "udp_connect",
+            result = "started",
+            candidates = server_addrs.len(),
+            "开始连接 VPN UDP endpoint"
+        );
         let mut udp_connected: Option<(UdpSocket, SocketAddr)> = None;
         let mut last_err: Option<String> = None;
         for addr in &server_addrs {
@@ -165,17 +226,40 @@ impl UserspaceTunnel {
             }
         }
         let (udp, server_addr) = udp_connected.ok_or_else(|| {
+            tracing::warn!(stage = "udp_connect", result = "failed", elapsed_ms = udp_started.elapsed().as_millis(), attempts = server_addrs.len(), error = %crate::error::redact_sensitive(last_err.as_deref().unwrap_or_default()), "连接 VPN UDP endpoint 失败");
             CliError::Other(format!(
                 "连接服务端 UDP 失败（已尝试全部解析地址）: {}",
                 last_err.unwrap_or_default()
             ))
         })?;
+        tracing::info!(
+            stage = "udp_connect",
+            result = "succeeded",
+            elapsed_ms = udp_started.elapsed().as_millis(),
+            address_family = if server_addr.is_ipv6() {
+                "ipv6"
+            } else {
+                "ipv4"
+            },
+            "VPN UDP endpoint 已就绪"
+        );
 
         // 5) 加路由：把所有 allowed_routes（含 VPN 子网）显式指向 TUN 接口。
         // 不能依赖"接口地址自动产生连通路由"——macOS utun 是点对点接口，不会自动生成
         // 子网路由（发往 10.8.0.1 的包会走默认网卡而非隧道）。Linux 上若连通路由已存在，
         // 这里的重复添加只会无害告警。
-        let handle = Handle::new().map_err(|e| CliError::Other(format!("路由句柄失败: {e}")))?;
+        let routes_started = std::time::Instant::now();
+        tracing::info!(
+            stage = "route_apply",
+            result = "started",
+            requested = allowed_routes.len(),
+            "开始应用 VPN 路由"
+        );
+        let requested_routes = allowed_routes.len();
+        let handle = Handle::new().map_err(|error| {
+            tracing::warn!(stage = "route_apply", result = "failed", elapsed_ms = routes_started.elapsed().as_millis(), error = %crate::error::redact_sensitive(&error.to_string()), "创建路由句柄失败");
+            CliError::Other(format!("路由句柄失败: {error}"))
+        })?;
         // 以 (归一化 CIDR 串, Route) 记账,便于后续与心跳下发的新集合做增量 diff。
         let mut added: Vec<(String, Route)> = Vec::new();
         for r in allowed_routes {
@@ -192,31 +276,59 @@ impl UserspaceTunnel {
             let route = Route::new(IpAddr::V4(dest), pfx).with_ifindex(ifindex);
             match handle.add(&route).await {
                 Ok(()) => added.push((r.clone(), route)),
-                Err(e) => tracing::warn!(route = %r, error = %e, "加路由失败（可能已存在）"),
+                Err(e) => tracing::warn!(
+                    stage = "route_apply",
+                    result = "failed",
+                    route = %r,
+                    error = %crate::error::redact_sensitive(&e.to_string()),
+                    "加路由失败（可能已存在）"
+                ),
             }
         }
 
+        let route_result = if added.len() == requested_routes {
+            "succeeded"
+        } else if added.is_empty() && requested_routes > 0 {
+            "failed"
+        } else {
+            "degraded"
+        };
         tracing::info!(
+            stage = "route_apply",
+            result = route_result,
+            elapsed_ms = routes_started.elapsed().as_millis(),
+            requested = requested_routes,
+            applied = added.len(),
+            skipped_or_failed = requested_routes.saturating_sub(added.len()),
+            "VPN 路由应用完成"
+        );
+
+        tracing::info!(
+            stage = "data_plane_ready",
+            result = if route_result == "succeeded" { "succeeded" } else { "degraded" },
+            elapsed_ms = bring_up_started.elapsed().as_millis(),
             iface,
             %vpn_ip,
-            %server_addr,
             routes = added.len(),
-            "用户态 WireGuard 隧道已建立，启动转发循环"
+            "用户态 WireGuard 数据面已就绪，启动转发循环（尚未确认握手）"
         );
 
         // 6) 后台转发任务。返回其 JoinHandle,供上层在重连时等待旧任务清完路由再建新隧道。
-        let task = tokio::spawn(forward_loop(
-            device,
-            udp,
-            tunn,
-            handle,
-            added,
-            ifindex,
-            shutdown,
-            shutdown_tx,
-            traffic,
-            routes_rx,
-        ));
+        let task = tokio::spawn(
+            forward_loop(
+                device,
+                udp,
+                tunn,
+                handle,
+                added,
+                ifindex,
+                shutdown,
+                shutdown_tx,
+                traffic,
+                routes_rx,
+            )
+            .instrument(tracing::Span::current()),
+        );
         Ok(task)
     }
 }
@@ -235,6 +347,12 @@ async fn forward_loop(
     traffic: Option<SharedState>,
     mut routes_rx: Option<watch::Receiver<Vec<String>>>,
 ) -> CliResult<()> {
+    let loop_started = std::time::Instant::now();
+    tracing::info!(
+        stage = "forward_loop",
+        result = "started",
+        "WireGuard 转发循环已启动"
+    );
     // 三个方向各用独立缓冲，避免 select! 多分支对同一缓冲的可变借用冲突。
     let mut tun_read_buf = [0u8; BUF_SIZE];
     let mut enc_buf = [0u8; BUF_SIZE];
@@ -367,9 +485,17 @@ async fn forward_loop(
         }
     }
     if cleanup_failures == 0 {
-        tracing::info!("用户态 WireGuard 转发循环已退出，路由已清理");
+        tracing::info!(
+            stage = "forward_loop",
+            result = "stopped",
+            elapsed_ms = loop_started.elapsed().as_millis(),
+            "用户态 WireGuard 转发循环已退出，路由已清理"
+        );
     } else {
         tracing::warn!(
+            stage = "route_cleanup",
+            result = "partial_failure",
+            elapsed_ms = loop_started.elapsed().as_millis(),
             cleanup_failures,
             "用户态 WireGuard 已退出，但部分路由清理失败"
         );
@@ -440,7 +566,13 @@ async fn apply_route_diff(
                 added.push((d.clone(), route));
                 tracing::info!(route = %d, "allowed_routes 变更:新增路由");
             }
-            Err(e) => tracing::warn!(route = %d, error = %e, "新增路由失败(可能已存在)"),
+            Err(e) => tracing::warn!(
+                stage = "route_update",
+                result = "failed",
+                route = %d,
+                error = %crate::error::redact_sensitive(&e.to_string()),
+                "新增路由失败(可能已存在)"
+            ),
         }
     }
 }

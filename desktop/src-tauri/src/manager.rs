@@ -7,10 +7,12 @@
 //! 代价:开 TUN 设备需要 root/管理员,所以**整个 App 需以特权运行**
 //! (macOS `sudo`、Windows 管理员)。这是单进程方案的固有要求。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{watch, Mutex};
+use tracing::Instrument;
 use vpn_cli::api::ApiClient;
 use vpn_cli::config::{default_device_name, CredentialRepo, DEFAULT_INTERFACE};
 use vpn_cli::daemon::{self, SharedState};
@@ -43,6 +45,8 @@ pub struct VpnManager {
     operation: Mutex<()>,
     /// TUN 接口名。
     iface: String,
+    /// 单调递增的连接尝试编号，仅用于关联本地日志。
+    attempt_seq: AtomicU64,
 }
 
 impl VpnManager {
@@ -56,6 +60,7 @@ impl VpnManager {
             operation: Mutex::new(()),
             iface: std::env::var("VPN_CLI_INTERFACE")
                 .unwrap_or_else(|_| DEFAULT_INTERFACE.to_string()),
+            attempt_seq: AtomicU64::new(0),
         }
     }
 
@@ -66,20 +71,75 @@ impl VpnManager {
 
     /// 建立连接:注册 → 建用户态隧道 → 启动心跳。需特权(开 TUN)。
     pub async fn connect(&self) -> Result<(), String> {
+        let attempt_id = self
+            .attempt_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let started = Instant::now();
+        let span = tracing::info_span!("vpn_connection", attempt_id);
+        let result = self
+            .connect_attempt(attempt_id)
+            .instrument(span.clone())
+            .await;
+        if let Err(error) = &result {
+            let safe = vpn_cli::error::redact_sensitive(error);
+            span.in_scope(|| {
+                tracing::warn!(
+                    stage = "connect",
+                    result = "failed",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %safe,
+                    "VPN 连接尝试失败"
+                );
+            });
+        }
+        result
+    }
+
+    async fn connect_attempt(&self, attempt_id: u64) -> Result<(), String> {
         let _operation = self.operation.lock().await;
-        tracing::info!(iface = %self.iface, "开始建立 VPN 连接");
-        let repo = CredentialRepo::file().map_err(|e| e.to_string())?;
-        let server = repo
-            .server_url()
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "未登录:请先登录".to_string())?;
-        let refresh = repo
-            .refresh_token()
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "未登录:请先登录".to_string())?;
-        let api = Arc::new(ApiClient::new(&server).map_err(|e| e.to_string())?);
+        let connection_started = Instant::now();
+        tracing::info!(attempt_id, iface = %self.iface, stage = "connect", result = "started", "开始建立 VPN 连接");
+
+        let credential_started = Instant::now();
+        tracing::info!(
+            stage = "credentials",
+            result = "started",
+            "读取本地连接凭证"
+        );
+        let repo = CredentialRepo::file().map_err(|error| {
+            let safe = vpn_cli::error::redact_sensitive(&error.to_string());
+            tracing::warn!(stage = "credentials", result = "failed", elapsed_ms = credential_started.elapsed().as_millis(), error = %safe, "打开凭证存储失败");
+            error.to_string()
+        })?;
+        let server = repo.server_url().map_err(|error| {
+            let safe = vpn_cli::error::redact_sensitive(&error.to_string());
+            tracing::warn!(stage = "credentials", result = "failed", elapsed_ms = credential_started.elapsed().as_millis(), error = %safe, "读取服务端配置失败");
+            error.to_string()
+        })?.ok_or_else(|| {
+            tracing::warn!(stage = "credentials", result = "failed", elapsed_ms = credential_started.elapsed().as_millis(), reason = "missing_server", "连接凭证不完整");
+            "未登录:请先登录".to_string()
+        })?;
+        let refresh = repo.refresh_token().map_err(|error| {
+            let safe = vpn_cli::error::redact_sensitive(&error.to_string());
+            tracing::warn!(stage = "credentials", result = "failed", elapsed_ms = credential_started.elapsed().as_millis(), error = %safe, "读取会话凭证失败");
+            error.to_string()
+        })?.ok_or_else(|| {
+            tracing::warn!(stage = "credentials", result = "failed", elapsed_ms = credential_started.elapsed().as_millis(), reason = "missing_session", "连接凭证不完整");
+            "未登录:请先登录".to_string()
+        })?;
+        let api = Arc::new(ApiClient::new(&server).map_err(|error| {
+            tracing::warn!(stage = "credentials", result = "failed", elapsed_ms = credential_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "初始化控制面客户端失败");
+            error.to_string()
+        })?);
         api.set_refresh_token(refresh);
         let device = default_device_name();
+        tracing::info!(
+            stage = "credentials",
+            result = "succeeded",
+            elapsed_ms = credential_started.elapsed().as_millis(),
+            "本地连接凭证已就绪"
+        );
 
         self.shared
             .set_state(ConnState::Connecting, now_unix())
@@ -88,6 +148,12 @@ impl VpnManager {
         // 1) 控制平面:注册取 vpn_ip + allowed_routes + 服务端 endpoint。
         // **先注册再拆旧隧道**:托盘 Connect 始终可点,一次冗余点击叠加瞬时网络/服务端
         // 错误不应毁掉正在工作的连接。注册失败时旧隧道原封不动。
+        let register_started = Instant::now();
+        tracing::info!(
+            stage = "register",
+            result = "started",
+            "开始刷新会话并注册 VPN 节点"
+        );
         let params = match tokio::time::timeout(
             CONNECT_TIMEOUT,
             daemon::connect_once(&api, &self.keypair, &device),
@@ -96,13 +162,16 @@ impl VpnManager {
         {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
-                tracing::warn!(error = %e.safe_diagnostic(), "注册 VPN 节点失败");
+                tracing::warn!(stage = "register", result = "failed", elapsed_ms = register_started.elapsed().as_millis(), error = %e.safe_diagnostic(), "注册 VPN 节点失败");
                 self.shared.set_error(e.to_string(), now_unix()).await;
                 return Err(e.to_string());
             }
             Err(_) => {
                 let error = "注册 VPN 节点超时，请检查网络后重试".to_string();
                 tracing::warn!(
+                    stage = "register",
+                    result = "timeout",
+                    elapsed_ms = register_started.elapsed().as_millis(),
                     timeout_secs = CONNECT_TIMEOUT.as_secs(),
                     "注册 VPN 节点超时"
                 );
@@ -110,19 +179,46 @@ impl VpnManager {
                 return Err(error);
             }
         };
+        tracing::info!(
+            stage = "register",
+            result = "succeeded",
+            elapsed_ms = register_started.elapsed().as_millis(),
+            routes = params.allowed_routes.len(),
+            "VPN 节点注册完成"
+        );
 
         // 注册成功后再停掉旧连接,并**等待**旧转发任务退出(它会删自己加的路由)——否则旧任务
         // 的 route delete 可能删掉下面新隧道刚加的同 CIDR 路由,导致重连黑洞。
+        let cleanup_started = Instant::now();
+        tracing::info!(
+            stage = "previous_connection_cleanup",
+            result = "started",
+            "开始清理旧连接任务"
+        );
         if let Err(error) = self.stop_current("重连替换旧连接").await {
+            tracing::warn!(stage = "previous_connection_cleanup", result = "failed", elapsed_ms = cleanup_started.elapsed().as_millis(), error = %vpn_cli::error::redact_sensitive(&error), "旧连接任务清理失败");
             self.shared.set_error(error.clone(), now_unix()).await;
             return Err(error);
         }
+        tracing::info!(
+            stage = "previous_connection_cleanup",
+            result = "succeeded",
+            elapsed_ms = cleanup_started.elapsed().as_millis(),
+            "旧连接任务清理完成"
+        );
 
         // 2) 数据面:用户态 boringtun 隧道(本进程内开 TUN + 加路由 + 转发循环)。
         let (tx, rx) = watch::channel(false);
         // 实时路由通道(P1.4):心跳检测到 allowed_routes 变化 → 转发循环增量更新路由。
         let init_routes = daemon::effective_allowed_ips(&params);
         let (routes_tx, routes_rx) = watch::channel(init_routes.clone());
+        let data_plane_started = Instant::now();
+        tracing::info!(
+            stage = "data_plane",
+            result = "started",
+            routes = init_routes.len(),
+            "开始准备 VPN 数据面"
+        );
         let forward = match daemon::bring_up_tunnel(
             &self.iface,
             &self.keypair,
@@ -136,7 +232,7 @@ impl VpnManager {
         {
             Ok(t) => t,
             Err(e) => {
-                tracing::error!(error = %e.safe_diagnostic(), "创建 VPN 数据面失败");
+                tracing::error!(stage = "data_plane", result = "failed", elapsed_ms = data_plane_started.elapsed().as_millis(), error = %e.safe_diagnostic(), "创建 VPN 数据面失败");
                 self.shared.set_error(e.to_string(), now_unix()).await;
                 return Err(e.to_string());
             }
@@ -145,7 +241,7 @@ impl VpnManager {
         self.shared
             .set_state(ConnState::Connected, now_unix())
             .await;
-        tracing::info!(vpn_ip = %params.vpn_ip, iface = %self.iface, routes = init_routes.len(), "VPN 连接已建立");
+        tracing::info!(stage = "data_plane", result = "ready", elapsed_ms = data_plane_started.elapsed().as_millis(), vpn_ip = %params.vpn_ip, iface = %self.iface, routes = init_routes.len(), "VPN 数据面任务已启动（尚未确认 WireGuard 握手）");
 
         // 3) 心跳:每 30s 上报,**韧性重连**。网络抖动不拆隧道——run_heartbeat 内部标记
         //    Reconnecting 并重试,boringtun 自动重握手,恢复后回 Connected。只有被管理员
@@ -154,36 +250,49 @@ impl VpnManager {
         let shared = self.shared.clone();
         let hb_state = shared.clone();
         let hb_pubkey = self.keypair.public_key.clone();
-        let heartbeat = tokio::spawn(async move {
-            daemon::run_heartbeat(
-                api_hb,
-                None,
-                Some(hb_pubkey),
-                rx,
-                Some(hb_state),
-                init_routes,
-                Some(routes_tx),
-            )
-            .await
-        });
+        let connection_span = tracing::Span::current();
+        let heartbeat = tokio::spawn(
+            async move {
+                daemon::run_heartbeat(
+                    api_hb,
+                    None,
+                    Some(hb_pubkey),
+                    rx,
+                    Some(hb_state),
+                    init_routes,
+                    Some(routes_tx),
+                )
+                .await
+            }
+            .instrument(connection_span.clone()),
+        );
 
         let stop_requested = Arc::new(AtomicBool::new(false));
         let supervisor_tx = tx.clone();
         let supervisor_stop_requested = stop_requested.clone();
-        let supervisor = tokio::spawn(async move {
-            daemon::supervise_connection_tasks(
-                forward,
-                heartbeat,
-                supervisor_tx,
-                supervisor_stop_requested,
-                shared,
-            )
-            .await;
-        });
+        let supervisor = tokio::spawn(
+            async move {
+                daemon::supervise_connection_tasks(
+                    forward,
+                    heartbeat,
+                    supervisor_tx,
+                    supervisor_stop_requested,
+                    shared,
+                )
+                .await;
+            }
+            .instrument(connection_span),
+        );
         *self.shutdown.lock().await = Some(tx);
         *self.stop_requested.lock().await = Some(stop_requested);
         *self.supervisor.lock().await = Some(supervisor);
 
+        tracing::info!(
+            stage = "connect",
+            result = "running",
+            elapsed_ms = connection_started.elapsed().as_millis(),
+            "VPN 连接后台任务已进入运行状态"
+        );
         Ok(())
     }
 
@@ -202,6 +311,7 @@ impl VpnManager {
     }
 
     async fn stop_current(&self, reason: &str) -> Result<(), String> {
+        let started = Instant::now();
         if let Some(requested) = self.stop_requested.lock().await.take() {
             requested.store(true, Ordering::Release);
         }
@@ -211,14 +321,16 @@ impl VpnManager {
         }
         if let Some(mut task) = self.supervisor.lock().await.take() {
             match tokio::time::timeout(STOP_TIMEOUT, &mut task).await {
-                Ok(Ok(())) => tracing::info!(%reason, "VPN 后台任务已停止"),
+                Ok(Ok(())) => {
+                    tracing::info!(%reason, stage = "task_shutdown", result = "succeeded", elapsed_ms = started.elapsed().as_millis(), "VPN 后台任务已停止")
+                }
                 Ok(Err(error)) => {
                     let error = vpn_cli::error::redact_sensitive(&error.to_string());
-                    tracing::warn!(%reason, %error, "VPN supervisor panic");
+                    tracing::warn!(%reason, stage = "task_shutdown", result = "failed", elapsed_ms = started.elapsed().as_millis(), %error, "VPN supervisor panic");
                     return Err(format!("VPN 后台任务异常: {error}"));
                 }
                 Err(_) => {
-                    tracing::warn!(%reason, timeout_secs = STOP_TIMEOUT.as_secs(), "VPN 后台任务停止超时，保留旧任务并阻止重连");
+                    tracing::warn!(%reason, stage = "task_shutdown", result = "timeout", elapsed_ms = started.elapsed().as_millis(), timeout_secs = STOP_TIMEOUT.as_secs(), "VPN 后台任务停止超时，保留旧任务并阻止重连");
                     *self.supervisor.lock().await = Some(task);
                     return Err("VPN 后台任务停止超时，为避免路由冲突已阻止重连".to_string());
                 }

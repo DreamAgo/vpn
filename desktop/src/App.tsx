@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ConnState,
   DiagnosticsInfo,
+  LogSnapshot,
   StatusResponse,
   changePassword,
   checkForUpdate,
@@ -17,6 +18,7 @@ import {
   logout,
   notify,
   quitApp,
+  readRecentLogs,
   savedServer,
   savedUsername,
   setLaunchOnStartup,
@@ -63,6 +65,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("connection");
   const [showChangePwd, setShowChangePwd] = useState(false);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
@@ -459,6 +462,10 @@ export default function App() {
           diagnostics={diagnostics}
           backendUnavailable={backendUnavailable}
           onRefresh={refresh}
+          onOpenLogs={() => {
+            setShowSettings(false);
+            setShowLogs(true);
+          }}
           onCheckUpdates={() => checkUpdates(true)}
           onInstallUpdate={onInstallUpdate}
           onToggleLaunchOnStartup={onToggleLaunchOnStartup}
@@ -470,6 +477,8 @@ export default function App() {
           onQuit={onQuit}
         />
       )}
+
+      {showLogs && <LogViewer onClose={() => setShowLogs(false)} />}
 
       {showChangePwd && (
         <ChangePasswordSheet
@@ -616,6 +625,7 @@ function SettingsPanel({
   diagnostics,
   backendUnavailable,
   onRefresh,
+  onOpenLogs,
   onCheckUpdates,
   onInstallUpdate,
   onToggleLaunchOnStartup,
@@ -642,6 +652,7 @@ function SettingsPanel({
   diagnostics: DiagnosticsInfo | null;
   backendUnavailable: boolean;
   onRefresh: () => void;
+  onOpenLogs: () => void;
   onCheckUpdates: () => void;
   onInstallUpdate: () => void;
   onToggleLaunchOnStartup: (enabled: boolean) => void;
@@ -722,9 +733,12 @@ function SettingsPanel({
                 <button className="secondary-action compact" onClick={copyDiagnostics}>
                   复制诊断信息
                 </button>
+                <button className="secondary-action compact" onClick={onOpenLogs}>
+                  查看详细日志
+                </button>
               </div>
               <div className="inline-card">
-                <div className="inline-title">连接日志</div>
+                <div className="inline-title">近期事件</div>
                 {activity.length > 0 ? (
                   <div className="activity-list">
                     {activity.map((item) => (
@@ -792,6 +806,207 @@ function SettingsPanel({
               </button>
             </div>
           )}
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function LogViewer({ onClose }: { onClose: () => void }) {
+  const [snapshot, setSnapshot] = useState<LogSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [copyMessage, setCopyMessage] = useState<string | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const followTailRef = useRef(true);
+  const requestIdRef = useRef(0);
+  const hasSnapshotRef = useRef(false);
+  const pendingSnapshotRef = useRef<LogSnapshot | null>(null);
+  const inFlightRef = useRef(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  const refreshLogs = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    const requestId = ++requestIdRef.current;
+    setLoading(true);
+    try {
+      const next = await readRecentLogs();
+      if (requestId !== requestIdRef.current) return;
+      if (!followTailRef.current && hasSnapshotRef.current) {
+        pendingSnapshotRef.current = next;
+      } else {
+        pendingSnapshotRef.current = null;
+        setSnapshot(next);
+      }
+      hasSnapshotRef.current = true;
+      setError(null);
+      window.requestAnimationFrame(() => {
+        const viewport = viewportRef.current;
+        if (viewport && followTailRef.current) {
+          viewport.scrollTop = viewport.scrollHeight;
+        }
+      });
+    } catch (reason) {
+      if (requestId !== requestIdRef.current) return;
+      setError(String(reason));
+    } finally {
+      inFlightRef.current = false;
+      if (requestId === requestIdRef.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let timer: number | null = null;
+    const stopPolling = () => {
+      if (timer !== null) window.clearInterval(timer);
+      timer = null;
+    };
+    const syncPolling = () => {
+      stopPolling();
+      if (document.visibilityState !== "visible") return;
+      void refreshLogs();
+      timer = window.setInterval(() => void refreshLogs(), 2000);
+    };
+    syncPolling();
+    document.addEventListener("visibilitychange", syncPolling);
+    return () => {
+      ++requestIdRef.current;
+      stopPolling();
+      document.removeEventListener("visibilitychange", syncPolling);
+    };
+  }, [refreshLogs]);
+
+  useEffect(() => {
+    panelRef.current?.focus();
+    return () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
+
+  const onScroll = () => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const wasFollowing = followTailRef.current;
+    followTailRef.current =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 28;
+    if (!wasFollowing && followTailRef.current && pendingSnapshotRef.current) {
+      const pending = pendingSnapshotRef.current;
+      pendingSnapshotRef.current = null;
+      setSnapshot(pending);
+      window.requestAnimationFrame(() => {
+        const current = viewportRef.current;
+        if (current) current.scrollTop = current.scrollHeight;
+      });
+    }
+  };
+
+  const copyLogs = async () => {
+    const content = snapshot?.content.trim();
+    if (!content) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopyMessage("已复制");
+    } catch {
+      setCopyMessage("复制失败");
+    }
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopyMessage(null);
+      copyTimerRef.current = null;
+    }, 1600);
+  };
+
+  const onDialogKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(
+      panelRef.current?.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      panelRef.current?.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  return (
+    <>
+      <div className="scrim log-scrim" onClick={onClose} />
+      <aside
+        ref={panelRef}
+        className="settings-panel log-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="详细日志"
+        tabIndex={-1}
+        onKeyDown={onDialogKeyDown}
+      >
+        <div className="panel-head">
+          <div>
+            <div className="panel-title">详细日志</div>
+            <div className="panel-sub">每 2 秒自动刷新 · 最多 500 行 / 256 KiB</div>
+          </div>
+          <IconButton title="关闭日志" onClick={onClose}>
+            <CloseIcon />
+          </IconButton>
+        </div>
+
+        <div className="log-toolbar">
+          <span className="log-status">
+            {loading && !snapshot
+              ? "正在读取..."
+              : snapshot
+                ? `${snapshot.line_count} 行${snapshot.truncated ? " · 已截断" : ""}`
+                : "暂无快照"}
+          </span>
+          <div className="log-actions">
+            {copyMessage && <span>{copyMessage}</span>}
+            <button className="text-button" disabled={!snapshot?.content} onClick={copyLogs}>复制</button>
+            <button className="text-button" disabled={loading} onClick={() => void refreshLogs()}>
+              {loading ? "刷新中" : "刷新"}
+            </button>
+          </div>
+        </div>
+
+        {snapshot?.truncated && (
+          <div className="notice log-notice">仅显示近期内容，更早日志已因安全读取上限省略。</div>
+        )}
+        {error && (
+          <div className="inline-card error-card log-error" role="alert">
+            <div className="inline-title">日志读取失败</div>
+            <div className="inline-note">{error}</div>
+            <button className="secondary-action compact" onClick={() => void refreshLogs()}>重试</button>
+          </div>
+        )}
+
+        <div className="log-viewport" ref={viewportRef} onScroll={onScroll}>
+          {snapshot?.content ? (
+            <pre>{snapshot.content}</pre>
+          ) : loading ? (
+            <div className="log-empty">正在读取近期日志...</div>
+          ) : (
+            <div className="log-empty">暂无本地日志。连接后将在这里显示分阶段事件。</div>
+          )}
+        </div>
+        <div className="panel-sub log-footnote">
+          向上滚动时自动跟随会暂停；回到底部后继续跟随新日志。
         </div>
       </aside>
     </>

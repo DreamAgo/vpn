@@ -40,8 +40,8 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-autostart = "2"
 
-# 仅 macOS：双击自提权(geteuid 判断当前是否 root)。
-[target.'cfg(target_os = "macos")'.dependencies]
+# Unix：macOS 双击自提权(geteuid)，以及日志读取时使用 O_NOFOLLOW。
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]

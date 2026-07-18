@@ -113,14 +113,18 @@ pub fn redact_sensitive(value: &str) -> String {
 }
 
 fn contains_url_userinfo(value: &str) -> bool {
-    let Some((_, after_scheme)) = value.split_once("://") else {
-        return false;
-    };
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    authority.contains('@')
+    let mut remaining = value;
+    while let Some((_, after_scheme)) = remaining.split_once("://") {
+        let authority = after_scheme
+            .split(['/', '?', '#', ' '])
+            .next()
+            .unwrap_or_default();
+        if authority.contains('@') {
+            return true;
+        }
+        remaining = after_scheme;
+    }
+    false
 }
 
 fn contains_jwt_like_value(value: &str) -> bool {
@@ -193,6 +197,10 @@ mod tests {
         assert_eq!(redact_sensitive("ordinary failure"), "ordinary failure");
         assert_eq!(
             redact_sensitive("https://user:pass@example.com/api"),
+            "[REDACTED sensitive diagnostic]"
+        );
+        assert_eq!(
+            redact_sensitive("first https://example.com then https://user:pass@example.net/api"),
             "[REDACTED sensitive diagnostic]"
         );
         assert_eq!(

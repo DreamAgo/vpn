@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
@@ -210,9 +210,25 @@ pub async fn connect_once(
     keypair: &vpn_wireguard::WgKeypair,
     device_name: &str,
 ) -> CliResult<TunnelParams> {
+    let started = Instant::now();
     // 1) 确保有可用 access token：优先用 refresh。
     if api.access_token().is_none() {
-        api.refresh().await?;
+        let refresh_started = Instant::now();
+        tracing::info!(
+            stage = "auth_refresh",
+            result = "started",
+            "开始刷新控制面会话"
+        );
+        if let Err(error) = api.refresh().await {
+            tracing::warn!(stage = "auth_refresh", result = "failed", elapsed_ms = refresh_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "刷新控制面会话失败");
+            return Err(error);
+        }
+        tracing::info!(
+            stage = "auth_refresh",
+            result = "succeeded",
+            elapsed_ms = refresh_started.elapsed().as_millis(),
+            "控制面会话刷新完成"
+        );
     }
 
     // 2) 注册 peer，取得 vpn_ip 与服务端信息。
@@ -223,7 +239,26 @@ pub async fn connect_once(
         // 节点健康监控：上报客户端版本。
         client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
-    let resp = api.register_peer(&req).await?;
+    let register_started = Instant::now();
+    tracing::info!(
+        stage = "peer_register_request",
+        result = "started",
+        "发送节点注册请求"
+    );
+    let resp = match api.register_peer(&req).await {
+        Ok(resp) => resp,
+        Err(error) => {
+            tracing::warn!(stage = "peer_register_request", result = "failed", elapsed_ms = register_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "节点注册请求失败");
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        stage = "peer_register_request",
+        result = "succeeded",
+        elapsed_ms = register_started.elapsed().as_millis(),
+        routes = resp.allowed_routes.len(),
+        "节点注册响应已接收"
+    );
 
     // Split-horizon：内网节点可经 `VPN_ENDPOINT_OVERRIDE` 用内网 endpoint 直连，
     // 避开公网 IP 的 NAT 回环；外网节点不设置该变量，用服务端下发的(公网) endpoint。
@@ -232,8 +267,19 @@ pub async fn connect_once(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| resp.server_endpoint.clone());
     if server_endpoint != resp.server_endpoint {
-        tracing::info!(override_endpoint = %server_endpoint, server_endpoint = %resp.server_endpoint, "使用 VPN_ENDPOINT_OVERRIDE 覆盖隧道 endpoint");
+        tracing::info!(
+            stage = "endpoint_select",
+            result = "override",
+            "使用 VPN_ENDPOINT_OVERRIDE 覆盖隧道 endpoint"
+        );
     }
+
+    tracing::info!(
+        stage = "control_plane",
+        result = "succeeded",
+        elapsed_ms = started.elapsed().as_millis(),
+        "连接控制面阶段完成"
+    );
 
     Ok(TunnelParams {
         vpn_ip: resp.vpn_ip.clone(),
@@ -319,6 +365,13 @@ pub async fn run_heartbeat(
     initial_routes: Vec<String>,
     routes_tx: Option<tokio::sync::watch::Sender<Vec<String>>>,
 ) -> CliResult<()> {
+    let loop_started = Instant::now();
+    tracing::info!(
+        stage = "heartbeat_loop",
+        result = "started",
+        interval_secs = HEARTBEAT_INTERVAL_SECS,
+        "VPN 心跳任务已启动"
+    );
     let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     let mut failures: u32 = 0;
     // 节点健康监控：最近一次心跳 RTT + 最近 N 次心跳成败窗口（用于丢包率上报）。
@@ -352,7 +405,7 @@ pub async fn run_heartbeat(
                     rtt_ms: last_rtt_ms,
                     loss_pct,
                 };
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 let result = api.heartbeat(&req).await;
                 if samples.len() >= HEARTBEAT_LOSS_WINDOW {
                     samples.pop_front();
@@ -362,6 +415,9 @@ pub async fn run_heartbeat(
                     Ok(resp) => {
                         last_rtt_ms = Some(started.elapsed().as_millis() as i64);
                         tracing::info!(
+                            stage = "heartbeat",
+                            result = "succeeded",
+                            elapsed_ms = started.elapsed().as_millis(),
                             rtt_ms = last_rtt_ms.unwrap_or_default(),
                             routes = resp.allowed_routes.len(),
                             "VPN 心跳成功"
@@ -394,11 +450,14 @@ pub async fn run_heartbeat(
                     // 致命错误 → 交上层拆隧道、回登录，而非当瞬时错误无限重连、把死隧道挂着黑洞流量：
                     // - token+refresh 都失效（被管理员强制下线）；
                     // - 服务端已无此 peer（被管理员彻底删除）→ PeerNotFound。
-                    Err(e) if e.is_token_expired() || e.is_peer_gone() => return Err(e),
+                    Err(e) if e.is_token_expired() || e.is_peer_gone() => {
+                        tracing::error!(stage = "heartbeat", result = "fatal", elapsed_ms = started.elapsed().as_millis(), error = %e.safe_diagnostic(), "VPN 心跳遇到不可恢复错误");
+                        return Err(e);
+                    }
                     // 瞬时网络错误:保持隧道,标记重连,下个 tick 再试。
                     Err(e) => {
                         failures = failures.saturating_add(1);
-                        tracing::warn!(error = %e.safe_diagnostic(), failures, "心跳失败,保持隧道并重试");
+                        tracing::warn!(stage = "heartbeat", result = "retrying", elapsed_ms = started.elapsed().as_millis(), error = %e.safe_diagnostic(), failures, "心跳失败,保持隧道并重试");
                         if let Some(s) = &state {
                             s.set_state(ConnState::Reconnecting, now_unix()).await;
                         }
@@ -407,6 +466,12 @@ pub async fn run_heartbeat(
             }
         }
     }
+    tracing::info!(
+        stage = "heartbeat_loop",
+        result = "stopped",
+        elapsed_ms = loop_started.elapsed().as_millis(),
+        "VPN 心跳任务已退出"
+    );
     Ok(())
 }
 

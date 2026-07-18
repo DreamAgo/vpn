@@ -533,6 +533,106 @@ button:disabled {
   bottom: auto;
 }
 
+.log-scrim {
+  z-index: 12;
+}
+
+.log-panel {
+  z-index: 13;
+  top: 10px;
+  right: 10px;
+  bottom: 10px;
+  left: 10px;
+  max-height: none;
+  gap: 10px;
+}
+
+.log-toolbar {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.log-status {
+  min-width: 0;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--success);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.log-actions .text-button {
+  height: 30px;
+  padding: 0 10px;
+}
+
+.log-notice {
+  padding: 7px 9px;
+  font-size: 10px;
+}
+
+.log-error {
+  flex: none;
+  padding: 10px;
+}
+
+.log-viewport {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  background: #0f172a;
+  -webkit-user-select: text;
+  user-select: text;
+  overscroll-behavior: contain;
+}
+
+.log-viewport pre {
+  min-width: 100%;
+  margin: 0;
+  padding: 12px;
+  color: #dbeafe;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.log-empty {
+  min-height: 100%;
+  padding: 20px 14px;
+  display: grid;
+  place-items: center;
+  color: #94a3b8;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.log-footnote {
+  flex: none;
+  text-align: center;
+}
+
 .panel-head {
   display: flex;
   align-items: center;

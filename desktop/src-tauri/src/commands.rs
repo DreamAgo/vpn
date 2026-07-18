@@ -12,7 +12,7 @@ use vpn_cli::config::CredentialRepo;
 use vpn_cli::ipc::StatusResponse;
 
 use crate::manager::VpnManager;
-use crate::observability::{self, DiagnosticsInfo};
+use crate::observability::{self, DiagnosticsInfo, LogSnapshot};
 
 /// Open a file-backed credential repo (most reliable, no keyring prompts).
 fn repo() -> Result<CredentialRepo, String> {
@@ -112,4 +112,12 @@ pub async fn saved_username() -> Result<Option<String>, String> {
 #[tauri::command]
 pub fn diagnostics_info() -> DiagnosticsInfo {
     observability::diagnostics()
+}
+
+/// 返回固定日志目录中有界且二次脱敏的近期日志。
+#[tauri::command]
+pub async fn read_recent_logs() -> Result<LogSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(observability::recent_logs)
+        .await
+        .map_err(|error| format!("读取日志任务失败: {error}"))?
 }

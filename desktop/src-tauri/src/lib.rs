@@ -174,6 +174,7 @@ pub fn run() {
             commands::saved_server,
             commands::saved_username,
             commands::diagnostics_info,
+            commands::read_recent_logs,
             hide_window,
             quit_app,
             sync_tray_state,
