@@ -66,6 +66,35 @@ pub async fn openapi_json() -> Json<Value> {
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
                 }
             },
+            "/api/v1/auth/feishu/config": {
+                "get": {
+                    "tags": ["Auth"], "summary": "探测飞书登录是否可用", "security": [],
+                    "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+                }
+            },
+            "/api/v1/auth/feishu/start": {
+                "post": {
+                    "tags": ["Auth"], "summary": "发起飞书 OAuth 登录", "security": [],
+                    "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+                }
+            },
+            "/api/v1/auth/feishu/callback": {
+                "get": {
+                    "tags": ["Auth"], "summary": "飞书 OAuth 固定服务端回调", "security": [],
+                    "parameters": [
+                        { "name": "state", "in": "query", "required": true, "schema": { "type": "string" } },
+                        { "name": "code", "in": "query", "schema": { "type": "string" } },
+                        { "name": "error", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": { "200": { "description": "不含 token 的授权结果 HTML" } }
+                }
+            },
+            "/api/v1/auth/feishu/poll": {
+                "post": {
+                    "tags": ["Auth"], "summary": "一次性领取飞书登录结果", "security": [],
+                    "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+                }
+            },
             "/api/v1/auth/refresh": {
                 "post": {
                     "tags": ["Auth"],

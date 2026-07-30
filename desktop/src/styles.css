@@ -891,6 +891,26 @@ button:disabled {
   font-size: 13px;
 }
 
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: var(--line);
+}
+
+.feishu-login {
+  width: 100%;
+}
+
 .field {
   display: flex;
   flex-direction: column;

@@ -2,6 +2,8 @@
 
 use chrono::Utc;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use vpn_core::{AppError, Result};
 
 /// 用户列表查询过滤条件（已归一化：page/page_size 已套用默认值，order_by 已白名单校验）。
@@ -112,11 +114,15 @@ pub struct UserRow {
 #[derive(Debug, Clone)]
 pub struct SqliteUserRepository {
     pool: SqlitePool,
+    external_identity_lock: Arc<Mutex<()>>,
 }
 
 impl SqliteUserRepository {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            external_identity_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn count_admins(&self) -> Result<i64> {
@@ -141,6 +147,25 @@ impl SqliteUserRepository {
         Ok(row.map(UserRow::from))
     }
 
+    pub async fn find_by_external_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<UserRow>> {
+        let id: Option<(String,)> = sqlx::query_as(
+            "SELECT user_id FROM external_identities WHERE provider = ?1 AND subject = ?2",
+        )
+        .bind(provider)
+        .bind(subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+        match id {
+            Some((id,)) => self.find_by_id(&id).await,
+            None => Ok(None),
+        }
+    }
+
     pub async fn find_by_id(&self, id: &str) -> Result<Option<UserRow>> {
         let row: Option<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
@@ -153,6 +178,143 @@ impl SqliteUserRepository {
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(row.map(UserRow::from))
+    }
+
+    pub async fn find_by_email(&self, email: &str) -> Result<Option<UserRow>> {
+        let rows: Vec<UserRowTuple> = sqlx::query_as(
+            r#"SELECT id, username, email, password_hash, role, status, must_change_password,
+                      last_login_at, created_at, updated_at, max_devices,
+                      (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id)
+               FROM users WHERE email = ?1 COLLATE NOCASE"#,
+        )
+        .bind(email)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+        match rows.len() {
+            0 => Ok(None),
+            1 => Ok(rows.into_iter().next().map(UserRow::from)),
+            _ => Err(AppError::DuplicateResource(
+                "存在多个大小写不同但等价的邮箱账号".to_string(),
+            )),
+        }
+    }
+
+    /// 解析外部身份；首次登录时按邮箱绑定，找不到则在同一事务创建受限普通账号。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_external_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        email: &str,
+        preferred_username: &str,
+        username_suffix: &str,
+        user_id: &str,
+        password_hash: &str,
+    ) -> Result<UserRow> {
+        // SQLite 单写者模型下主动串行化本进程的首次绑定，避免并发首次登录退化为
+        // SQLITE_BUSY；数据库唯一约束仍负责跨进程冲突的最终保护。
+        let _guard = self.external_identity_lock.lock().await;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        let existing_id: Option<(String,)> = sqlx::query_as(
+            "SELECT user_id FROM external_identities WHERE provider = ?1 AND subject = ?2",
+        )
+        .bind(provider)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+
+        let resolved_id = if let Some((id,)) = existing_id {
+            id
+        } else {
+            let email_users: Vec<(String, String)> =
+                sqlx::query_as("SELECT id, status FROM users WHERE email = ?1 COLLATE NOCASE")
+                    .bind(email)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(Box::new(e)))?;
+            if email_users.len() > 1 {
+                return Err(AppError::DuplicateResource(
+                    "存在多个大小写不同但等价的邮箱账号".to_string(),
+                ));
+            }
+            let id = if let Some((id, status)) = email_users.into_iter().next() {
+                if status == "disabled" {
+                    return Err(AppError::AccountDisabled);
+                }
+                id
+            } else {
+                let candidates = std::iter::once(preferred_username.to_string())
+                    .chain(std::iter::once(format!(
+                        "{preferred_username}-{username_suffix}"
+                    )))
+                    .chain(
+                        (2_u32..10_000)
+                            .map(|n| format!("{preferred_username}-{username_suffix}-{n}")),
+                    );
+                let mut username = None;
+                for candidate in candidates {
+                    let taken: (i64,) =
+                        sqlx::query_as("SELECT COUNT(*) FROM users WHERE username = ?1")
+                            .bind(&candidate)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .map_err(|e| AppError::Database(Box::new(e)))?;
+                    if taken.0 == 0 {
+                        username = Some(candidate);
+                        break;
+                    }
+                }
+                let username =
+                    username.ok_or_else(|| AppError::DuplicateResource("用户名".to_string()))?;
+                let now = Utc::now().timestamp_millis();
+                sqlx::query(
+                    r#"INSERT INTO users (id, username, email, password_hash, role, status,
+                       must_change_password, max_devices, created_at, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, 'user', 'active', 0, 1, ?5, ?5)"#,
+                )
+                .bind(user_id)
+                .bind(username)
+                .bind(email)
+                .bind(password_hash)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| match e {
+                    sqlx::Error::Database(ref d) if d.is_unique_violation() => {
+                        AppError::DuplicateResource("用户名、邮箱或飞书身份".to_string())
+                    }
+                    other => AppError::Database(Box::new(other)),
+                })?;
+                user_id.to_string()
+            };
+            sqlx::query(
+                "INSERT INTO external_identities (provider, subject, user_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(provider)
+            .bind(subject)
+            .bind(&id)
+            .bind(Utc::now().timestamp_millis())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref d) if d.is_unique_violation() =>
+                    AppError::DuplicateResource("飞书身份".to_string()),
+                other => AppError::Database(Box::new(other)),
+            })?;
+            id
+        };
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        self.find_by_id(&resolved_id)
+            .await?
+            .ok_or(AppError::UserNotFound)
     }
 
     /// 插入新用户。username/email 冲突返回 DuplicateResource。
@@ -442,6 +604,174 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::DuplicateResource(_)));
+    }
+
+    #[tokio::test]
+    async fn external_identity_creates_restricted_user_and_is_idempotent() {
+        let pool = setup_pool().await;
+        let repo = SqliteUserRepository::new(pool);
+        let created = repo
+            .resolve_external_identity(
+                "feishu",
+                "subject-1",
+                "new@example.com",
+                "new",
+                "abcd1234",
+                "u-new",
+                "random-hash",
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.role, "user");
+        assert_eq!(created.max_devices, 1);
+        assert!(created.group_ids.is_empty());
+        assert!(!created.must_change_password);
+
+        let again = repo
+            .resolve_external_identity(
+                "feishu",
+                "subject-1",
+                "changed@example.com",
+                "changed",
+                "abcd1234",
+                "ignored",
+                "ignored",
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.id, created.id);
+        assert_eq!(again.email, "new@example.com");
+    }
+
+    #[tokio::test]
+    async fn external_identity_binds_existing_email_and_rejects_identity_conflict() {
+        let pool = setup_pool().await;
+        let repo = SqliteUserRepository::new(pool);
+        repo.insert("u1", "alice", "Alice@Example.com", "hash", "user", false, 1)
+            .await
+            .unwrap();
+        let bound = repo
+            .resolve_external_identity(
+                "feishu",
+                "subject-1",
+                "alice@example.com",
+                "alice",
+                "11111111",
+                "unused",
+                "hash",
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.id, "u1");
+
+        let error = repo
+            .resolve_external_identity(
+                "feishu",
+                "subject-2",
+                "alice@example.com",
+                "alice",
+                "22222222",
+                "unused2",
+                "hash",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::DuplicateResource(_)));
+    }
+
+    #[tokio::test]
+    async fn external_identity_uses_subject_suffix_for_username_conflict() {
+        let pool = setup_pool().await;
+        let repo = SqliteUserRepository::new(pool);
+        repo.insert("u1", "alice", "other@example.com", "hash", "user", false, 1)
+            .await
+            .unwrap();
+        repo.insert(
+            "u-existing-suffix",
+            "alice-1234abcd",
+            "suffix@example.com",
+            "hash",
+            "user",
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        let created = repo
+            .resolve_external_identity(
+                "feishu",
+                "subject-1",
+                "alice@example.com",
+                "alice",
+                "1234abcd",
+                "u2",
+                "hash",
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.username, "alice-1234abcd-2");
+    }
+
+    #[tokio::test]
+    async fn case_insensitive_duplicate_emails_are_rejected() {
+        let pool = setup_pool().await;
+        let repo = SqliteUserRepository::new(pool);
+        repo.insert("u1", "alice1", "Alice@example.com", "h", "user", false, 1)
+            .await
+            .unwrap();
+        repo.insert("u2", "alice2", "alice@EXAMPLE.com", "h", "user", false, 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.find_by_email("alice@example.com").await,
+            Err(AppError::DuplicateResource(_))
+        ));
+        assert!(matches!(
+            repo.resolve_external_identity(
+                "feishu",
+                "subject",
+                "alice@example.com",
+                "alice",
+                "abcd1234",
+                "u3",
+                "h"
+            )
+            .await,
+            Err(AppError::DuplicateResource(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_external_identity_resolution_does_not_duplicate_user() {
+        let pool = setup_pool().await;
+        let first = SqliteUserRepository::new(pool.clone());
+        let second = first.clone();
+        let a = first.resolve_external_identity(
+            "feishu",
+            "same-subject",
+            "same@example.com",
+            "same",
+            "11111111",
+            "u1",
+            "h1",
+        );
+        let b = second.resolve_external_identity(
+            "feishu",
+            "same-subject",
+            "same@example.com",
+            "same",
+            "11111111",
+            "u2",
+            "h2",
+        );
+        let (a, b) = tokio::join!(a, b);
+        assert_eq!(a.unwrap().id, b.unwrap().id);
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE email = 'same@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1);
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@
     "core:window:allow-start-dragging",
     "core:event:default",
     "core:app:default",
-    "shell:allow-open",
+    "opener:allow-open-url",
     "notification:default",
     "process:default",
     "updater:default",

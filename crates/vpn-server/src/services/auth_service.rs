@@ -34,6 +34,27 @@ pub struct LoginOutcome {
 }
 
 impl AuthService {
+    /// 已验证的外部身份签发本站会话。
+    pub async fn login_user(
+        &self,
+        user: UserRow,
+        ip: Option<&str>,
+        ua: Option<&str>,
+    ) -> Result<LoginOutcome> {
+        if user.status == "disabled" {
+            return Err(AppError::AccountDisabled);
+        }
+        self.user_repo.update_last_login(&user.id).await?;
+        let access = self.issuer.issue_access(&user.id, &user.role).await?;
+        let refresh = self.issuer.issue_refresh(&user.id).await?;
+        self.persist_session(&user.id, &refresh, ip, ua).await?;
+        Ok(LoginOutcome {
+            user,
+            access_token: access,
+            refresh_token: refresh,
+        })
+    }
+
     /// 创建首位 admin（first-time-setup）。
     ///
     /// 仅当 users 表无 admin 时可调用。
@@ -96,15 +117,7 @@ impl AuthService {
 
         // 登录成功
         self.login_attempts.reset(username).await;
-        self.user_repo.update_last_login(&user.id).await?;
-        let access = self.issuer.issue_access(&user.id, &user.role).await?;
-        let refresh = self.issuer.issue_refresh(&user.id).await?;
-        self.persist_session(&user.id, &refresh, ip, ua).await?;
-        Ok(LoginOutcome {
-            user,
-            access_token: access,
-            refresh_token: refresh,
-        })
+        self.login_user(user, ip, ua).await
     }
 
     /// 用 Refresh Token 换取新 Access Token。

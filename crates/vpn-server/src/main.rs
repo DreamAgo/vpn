@@ -17,8 +17,9 @@ use vpn_server::{
     },
     services::{
         build_peer_service_with_backend, domain_event_service, ApiKeyService, Argon2Hasher,
-        AuditService, AuthService, ConfigService, DomainEventService, JwtTokenIssuer,
-        NotificationService, PeerService, SubnetService, UserGroupService, UserService,
+        AuditService, AuthService, ConfigService, DomainEventService, FeishuAuthService,
+        JwtTokenIssuer, NotificationService, PeerService, ReqwestFeishuIdentityProvider,
+        SubnetService, UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -81,6 +82,16 @@ async fn main() -> anyhow::Result<()> {
         issuer,
         login_attempts: LoginAttempts::new(),
     });
+    let feishu_auth_service = if config.feishu.enabled() {
+        Some(Arc::new(FeishuAuthService::new(
+            config.feishu.clone(),
+            Arc::new(ReqwestFeishuIdentityProvider::new(config.feishu.clone())?),
+            auth_service.user_repo.clone(),
+            auth_service.clone(),
+        )))
+    } else {
+        None
+    };
     let api_key_service = Arc::new(ApiKeyService::new(SqliteApiKeyRepository::new(
         pool.clone(),
     )));
@@ -137,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_audit_cleanup(audit_service.clone(), config.audit_retention_days);
 
     // 构造 AppState + Router
-    let state = AppState::new()
+    let mut state = AppState::new()
         .with_auth_service(auth_service)
         .with_api_key_service(api_key_service)
         .with_user_service(user_service)
@@ -149,6 +160,9 @@ async fn main() -> anyhow::Result<()> {
         .with_domain_event_service(domain_event_service)
         .with_notification_service(notification_service)
         .with_db_pool(pool.clone());
+    if let Some(service) = feishu_auth_service {
+        state = state.with_feishu_auth_service(service);
+    }
     let app = build_router(state);
 
     // 监听端口

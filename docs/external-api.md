@@ -18,6 +18,10 @@ GET /api/v1/openapi.json
 - `POST /api/v1/auth/first-time-setup`
 - `POST /api/v1/auth/login`
 - `POST /api/v1/auth/refresh`
+- `GET /api/v1/auth/feishu/config`
+- `POST /api/v1/auth/feishu/start`
+- `GET /api/v1/auth/feishu/callback`
+- `POST /api/v1/auth/feishu/poll`
 
 请求头格式：
 
@@ -45,6 +49,20 @@ API Key 只在创建时返回一次明文，服务端只保存哈希。
 2. 调用业务接口时使用 `access_token`
 3. access token 过期后调用 `POST /api/v1/auth/refresh`
 4. 退出登录时调用 `POST /api/v1/auth/logout`
+
+### 飞书 OAuth
+
+服务端配置以下三个环境变量后启用：
+
+- `VPN_FEISHU_APP_ID`
+- `VPN_FEISHU_APP_SECRET`（仅存服务端，禁止写入客户端配置或日志）
+- `VPN_FEISHU_REDIRECT_URI`（必须为 HTTPS，例如 `https://vpn.example.com/api/v1/auth/feishu/callback`）
+
+飞书开放平台中必须把 `VPN_FEISHU_REDIRECT_URI` 原样加入 OAuth 回调白名单，并为应用开通用户基础信息和邮箱只读权限（`contact:user.base:readonly`、`contact:user.email:readonly`）。
+
+服务端只接受非空 `union_id` 作为稳定身份主键；邮箱会去除首尾空白并转为小写。缺少 `union_id`、邮箱非法或大小写不敏感匹配到多个历史账号时，登录会被拒绝并要求管理员先清理账号数据。
+
+桌面流程：先调用 `config` 探测，再调用 `start` 得到浏览器授权地址和高熵 `poll_token`；浏览器完成固定服务端 `callback` 后，客户端调用 `poll`。pending 时继续短轮询，complete 时只可领取一次现有格式的登录凭证。state、授权码、完成结果、失败结果和过期结果都不可重放，回调 HTML 永不包含 token。
 
 ## 响应格式
 

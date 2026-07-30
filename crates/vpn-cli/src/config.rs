@@ -68,6 +68,8 @@ impl CredentialRepo {
         self.store.save(KEY_REFRESH_TOKEN, refresh_token)?;
         if let Some(u) = username {
             self.store.save(KEY_USERNAME, u)?;
+        } else {
+            let _ = self.store.delete(KEY_USERNAME);
         }
         let _ = self.store.delete(LEGACY_KEY_ROUTES);
         Ok(())
@@ -158,6 +160,25 @@ mod tests {
         );
         assert_eq!(repo.refresh_token().unwrap(), Some("rtk-123".to_string()));
         assert_eq!(repo.username().unwrap(), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn later_login_replaces_or_clears_previous_username() {
+        let dir = tempdir().unwrap();
+        let repo = file_repo(dir.path());
+        repo.save_login("https://vpn.example.com", "password-token", Some("alice"))
+            .unwrap();
+        repo.save_login("https://vpn.example.com", "feishu-token", Some("bob"))
+            .unwrap();
+        assert_eq!(repo.username().unwrap().as_deref(), Some("bob"));
+        assert_eq!(
+            repo.refresh_token().unwrap().as_deref(),
+            Some("feishu-token")
+        );
+
+        repo.save_login("https://vpn.example.com", "anonymous-token", None)
+            .unwrap();
+        assert_eq!(repo.username().unwrap(), None);
     }
 
     #[test]

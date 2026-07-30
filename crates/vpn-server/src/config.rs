@@ -39,6 +39,29 @@ pub struct ServerConfig {
     pub server_routes: Vec<String>,
     /// 事件通知配置（SMTP 邮件）。
     pub notifications: NotificationConfig,
+    /// 飞书 OAuth。三项同时存在时启用。
+    pub feishu: FeishuConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FeishuConfig {
+    pub app_id: Option<String>,
+    pub app_secret: Option<String>,
+    pub redirect_uri: Option<String>,
+}
+
+impl FeishuConfig {
+    pub fn enabled(&self) -> bool {
+        self.app_id.as_deref().is_some_and(|v| !v.trim().is_empty())
+            && self
+                .app_secret
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty())
+            && self
+                .redirect_uri
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +140,19 @@ impl ServerConfig {
                 })
                 .unwrap_or_default(),
         };
+        let feishu = FeishuConfig {
+            app_id: env::var("VPN_FEISHU_APP_ID").ok(),
+            app_secret: env::var("VPN_FEISHU_APP_SECRET").ok(),
+            redirect_uri: env::var("VPN_FEISHU_REDIRECT_URI").ok(),
+        };
+
+        if feishu.enabled() {
+            if let Some(uri) = feishu.redirect_uri.as_deref() {
+                if !uri.trim().starts_with("https://") {
+                    anyhow::bail!("VPN_FEISHU_REDIRECT_URI 必须使用 HTTPS");
+                }
+            }
+        }
 
         Ok(Self {
             bind_addr,
@@ -132,6 +168,7 @@ impl ServerConfig {
             wg_interface,
             server_routes,
             notifications,
+            feishu,
         })
     }
 }
@@ -172,5 +209,25 @@ mod tests {
         assert_eq!(cfg.audit_retention_days, 180);
         assert_eq!(cfg.wg_backend, "noop");
         assert_eq!(cfg.wg_interface, "wg0");
+    }
+
+    #[test]
+    fn feishu_config_requires_three_non_blank_values() {
+        let complete = FeishuConfig {
+            app_id: Some("app".into()),
+            app_secret: Some("secret".into()),
+            redirect_uri: Some("https://vpn.example.com/callback".into()),
+        };
+        assert!(complete.enabled());
+        assert!(!FeishuConfig {
+            app_id: Some("   ".into()),
+            ..complete.clone()
+        }
+        .enabled());
+        assert!(!FeishuConfig {
+            app_secret: None,
+            ..complete
+        }
+        .enabled());
     }
 }

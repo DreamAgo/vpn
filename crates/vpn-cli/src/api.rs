@@ -18,8 +18,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use vpn_api_types::{
     auth::{
-        ChangePasswordRequest, LoginRequest, LoginResponse, LogoutRequest, RefreshRequest,
-        RefreshResponse,
+        ChangePasswordRequest, FeishuAuthConfigResponse, FeishuAuthPollRequest,
+        FeishuAuthPollResponse, FeishuAuthPollStatus, FeishuAuthStartResponse, LoginRequest,
+        LoginResponse, LogoutRequest, RefreshRequest, RefreshResponse,
     },
     peer::{
         PeerHeartbeatRequest, PeerHeartbeatResponse, PeerRegisterRequest, PeerRegisterResponse,
@@ -132,6 +133,39 @@ impl ApiClient {
             t.refresh_token = Some(resp.refresh_token.clone());
         }
         Ok(resp)
+    }
+
+    pub async fn feishu_config(&self) -> CliResult<FeishuAuthConfigResponse> {
+        let resp = self
+            .http
+            .get(self.url("/api/v1/auth/feishu/config"))
+            .send()
+            .await?;
+        parse_and_unwrap(&resp.text().await?)
+    }
+
+    pub async fn feishu_start(&self) -> CliResult<FeishuAuthStartResponse> {
+        self.post_json_unauthed("/api/v1/auth/feishu/start", &())
+            .await
+    }
+
+    pub async fn feishu_poll(&self, poll_token: &str) -> CliResult<FeishuAuthPollResponse> {
+        let response: FeishuAuthPollResponse = self
+            .post_json_unauthed(
+                "/api/v1/auth/feishu/poll",
+                &FeishuAuthPollRequest {
+                    poll_token: poll_token.to_string(),
+                },
+            )
+            .await?;
+        if matches!(response.status, FeishuAuthPollStatus::Complete) {
+            if let Some(login) = &response.login {
+                let mut tokens = self.tokens.lock().unwrap();
+                tokens.access_token = Some(login.access_token.clone());
+                tokens.refresh_token = Some(login.refresh_token.clone());
+            }
+        }
+        Ok(response)
     }
 
     /// 修改当前登录用户的密码（需已认证）。成功后旧密码立即失效。

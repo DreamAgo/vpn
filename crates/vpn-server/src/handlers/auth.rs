@@ -7,11 +7,19 @@
 //! - POST /api/v1/auth/change-password
 //! - POST /api/v1/auth/first-time-setup
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::{Query, State},
+    http::HeaderMap,
+    response::Html,
+    Json,
+};
+use serde::Deserialize;
 use vpn_api_types::{
     auth::{
-        ChangePasswordRequest, FirstTimeSetupRequest, FirstTimeSetupResponse, LoginRequest,
-        LoginResponse, LogoutRequest, RefreshRequest, RefreshResponse, SetupStatusResponse,
+        ChangePasswordRequest, FeishuAuthConfigResponse, FeishuAuthPollRequest,
+        FeishuAuthPollResponse, FeishuAuthStartResponse, FirstTimeSetupRequest,
+        FirstTimeSetupResponse, LoginRequest, LoginResponse, LogoutRequest, RefreshRequest,
+        RefreshResponse, SetupStatusResponse,
     },
     ApiResponse,
 };
@@ -37,6 +45,92 @@ fn success<T: serde::Serialize>(state: &AppState, data: T) -> Json<ApiResponse<T
         "n/a".to_string(),
         state.clock.now_unix_ms(),
     ))
+}
+
+#[tracing::instrument(skip(state))]
+pub async fn feishu_config(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<FeishuAuthConfigResponse>> {
+    let enabled = state
+        .feishu_auth_service
+        .as_ref()
+        .is_some_and(|svc| svc.enabled());
+    success(&state, FeishuAuthConfigResponse { enabled })
+}
+
+#[tracing::instrument(skip(state))]
+pub async fn feishu_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<FeishuAuthStartResponse>>, ApiError> {
+    let (ip, _) = extract_client_info(&headers);
+    let response = state
+        .feishu_auth_service()?
+        .start(ip.as_deref().unwrap_or("unknown"))
+        .await?;
+    Ok(success(&state, response))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeishuCallbackQuery {
+    state: String,
+    code: Option<String>,
+    error: Option<String>,
+}
+
+/// 回调页只显示结果，不携带本站或飞书 token。
+#[tracing::instrument(skip(state, query), fields(outcome))]
+pub async fn feishu_callback(
+    State(state): State<AppState>,
+    Query(query): Query<FeishuCallbackQuery>,
+) -> Html<&'static str> {
+    let ok = match state.feishu_auth_service() {
+        Ok(service) => service
+            .callback(&query.state, query.code.as_deref(), query.error.as_deref())
+            .await
+            .is_ok(),
+        Err(_) => false,
+    };
+    tracing::Span::current().record("outcome", if ok { "success" } else { "failed" });
+    if ok {
+        Html("<!doctype html><meta charset=utf-8><title>授权成功</title><p>飞书授权成功，可以关闭此窗口并返回客户端。</p>")
+    } else {
+        Html("<!doctype html><meta charset=utf-8><title>授权失败</title><p>飞书授权失败或已过期，请关闭此窗口后在客户端重试。</p>")
+    }
+}
+
+#[tracing::instrument(skip(state, headers, body))]
+pub async fn feishu_poll(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FeishuAuthPollRequest>,
+) -> Result<Json<ApiResponse<FeishuAuthPollResponse>>, ApiError> {
+    let (ip, ua) = extract_client_info(&headers);
+    let result = state
+        .feishu_auth_service()?
+        .poll(&body.poll_token, ip.as_deref(), ua.as_deref())
+        .await;
+    let completed = result.as_ref().is_ok_and(|response| {
+        matches!(
+            response.status,
+            vpn_api_types::auth::FeishuAuthPollStatus::Complete
+        )
+    });
+    if completed && state.audit_service.is_some() {
+        state
+            .audit_service()?
+            .log_external_login_attempt(
+                "feishu",
+                true,
+                None,
+                ip.as_deref(),
+                ua.as_deref(),
+                state.clock.now_unix_ms(),
+            )
+            .await;
+    }
+    let response = result?;
+    Ok(success(&state, response))
 }
 
 #[tracing::instrument(skip(state))]

@@ -64,6 +64,40 @@ impl AuditService {
         self.log(entry, now_ms).await;
     }
 
+    pub async fn log_external_login_attempt(
+        &self,
+        provider: &str,
+        success: bool,
+        reason: Option<&str>,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+        now_ms: i64,
+    ) {
+        let metadata = serde_json::json!({
+            "provider": provider,
+            "reason": reason,
+        });
+        self.log(
+            AuditLogEntry {
+                user_id: None,
+                username: None,
+                action: if success {
+                    "external_login_success"
+                } else {
+                    "external_login_failed"
+                }
+                .to_string(),
+                resource: "/api/v1/auth/feishu/poll".to_string(),
+                ip_addr: ip.map(str::to_string),
+                user_agent: user_agent.map(str::to_string),
+                metadata: Some(metadata.to_string()),
+                status_code: None,
+            },
+            now_ms,
+        )
+        .await;
+    }
+
     /// 删除早于 cutoff_ms 的日志。返回删除条数。
     pub async fn purge_older_than(&self, cutoff_ms: i64) -> Result<u64> {
         self.repo.delete_older_than(cutoff_ms).await

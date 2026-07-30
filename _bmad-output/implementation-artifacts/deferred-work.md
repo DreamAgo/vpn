@@ -12,3 +12,7 @@
 - `update_peer_routes` 先写数据库再配置 WireGuard；数据面配置失败时会留下数据库与运行时状态不一致。后续应增加补偿回滚或可重放的 reconciliation。
 - 对 `force_removed` peer 清空/替换路由时，现有分支不会主动清理历史 OS 路由；后续应统一计算并释放不再被活跃 peer 使用的路由。
 - peer 身份仍允许同一账户通过相同 `device_name` 携新公钥匹配旧槽位，这是为客户端重启后密钥变化保留的既有语义，也意味着设备名可被同账户其他客户端冒用。后续应持久化设备密钥或引入管理员批准的设备身份。
+
+## Authentication session consistency
+
+- `crates/vpn-server/src/services/auth_service.rs`：密码与飞书登录都在检查用户启用状态后再签发并持久化 session；管理员若在该窗口内并发禁用用户，仍可能产生一个随后会在 refresh 时被拒绝、但短期 access token 仍有效的会话。该 TOCTOU 属于既有认证通用问题，后续应把“用户仍启用”校验与 session 创建纳入同一事务，或在每次 access-token 鉴权时校验用户状态。

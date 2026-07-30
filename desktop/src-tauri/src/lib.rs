@@ -154,7 +154,7 @@ pub fn run() {
     maybe_elevate();
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -168,6 +168,8 @@ pub fn run() {
             commands::connect,
             commands::disconnect,
             commands::login,
+            commands::feishu_login_available,
+            commands::feishu_login,
             commands::logout,
             commands::change_password,
             commands::is_logged_in,

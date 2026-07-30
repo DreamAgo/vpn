@@ -143,6 +143,16 @@ export function login(
   return invoke<void>("login", { server, username, password });
 }
 
+export function feishuLoginAvailable(server: string): Promise<boolean> {
+  if (!isTauriRuntime()) return Promise.resolve(true);
+  return invoke<boolean>("feishu_login_available", { server });
+}
+
+export function feishuLogin(server: string): Promise<void> {
+  if (!isTauriRuntime()) return Promise.resolve();
+  return invoke<void>("feishu_login", { server });
+}
+
 export function logout(): Promise<void> {
   if (!isTauriRuntime()) return Promise.resolve();
   return invoke<void>("logout");

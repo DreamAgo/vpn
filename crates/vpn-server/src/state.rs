@@ -5,7 +5,7 @@ use std::sync::Arc;
 use vpn_core::time::{Clock, SystemClock};
 
 use crate::services::{
-    ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService,
+    ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService, FeishuAuthService,
     NotificationService, PeerService, SubnetService, UserGroupService, UserService,
 };
 
@@ -16,6 +16,7 @@ use crate::services::{
 pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub auth_service: Option<Arc<AuthService>>,
+    pub feishu_auth_service: Option<Arc<FeishuAuthService>>,
     pub api_key_service: Option<Arc<ApiKeyService>>,
     pub user_service: Option<Arc<UserService>>,
     pub user_group_service: Option<Arc<UserGroupService>>,
@@ -34,6 +35,7 @@ impl AppState {
         Self {
             clock: Arc::new(SystemClock),
             auth_service: None,
+            feishu_auth_service: None,
             api_key_service: None,
             user_service: None,
             user_group_service: None,
@@ -49,6 +51,11 @@ impl AppState {
 
     pub fn with_auth_service(mut self, svc: Arc<AuthService>) -> Self {
         self.auth_service = Some(svc);
+        self
+    }
+
+    pub fn with_feishu_auth_service(mut self, svc: Arc<FeishuAuthService>) -> Self {
+        self.feishu_auth_service = Some(svc);
         self
     }
 
@@ -107,6 +114,12 @@ impl AppState {
         self.auth_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("auth_service 未初始化".to_string()))
+    }
+
+    pub fn feishu_auth_service(&self) -> Result<Arc<FeishuAuthService>, vpn_core::AppError> {
+        self.feishu_auth_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("飞书登录未配置".to_string()))
     }
 
     pub fn api_key_service(&self) -> Result<Arc<ApiKeyService>, vpn_core::AppError> {

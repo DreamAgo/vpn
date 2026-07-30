@@ -49,6 +49,22 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::auth::first_time_setup),
         )
         .route("/api/v1/auth/login", post(handlers::auth::login))
+        .route(
+            "/api/v1/auth/feishu/config",
+            get(handlers::auth::feishu_config),
+        )
+        .route(
+            "/api/v1/auth/feishu/start",
+            post(handlers::auth::feishu_start),
+        )
+        .route(
+            "/api/v1/auth/feishu/callback",
+            get(handlers::auth::feishu_callback),
+        )
+        .route(
+            "/api/v1/auth/feishu/poll",
+            post(handlers::auth::feishu_poll),
+        )
         .route("/api/v1/auth/refresh", post(handlers::auth::refresh));
 
     // 认证路由（需要 JWT）

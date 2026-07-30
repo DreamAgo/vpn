@@ -3,7 +3,7 @@
 //! 覆盖：登录取 token、注册 peer、心跳、token 过期自动刷新重试、错误码映射。
 
 use vpn_api_types::{
-    auth::{LoginResponse, RefreshResponse},
+    auth::{FeishuAuthPollResponse, FeishuAuthPollStatus, LoginResponse, RefreshResponse},
     peer::{PeerRegisterRequest, PeerRegisterResponse},
     ApiResponse,
 };
@@ -47,6 +47,46 @@ async fn login_stores_tokens() {
     assert_eq!(resp.access_token, "atk");
     assert_eq!(client.access_token(), Some("atk".to_string()));
     assert_eq!(client.refresh_token(), Some("rtk".to_string()));
+}
+
+#[tokio::test]
+async fn feishu_login_replaces_password_login_tokens_and_returns_username() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/auth/login"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(LoginResponse {
+                access_token: "password-atk".into(),
+                refresh_token: "password-rtk".into(),
+                access_expires_in: 900,
+                must_change_password: false,
+            })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/auth/feishu/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(
+            FeishuAuthPollResponse {
+                status: FeishuAuthPollStatus::Complete,
+                username: Some("bob".into()),
+                login: Some(LoginResponse {
+                    access_token: "feishu-atk".into(),
+                    refresh_token: "feishu-rtk".into(),
+                    access_expires_in: 900,
+                    must_change_password: false,
+                }),
+            },
+        )))
+        .mount(&server)
+        .await;
+
+    let client = ApiClient::new(server.uri()).unwrap();
+    client.login("alice", "pw").await.unwrap();
+    let response = client.feishu_poll("poll-token").await.unwrap();
+    assert_eq!(response.username.as_deref(), Some("bob"));
+    assert_eq!(client.access_token().as_deref(), Some("feishu-atk"));
+    assert_eq!(client.refresh_token().as_deref(), Some("feishu-rtk"));
 }
 
 #[tokio::test]

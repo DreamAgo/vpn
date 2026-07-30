@@ -15,6 +15,8 @@ import {
   installPendingUpdate,
   isLoggedIn,
   login,
+  feishuLogin,
+  feishuLoginAvailable,
   logout,
   notify,
   quitApp,
@@ -1093,6 +1095,9 @@ function LoginView({
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  const [feishuBusy, setFeishuBusy] = useState(false);
+  const [feishuEnabled, setFeishuEnabled] = useState(false);
+  const [checkingFeishu, setCheckingFeishu] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -1101,8 +1106,30 @@ function LoginView({
     });
   }, []);
 
+  useEffect(() => {
+    const normalized = server.trim();
+    if (!normalized || normalized === "https://") {
+      setFeishuEnabled(false);
+      setCheckingFeishu(false);
+      return;
+    }
+    setCheckingFeishu(true);
+    let active = { current: true };
+    const timer = window.setTimeout(() => {
+      feishuLoginAvailable(normalized)
+        .then((enabled) => active.current && setFeishuEnabled(enabled))
+        .catch(() => active.current && setFeishuEnabled(false))
+        .finally(() => active.current && setCheckingFeishu(false));
+    }, 350);
+    return () => {
+      active.current = false;
+      window.clearTimeout(timer);
+    };
+  }, [server]);
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (feishuBusy) return;
     setErr(null);
     setBusy(true);
     try {
@@ -1112,6 +1139,19 @@ function LoginView({
       setErr(String(e2));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const submitFeishu = async () => {
+    setErr(null);
+    setFeishuBusy(true);
+    try {
+      await feishuLogin(server.trim());
+      onLoggedIn();
+    } catch (e2) {
+      setErr(String(e2));
+    } finally {
+      setFeishuBusy(false);
     }
   };
 
@@ -1158,9 +1198,21 @@ function LoginView({
             />
           </Field>
           {err && <div className="form-error">{err}</div>}
-          <button className="primary-action connect" disabled={busy || !server || !username || !password}>
+          <button className="primary-action connect" disabled={busy || feishuBusy || !server || !username || !password}>
             {busy ? "登录中..." : "登录"}
           </button>
+          <div className="login-divider"><span>或</span></div>
+          <button
+            type="button"
+            className="secondary-action feishu-login"
+            disabled={!feishuEnabled || checkingFeishu || feishuBusy || busy}
+            onClick={submitFeishu}
+          >
+            {feishuBusy ? "等待浏览器授权..." : checkingFeishu ? "检查飞书登录..." : "使用飞书登录"}
+          </button>
+          {!checkingFeishu && !feishuEnabled && server.trim() !== "https://" && (
+            <div className="form-note">此服务端未启用飞书登录，仍可使用账号密码。</div>
+          )}
         </form>
       </main>
     </div>
