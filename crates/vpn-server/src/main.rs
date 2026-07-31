@@ -17,9 +17,10 @@ use vpn_server::{
     },
     services::{
         build_peer_service_with_backend, domain_event_service, ApiKeyService, Argon2Hasher,
-        AuditService, AuthService, ConfigService, DomainEventService, FeishuAuthService,
-        JwtTokenIssuer, NotificationService, PeerService, ReqwestFeishuIdentityProvider,
-        SubnetService, UserGroupService, UserService,
+        AuditService, AuthService, ConfigService, DomainEventService, ExternalOptionsService,
+        FeishuAuthService, JwtTokenIssuer, NotificationService, PeerService,
+        ReqwestFeishuIdentityProvider, SubnetExternalOptionProvider, SubnetService,
+        UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -75,6 +76,15 @@ async fn main() -> anyhow::Result<()> {
     let subnet_service = Arc::new(SubnetService::new(SqliteSubnetRepository::new(
         pool.clone(),
     )));
+    let mut external_options_service =
+        ExternalOptionsService::new(config.feishu_approval_options.token.clone());
+    external_options_service
+        .register(
+            "subnets",
+            Arc::new(SubnetExternalOptionProvider::new(subnet_service.clone())),
+        )
+        .context("注册网段外部选项数据源失败")?;
+    let external_options_service = Arc::new(external_options_service);
     let auth_service = Arc::new(AuthService {
         user_repo,
         session_repo,
@@ -154,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .with_user_service(user_service)
         .with_user_group_service(user_group_service)
         .with_subnet_service(subnet_service)
+        .with_external_options_service(external_options_service)
         .with_peer_service(peer_service)
         .with_audit_service(audit_service)
         .with_config_service(config_service)

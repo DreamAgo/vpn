@@ -24,6 +24,7 @@ services:
       VPN_DOMAIN: "vpn.example.com"  # ← 修改为你的真实域名
       DATABASE_URL: "sqlite:///var/lib/vpn/vpn.db?mode=rwc"
       VPN_DATA_DIR: "/var/lib/vpn"
+      # VPN_FEISHU_APPROVAL_OPTIONS_TOKEN: "replace-with-a-random-secret"
       RUST_LOG: "info,sqlx=warn"
     volumes:
       - vpn-data:/var/lib/vpn

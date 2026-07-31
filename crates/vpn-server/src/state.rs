@@ -5,8 +5,9 @@ use std::sync::Arc;
 use vpn_core::time::{Clock, SystemClock};
 
 use crate::services::{
-    ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService, FeishuAuthService,
-    NotificationService, PeerService, SubnetService, UserGroupService, UserService,
+    ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService,
+    ExternalOptionsService, FeishuAuthService, NotificationService, PeerService, SubnetService,
+    UserGroupService, UserService,
 };
 
 /// AppState 持有所有跨 handler 共享的资源。
@@ -17,6 +18,7 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub auth_service: Option<Arc<AuthService>>,
     pub feishu_auth_service: Option<Arc<FeishuAuthService>>,
+    pub external_options_service: Option<Arc<ExternalOptionsService>>,
     pub api_key_service: Option<Arc<ApiKeyService>>,
     pub user_service: Option<Arc<UserService>>,
     pub user_group_service: Option<Arc<UserGroupService>>,
@@ -36,6 +38,7 @@ impl AppState {
             clock: Arc::new(SystemClock),
             auth_service: None,
             feishu_auth_service: None,
+            external_options_service: None,
             api_key_service: None,
             user_service: None,
             user_group_service: None,
@@ -56,6 +59,11 @@ impl AppState {
 
     pub fn with_feishu_auth_service(mut self, svc: Arc<FeishuAuthService>) -> Self {
         self.feishu_auth_service = Some(svc);
+        self
+    }
+
+    pub fn with_external_options_service(mut self, svc: Arc<ExternalOptionsService>) -> Self {
+        self.external_options_service = Some(svc);
         self
     }
 

@@ -22,6 +22,7 @@ GET /api/v1/openapi.json
 - `POST /api/v1/auth/feishu/start`
 - `GET /api/v1/auth/feishu/callback`
 - `POST /api/v1/auth/feishu/poll`
+- `POST /api/v1/integrations/feishu/approval-options/{source}`（使用请求体中的专用 token）
 
 请求头格式：
 
@@ -84,6 +85,54 @@ JSON API 统一返回 `ApiResponse` 信封：
 - `code != 0` 表示业务错误
 - `request_id` 会同步写入响应头 `x-request-id`，用于排查日志
 - 分页接口的 `data` 为 `{ "items": [], "total": 0, "page": 1, "page_size": 20 }`
+
+飞书审批外部选项接口遵循飞书定义的第三方协议，不使用上述 `ApiResponse`：它返回 `code`、`msg` 和 `data.result`。
+
+## 飞书审批外部选项
+
+用于在飞书审批单选/多选控件中动态展示易链目录数据。当前数据源：
+
+- `subnets`：网段目录，显示为“名称（CIDR）”，选项 ID 使用网段的稳定 ID。
+
+配置：
+
+1. 生成至少 32 个字符的独立高熵随机值并设置 `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN`。
+2. 在飞书审批后台把请求 URL 填为 `https://<域名>/api/v1/integrations/feishu/approval-options/subnets`。
+3. Token 填写与环境变量相同的值；首版不支持可选 Key 加密，因此 Key 必须留空。
+
+接口为公网 `POST`，支持飞书的 `query` 与 `page_token` 参数，固定每页最多 50 项。`query` 最长 256 字节，`page_token` 最长 4096 字节。token 缺失或错误时返回 HTTP 401；未配置时返回 HTTP 503；数据源读取超过 2.5 秒时返回 HTTP 504。请求 token 不会写入日志。
+
+请求示例：
+
+```json
+{
+  "token": "<VPN_FEISHU_APPROVAL_OPTIONS_TOKEN>",
+  "query": "办公网",
+  "page_token": ""
+}
+```
+
+成功响应示例：
+
+```json
+{
+  "code": 0,
+  "msg": "success!",
+  "data": {
+    "result": {
+      "options": [{ "id": "<subnet-id>", "value": "@i18n@subnets_<subnet-id>" }],
+      "i18nResources": [{
+        "locale": "zh_cn",
+        "isDefault": true,
+        "texts": { "@i18n@subnets_<subnet-id>": "办公网（10.10.0.0/16）" }
+      }],
+      "hasMore": false
+    }
+  }
+}
+```
+
+新增类似目录时，实现并注册一个外部选项 provider 即可复用 token 校验、搜索、签名游标与飞书响应包装。
 
 ## 主要资源
 

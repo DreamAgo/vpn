@@ -17,12 +17,15 @@
 | `VPN_WG_BACKEND` | `noop` | WireGuard 数据平面后端：`kernel` / `userspace` / `auto` / `noop`。**生产必须显式设置**（默认 `noop` 不建真实隧道）。详见下节。 |
 | `VPN_WG_INTERFACE` | `wg0` | WireGuard 接口名（`kernel`/`userspace` 后端创建的接口）。 |
 | `VPN_AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期由后台任务自动清理。 |
+| `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` | （无） | 飞书审批“关联外部选项”请求校验 token。至少 32 个字符；应使用独立高熵随机值。 |
 | `RUST_LOG` | `info` | 日志级别（tracing EnvFilter 语法），如 `vpn_server=debug,info`。 |
 
 ## 启动校验
 
 - `VPN_HTTPS=true` 但缺少 `VPN_DOMAIN` → 启动失败并报错。
 - 数据目录与数据库父目录会在启动时自动创建。
+- 未配置 `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` 时，飞书审批外部选项接口返回 HTTP 503。
+- `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` 少于 32 个字符时启动失败。
 
 ## WireGuard 数据平面后端（`VPN_WG_BACKEND`）
 

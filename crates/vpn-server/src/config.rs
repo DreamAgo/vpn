@@ -41,6 +41,8 @@ pub struct ServerConfig {
     pub notifications: NotificationConfig,
     /// 飞书 OAuth。三项同时存在时启用。
     pub feishu: FeishuConfig,
+    /// 飞书审批外部选项 webhook。
+    pub feishu_approval_options: FeishuApprovalOptionsConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,6 +63,20 @@ impl FeishuConfig {
                 .redirect_uri
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty())
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FeishuApprovalOptionsConfig {
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for FeishuApprovalOptionsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FeishuApprovalOptionsConfig")
+            .field("configured", &self.token.is_some())
+            .finish()
     }
 }
 
@@ -145,6 +161,10 @@ impl ServerConfig {
             app_secret: env::var("VPN_FEISHU_APP_SECRET").ok(),
             redirect_uri: env::var("VPN_FEISHU_REDIRECT_URI").ok(),
         };
+        let feishu_approval_options = FeishuApprovalOptionsConfig {
+            token: optional_non_blank(env::var("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN").ok()),
+        };
+        validate_approval_options_token(feishu_approval_options.token.as_deref())?;
 
         if feishu.enabled() {
             if let Some(uri) = feishu.redirect_uri.as_deref() {
@@ -169,8 +189,22 @@ impl ServerConfig {
             server_routes,
             notifications,
             feishu,
+            feishu_approval_options,
         })
     }
+}
+
+fn optional_non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_approval_options_token(token: Option<&str>) -> anyhow::Result<()> {
+    if token.is_some_and(|token| token.len() < 32) {
+        anyhow::bail!("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN 至少需要 32 个字符");
+    }
+    Ok(())
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -199,6 +233,7 @@ mod tests {
             env::remove_var("VPN_WG_BACKEND");
             env::remove_var("VPN_WG_INTERFACE");
             env::remove_var("VPN_SERVER_ROUTES");
+            env::remove_var("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN");
         }
         let cfg = ServerConfig::from_env().unwrap();
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");
@@ -209,6 +244,7 @@ mod tests {
         assert_eq!(cfg.audit_retention_days, 180);
         assert_eq!(cfg.wg_backend, "noop");
         assert_eq!(cfg.wg_interface, "wg0");
+        assert!(cfg.feishu_approval_options.token.is_none());
     }
 
     #[test]
@@ -229,5 +265,32 @@ mod tests {
             ..complete
         }
         .enabled());
+    }
+
+    #[test]
+    fn optional_secret_trims_and_rejects_blank_values() {
+        assert_eq!(
+            optional_non_blank(Some("  secret  ".into())).as_deref(),
+            Some("secret")
+        );
+        assert_eq!(optional_non_blank(Some("   ".into())), None);
+        assert_eq!(optional_non_blank(None), None);
+    }
+
+    #[test]
+    fn approval_options_debug_redacts_token() {
+        let config = FeishuApprovalOptionsConfig {
+            token: Some("super-secret".into()),
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("configured: true"));
+        assert!(!debug.contains("super-secret"));
+    }
+
+    #[test]
+    fn approval_options_token_requires_minimum_length() {
+        assert!(validate_approval_options_token(None).is_ok());
+        assert!(validate_approval_options_token(Some(&"x".repeat(32))).is_ok());
+        assert!(validate_approval_options_token(Some("too-short")).is_err());
     }
 }

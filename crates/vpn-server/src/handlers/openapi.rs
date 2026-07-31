@@ -13,7 +13,7 @@ pub async fn openapi_json() -> Json<Value> {
         "info": {
             "title": "易链开放 API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "易链管理端与客户端对外 REST API。除初始化、登录、刷新、健康检查和 OpenAPI 文档外，接口均使用 Bearer access token 认证。"
+            "description": "易链管理端与客户端对外 REST API。飞书审批外部选项使用请求体 token；其余公开接口见各 operation 的 security 配置。"
         },
         "servers": [
             { "url": "/", "description": "当前服务" }
@@ -21,6 +21,7 @@ pub async fn openapi_json() -> Json<Value> {
         "tags": [
             { "name": "Health", "description": "健康检查" },
             { "name": "Auth", "description": "初始化、登录、刷新、登出、改密" },
+            { "name": "Integrations", "description": "第三方系统回调与数据源" },
             { "name": "System", "description": "服务端状态与 LAN 路由" },
             { "name": "Users", "description": "用户生命周期管理" },
             { "name": "Groups", "description": "用户组与组路由" },
@@ -93,6 +94,28 @@ pub async fn openapi_json() -> Json<Value> {
                 "post": {
                     "tags": ["Auth"], "summary": "一次性领取飞书登录结果", "security": [],
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+                }
+            },
+            "/api/v1/integrations/feishu/approval-options/{source}": {
+                "post": {
+                    "tags": ["Integrations"],
+                    "summary": "获取飞书审批外部选项",
+                    "description": "当前 source 支持 subnets。使用请求体 token 校验来源；首版仅支持明文 result，飞书后台 Key 应留空。",
+                    "security": [],
+                    "parameters": [{
+                        "name": "source", "in": "path", "required": true,
+                        "schema": { "type": "string", "enum": ["subnets"] }
+                    }],
+                    "requestBody": { "$ref": "#/components/requestBodies/FeishuExternalOptions" },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/FeishuExternalOptions" },
+                        "400": { "$ref": "#/components/responses/FeishuExternalOptions" },
+                        "401": { "$ref": "#/components/responses/FeishuExternalOptions" },
+                        "404": { "$ref": "#/components/responses/FeishuExternalOptions" },
+                        "500": { "$ref": "#/components/responses/FeishuExternalOptions" },
+                        "503": { "$ref": "#/components/responses/FeishuExternalOptions" },
+                        "504": { "$ref": "#/components/responses/FeishuExternalOptions" }
+                    }
                 }
             },
             "/api/v1/auth/refresh": {
@@ -429,6 +452,7 @@ pub async fn openapi_json() -> Json<Value> {
                 "PeerRoutes": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["routed_subnets"], "properties": { "routed_subnets": { "type": "array", "items": { "type": "string", "example": "192.168.10.0/24" } } } } } } },
                 "PeerRegister": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PeerRegisterRequest" } } } },
                 "PeerHeartbeat": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PeerHeartbeatRequest" } } } }
+                ,"FeishuExternalOptions": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FeishuExternalOptionsRequest" } } } }
             },
             "responses": {
                 "Envelope": {
@@ -438,6 +462,10 @@ pub async fn openapi_json() -> Json<Value> {
                 "EnvelopePage": {
                     "description": "统一分页响应信封",
                     "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponsePage" } } }
+                },
+                "FeishuExternalOptions": {
+                    "description": "飞书审批外部选项协议响应",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FeishuExternalOptionsResponse" } } }
                 }
             },
             "schemas": {
@@ -454,6 +482,58 @@ pub async fn openapi_json() -> Json<Value> {
                 },
                 "ApiResponsePage": {
                     "allOf": [{ "$ref": "#/components/schemas/ApiResponse" }]
+                },
+                "FeishuExternalOptionsRequest": {
+                    "type": "object",
+                    "required": ["token"],
+                    "properties": {
+                        "token": { "type": "string", "format": "password", "minLength": 32, "maxLength": 512 },
+                        "user_id": { "type": "string" },
+                        "employee_id": { "type": "string" },
+                        "linkage_params": { "type": "object", "additionalProperties": true },
+                        "page_token": { "type": "string", "maxLength": 4096 },
+                        "query": { "type": "string", "maxLength": 256 },
+                        "locale": { "type": "string", "enum": ["zh_cn", "en_us", "ja_jp"], "description": "请求语言；当前响应始终包含 zh_cn 默认资源" }
+                    }
+                },
+                "FeishuExternalOptionsResponse": {
+                    "type": "object",
+                    "required": ["code", "msg", "data"],
+                    "properties": {
+                        "code": { "type": "integer", "description": "0 表示成功" },
+                        "msg": { "type": "string" },
+                        "data": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "result": {
+                                    "type": "object",
+                                    "required": ["options", "i18nResources", "hasMore"],
+                                    "properties": {
+                                        "options": { "type": "array", "items": { "$ref": "#/components/schemas/FeishuExternalOption" } },
+                                        "i18nResources": { "type": "array", "items": { "$ref": "#/components/schemas/FeishuI18nResource" } },
+                                        "hasMore": { "type": "boolean" },
+                                        "nextPageToken": { "type": "string" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "FeishuExternalOption": {
+                    "type": "object", "required": ["id", "value"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "value": { "type": "string" },
+                        "isDefault": { "type": "boolean" }
+                    }
+                },
+                "FeishuI18nResource": {
+                    "type": "object", "required": ["locale", "isDefault", "texts"],
+                    "properties": {
+                        "locale": { "type": "string" },
+                        "isDefault": { "type": "boolean" },
+                        "texts": { "type": "object", "additionalProperties": { "type": "string" } }
+                    }
                 },
                 "LoginRequest": {
                     "type": "object",

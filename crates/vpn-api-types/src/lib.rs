@@ -12,6 +12,7 @@ pub mod audit;
 pub mod auth;
 pub mod envelope;
 pub mod error_codes;
+pub mod external_options;
 pub mod group;
 pub mod peer;
 pub mod subnet;

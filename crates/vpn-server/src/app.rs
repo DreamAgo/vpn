@@ -65,6 +65,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/auth/feishu/poll",
             post(handlers::auth::feishu_poll),
         )
+        .route(
+            "/api/v1/integrations/feishu/approval-options/{source}",
+            post(handlers::external_options::list_external_options),
+        )
         .route("/api/v1/auth/refresh", post(handlers::auth::refresh));
 
     // 认证路由（需要 JWT）
