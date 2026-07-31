@@ -12,7 +12,7 @@ use vpn_api_types::external_options::{
 };
 use vpn_core::AppError;
 
-use super::SubnetService;
+use super::{SubnetService, UserGroupService};
 
 type HmacSha256 = Hmac<Sha256>;
 const PAGE_SIZE: usize = 50;
@@ -56,6 +56,33 @@ impl ExternalOptionProvider for SubnetExternalOptionProvider {
             .map(|subnet| ExternalOptionItem {
                 id: subnet.id,
                 label: format!("{}（{}）", subnet.name, subnet.cidr),
+                is_default: false,
+            })
+            .collect())
+    }
+}
+
+pub struct UserGroupExternalOptionProvider {
+    user_groups: Arc<UserGroupService>,
+}
+
+impl UserGroupExternalOptionProvider {
+    pub fn new(user_groups: Arc<UserGroupService>) -> Self {
+        Self { user_groups }
+    }
+}
+
+#[async_trait]
+impl ExternalOptionProvider for UserGroupExternalOptionProvider {
+    async fn items(&self) -> Result<Vec<ExternalOptionItem>, AppError> {
+        Ok(self
+            .user_groups
+            .list()
+            .await?
+            .into_iter()
+            .map(|group| ExternalOptionItem {
+                id: group.id,
+                label: group.name,
                 is_default: false,
             })
             .collect())

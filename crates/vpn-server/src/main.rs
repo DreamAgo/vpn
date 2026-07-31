@@ -20,7 +20,7 @@ use vpn_server::{
         AuditService, AuthService, ConfigService, DomainEventService, ExternalOptionsService,
         FeishuAuthService, JwtTokenIssuer, NotificationService, PeerService,
         ReqwestFeishuIdentityProvider, SubnetExternalOptionProvider, SubnetService,
-        UserGroupService, UserService,
+        UserGroupExternalOptionProvider, UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -84,6 +84,14 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(SubnetExternalOptionProvider::new(subnet_service.clone())),
         )
         .context("注册网段外部选项数据源失败")?;
+    external_options_service
+        .register(
+            "user-groups",
+            Arc::new(UserGroupExternalOptionProvider::new(
+                user_group_service.clone(),
+            )),
+        )
+        .context("注册用户组外部选项数据源失败")?;
     let external_options_service = Arc::new(external_options_service);
     let auth_service = Arc::new(AuthService {
         user_repo,

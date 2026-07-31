@@ -24,6 +24,7 @@ pub use domain_event_service::DomainEventService;
 pub use external_options_service::{
     ExternalOptionItem, ExternalOptionProvider, ExternalOptionsError,
     ExternalOptionsRegistrationError, ExternalOptionsService, SubnetExternalOptionProvider,
+    UserGroupExternalOptionProvider,
 };
 pub use feishu_auth_service::{FeishuAuthService, ReqwestFeishuIdentityProvider};
 pub use notification_service::NotificationService;

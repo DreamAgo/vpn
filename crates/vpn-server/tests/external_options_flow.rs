@@ -12,12 +12,23 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tower::ServiceExt;
 use vpn_server::{
     build_router,
-    repositories::SqliteSubnetRepository,
-    services::{ExternalOptionsService, SubnetExternalOptionProvider, SubnetService},
+    repositories::{SqliteSubnetRepository, SqliteUserGroupRepository, SqliteUserRepository},
+    services::{
+        ExternalOptionsService, SubnetExternalOptionProvider, SubnetService,
+        UserGroupExternalOptionProvider, UserGroupService,
+    },
     AppState,
 };
 
 async fn build_test_app(token: Option<&str>, subnet_count: usize) -> axum::Router {
+    build_test_app_with_groups(token, subnet_count, &[]).await
+}
+
+async fn build_test_app_with_groups(
+    token: Option<&str>,
+    subnet_count: usize,
+    group_names: &[&str],
+) -> axum::Router {
     let url = format!(
         "sqlite:file:external_options_test_{}?mode=memory&cache=shared",
         uuid::Uuid::new_v4()
@@ -30,12 +41,22 @@ async fn build_test_app(token: Option<&str>, subnet_count: usize) -> axum::Route
         .unwrap();
     sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
 
-    let subnets = Arc::new(SubnetService::new(SqliteSubnetRepository::new(pool)));
+    let subnets = Arc::new(SubnetService::new(SqliteSubnetRepository::new(
+        pool.clone(),
+    )));
     for index in 0..subnet_count {
         subnets
             .create(&format!("网段 {index:03}"), &format!("10.{index}.0.0/16"))
             .await
             .unwrap();
+    }
+
+    let user_groups = Arc::new(UserGroupService::new(
+        SqliteUserGroupRepository::new(pool.clone()),
+        SqliteUserRepository::new(pool),
+    ));
+    for name in group_names {
+        user_groups.create(name, &[]).await.unwrap();
     }
 
     let mut external_options = ExternalOptionsService::new(token.map(str::to_string));
@@ -45,9 +66,16 @@ async fn build_test_app(token: Option<&str>, subnet_count: usize) -> axum::Route
             Arc::new(SubnetExternalOptionProvider::new(subnets.clone())),
         )
         .unwrap();
+    external_options
+        .register(
+            "user-groups",
+            Arc::new(UserGroupExternalOptionProvider::new(user_groups.clone())),
+        )
+        .unwrap();
     build_router(
         AppState::new()
             .with_subnet_service(subnets)
+            .with_user_group_service(user_groups)
             .with_external_options_service(Arc::new(external_options)),
     )
 }
@@ -102,6 +130,61 @@ async fn external_options_returns_stable_subnet_option_contract() {
         body["data"]["result"]["i18nResources"][0]["texts"][value],
         json!("网段 000（10.0.0.0/16）")
     );
+}
+
+#[tokio::test]
+async fn external_options_returns_and_searches_user_groups() {
+    let app = build_test_app_with_groups(Some("approval-secret"), 0, &["测试", "测试 2"]).await;
+    let (status, body) = post(&app, "user-groups", json!({ "token": "approval-secret" })).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let options = body["data"]["result"]["options"].as_array().unwrap();
+    assert_eq!(options.len(), 2);
+    let first_id = options[0]["id"].as_str().unwrap();
+    let first_value = options[0]["value"].as_str().unwrap();
+    assert_eq!(first_value, format!("@i18n@user-groups_{first_id}"));
+    assert_eq!(
+        body["data"]["result"]["i18nResources"][0]["texts"][first_value],
+        json!("测试")
+    );
+
+    let (_, searched) = post(
+        &app,
+        "user-groups",
+        json!({ "token": "approval-secret", "query": "2" }),
+    )
+    .await;
+    assert_eq!(
+        searched["data"]["result"]["options"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn external_options_returns_empty_user_groups_and_rejects_cross_source_cursor() {
+    let empty = build_test_app(Some("approval-secret"), 0).await;
+    let (status, body) = post(&empty, "user-groups", json!({ "token": "approval-secret" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["data"]["result"]["options"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(body["data"]["result"]["hasMore"], json!(false));
+
+    let app = build_test_app_with_groups(Some("approval-secret"), 55, &["测试"]).await;
+    let (_, first) = post(&app, "subnets", json!({ "token": "approval-secret" })).await;
+    let subnet_cursor = first["data"]["result"]["nextPageToken"].as_str().unwrap();
+    let (status, body) = post(
+        &app,
+        "user-groups",
+        json!({ "token": "approval-secret", "page_token": subnet_cursor }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], json!(40000));
 }
 
 #[tokio::test]

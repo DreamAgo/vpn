@@ -100,11 +100,11 @@ pub async fn openapi_json() -> Json<Value> {
                 "post": {
                     "tags": ["Integrations"],
                     "summary": "获取飞书审批外部选项",
-                    "description": "当前 source 支持 subnets。使用请求体 token 校验来源；首版仅支持明文 result，飞书后台 Key 应留空。",
+                    "description": "当前 source 支持 subnets 和 user-groups。使用请求体 token 校验来源；首版仅支持明文 result，飞书后台 Key 应留空。",
                     "security": [],
                     "parameters": [{
                         "name": "source", "in": "path", "required": true,
-                        "schema": { "type": "string", "enum": ["subnets"] }
+                        "schema": { "type": "string", "enum": ["subnets", "user-groups"] }
                     }],
                     "requestBody": { "$ref": "#/components/requestBodies/FeishuExternalOptions" },
                     "responses": {

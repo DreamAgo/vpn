@@ -20,3 +20,7 @@
 ## Feishu callback error UX
 
 - `crates/vpn-server/src/handlers/auth.rs`：`FeishuCallbackQuery.state` 由 Axum 在进入 handler 前强制反序列化；完全缺失或畸形的 `state` 会返回框架通用 400，而非项目的飞书失败提示页。这是自动关闭改动前已存在的 extractor 行为；后续可接收可失败的 query 提取结果并补充无 `state` 的路由级测试，使所有无效回调都呈现统一重试指引。
+
+## External options pagination consistency
+
+- `crates/vpn-server/src/services/external_options_service.rs`：现有签名游标使用排序结果的数字 offset；若两个分页请求之间目录项被新增、删除或重命名，后续页可能重复、遗漏或因 offset 越界返回 400。该问题源自既有 `subnets` 通用分页实现，并非本次 `user-groups` provider 引入；后续可改为携带 `(label, id)` 的 keyset 游标，并补并发目录变更测试。

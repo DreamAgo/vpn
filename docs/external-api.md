@@ -93,12 +93,19 @@ JSON API 统一返回 `ApiResponse` 信封：
 用于在飞书审批单选/多选控件中动态展示易链目录数据。当前数据源：
 
 - `subnets`：网段目录，显示为“名称（CIDR）”，选项 ID 使用网段的稳定 ID。
+- `user-groups`：用户组目录，显示用户组名称，选项 ID 使用用户组的稳定 ID。
 
 配置：
 
 1. 生成至少 32 个字符的独立高熵随机值并设置 `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN`。
 2. 在飞书审批后台把请求 URL 填为 `https://<域名>/api/v1/integrations/feishu/approval-options/subnets`。
 3. Token 填写与环境变量相同的值；首版不支持可选 Key 加密，因此 Key 必须留空。
+
+用户组控件使用同一 Token，并将 URL 中的数据源替换为 `user-groups`：
+
+```text
+https://<域名>/api/v1/integrations/feishu/approval-options/user-groups
+```
 
 接口为公网 `POST`，支持飞书的 `query` 与 `page_token` 参数，固定每页最多 50 项。`query` 最长 256 字节，`page_token` 最长 4096 字节。token 缺失或错误时返回 HTTP 401；未配置时返回 HTTP 503；数据源读取超过 2.5 秒时返回 HTTP 504。请求 token 不会写入日志。
 
