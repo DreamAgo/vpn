@@ -78,6 +78,42 @@ pub struct FeishuCallbackQuery {
     error: Option<String>,
 }
 
+const FEISHU_CALLBACK_SUCCESS_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>授权成功</title>
+</head>
+<body>
+<p>飞书授权成功。</p>
+<p>如未自动关闭，请手动关闭此窗口并返回客户端。</p>
+<script>
+window.setTimeout(function () {
+    window.close();
+}, 1200);
+</script>
+</body>
+</html>"#;
+
+const FEISHU_CALLBACK_FAILURE_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>授权失败</title>
+</head>
+<body>
+<p>飞书授权失败或已过期，请关闭此窗口后在客户端重试。</p>
+</body>
+</html>"#;
+
+fn feishu_callback_html(ok: bool) -> &'static str {
+    if ok {
+        FEISHU_CALLBACK_SUCCESS_HTML
+    } else {
+        FEISHU_CALLBACK_FAILURE_HTML
+    }
+}
+
 /// 回调页只显示结果，不携带本站或飞书 token。
 #[tracing::instrument(skip(state, query), fields(outcome))]
 pub async fn feishu_callback(
@@ -92,11 +128,7 @@ pub async fn feishu_callback(
         Err(_) => false,
     };
     tracing::Span::current().record("outcome", if ok { "success" } else { "failed" });
-    if ok {
-        Html("<!doctype html><meta charset=utf-8><title>授权成功</title><p>飞书授权成功，可以关闭此窗口并返回客户端。</p>")
-    } else {
-        Html("<!doctype html><meta charset=utf-8><title>授权失败</title><p>飞书授权失败或已过期，请关闭此窗口后在客户端重试。</p>")
-    }
+    Html(feishu_callback_html(ok))
 }
 
 #[tracing::instrument(skip(state, headers, body))]
@@ -254,3 +286,31 @@ pub async fn change_password(
 // 让 dead_code lint 不抱怨：trait import 仅用于类型推导
 #[allow(dead_code)]
 fn _hasher_type_marker(_: Box<dyn PasswordHasher>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{feishu_callback_html, FEISHU_CALLBACK_FAILURE_HTML, FEISHU_CALLBACK_SUCCESS_HTML};
+
+    #[test]
+    fn feishu_callback_success_page_attempts_close_with_visible_fallback() {
+        assert!(FEISHU_CALLBACK_SUCCESS_HTML
+            .contains("window.setTimeout(function () {\n    window.close();\n}, 1200);"));
+        assert!(
+            FEISHU_CALLBACK_SUCCESS_HTML.contains("如未自动关闭，请手动关闭此窗口并返回客户端。")
+        );
+    }
+
+    #[test]
+    fn feishu_callback_failure_page_remains_visible() {
+        assert!(FEISHU_CALLBACK_FAILURE_HTML.contains("授权失败"));
+        assert!(FEISHU_CALLBACK_FAILURE_HTML.contains("在客户端重试"));
+        assert!(!FEISHU_CALLBACK_FAILURE_HTML.contains("window.close"));
+        assert!(!FEISHU_CALLBACK_FAILURE_HTML.contains("window.setTimeout"));
+    }
+
+    #[test]
+    fn feishu_callback_result_selects_matching_page() {
+        assert_eq!(feishu_callback_html(true), FEISHU_CALLBACK_SUCCESS_HTML);
+        assert_eq!(feishu_callback_html(false), FEISHU_CALLBACK_FAILURE_HTML);
+    }
+}

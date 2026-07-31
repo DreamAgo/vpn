@@ -16,3 +16,7 @@
 ## Authentication session consistency
 
 - `crates/vpn-server/src/services/auth_service.rs`：密码与飞书登录都在检查用户启用状态后再签发并持久化 session；管理员若在该窗口内并发禁用用户，仍可能产生一个随后会在 refresh 时被拒绝、但短期 access token 仍有效的会话。该 TOCTOU 属于既有认证通用问题，后续应把“用户仍启用”校验与 session 创建纳入同一事务，或在每次 access-token 鉴权时校验用户状态。
+
+## Feishu callback error UX
+
+- `crates/vpn-server/src/handlers/auth.rs`：`FeishuCallbackQuery.state` 由 Axum 在进入 handler 前强制反序列化；完全缺失或畸形的 `state` 会返回框架通用 400，而非项目的飞书失败提示页。这是自动关闭改动前已存在的 extractor 行为；后续可接收可失败的 query 提取结果并补充无 `state` 的路由级测试，使所有无效回调都呈现统一重试指引。
