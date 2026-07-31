@@ -10,12 +10,14 @@
 //! （真实 boringtun 隧道 / TUN / UDP）分离，后者隔离在 [`control::WireGuardControl`]
 //! trait 之后，便于服务端业务层用 Noop 实现进行完整单元/集成测试。
 
+pub mod acl;
 pub mod config;
 pub mod control;
 pub mod ip_pool;
 pub mod kernel;
 pub mod keys;
 
+pub use acl::{render_nft_batch, AclLease, NftAclController};
 pub use config::{render_client_config, WgPeerConfig};
 pub use control::{NoopWireGuardControl, WireGuardControl};
 pub use ip_pool::IpPool;

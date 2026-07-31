@@ -4779,11 +4779,13 @@ dependencies = [
 name = "vpn-server"
 version = "0.1.7"
 dependencies = [
+ "aes",
  "anyhow",
  "argon2",
  "async-trait",
  "axum",
  "base64",
+ "cbc",
  "chrono",
  "futures",
  "hmac",

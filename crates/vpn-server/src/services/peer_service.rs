@@ -6,7 +6,7 @@
 //! - `Arc<dyn WireGuardControl>`（本轮注入 Noop，真实后端留待真机集成）
 
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ipnet::Ipv4Net;
 use tokio::sync::{Mutex, RwLock};
@@ -33,6 +33,14 @@ pub const KEY_SERVER_ROUTES: &str = "server_routes";
 
 /// 客户端配置下载里 PrivateKey 字段的占位符（服务端不持有客户端私钥）。
 const CLIENT_PRIVATE_KEY_PLACEHOLDER: &str = "<在此填入客户端私钥>";
+
+static ROUTE_POLICY_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+
+pub(crate) fn route_policy_lock() -> Arc<Mutex<()>> {
+    ROUTE_POLICY_LOCK
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 /// PersistentKeepalive 秒数（穿越 NAT）。
 const PERSISTENT_KEEPALIVE: u16 = 25;
 /// 离线判定阈值：心跳超过该毫秒数未更新视为离线。
@@ -196,7 +204,7 @@ impl PeerService {
             subnet,
             server_endpoint,
             server_routes: Arc::new(RwLock::new(server_routes)),
-            peer_route_lock: Arc::new(Mutex::new(())),
+            peer_route_lock: route_policy_lock(),
         }
     }
 
@@ -315,6 +323,8 @@ impl PeerService {
         // 做碰撞校验，不能让重注册静默抢回 AllowedIPs。
         if matched_existing {
             self.ensure_no_subnet_collision(&routed_subnets, target_id.as_deref(), None)
+                .await?;
+            self.ensure_no_group_route_collision(&routed_subnets)
                 .await?;
         }
 
@@ -564,6 +574,33 @@ impl PeerService {
                             )));
                         }
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 站点源网段与用户组授权目的网段必须始终分离；同时校验反向写入顺序，
+    /// 防止“先建组、后声明站点”绕过 UserGroupService 的检查。
+    async fn ensure_no_group_route_collision(&self, new_subnets: &[String]) -> Result<()> {
+        if new_subnets.is_empty() {
+            return Ok(());
+        }
+        let news: Vec<Ipv4Net> = new_subnets
+            .iter()
+            .filter_map(|route| route.parse().ok())
+            .collect();
+        for (group, _) in self.user_group_repo.list_with_counts().await? {
+            for route in group
+                .routes
+                .split(',')
+                .filter_map(|route| route.parse::<Ipv4Net>().ok())
+            {
+                if news.iter().any(|net| Self::nets_overlap(net, &route)) {
+                    return Err(AppError::Validation(format!(
+                        "站点网段与用户组 {} 的授权网段 {route} 重叠，请先调整用户组路由",
+                        group.name
+                    )));
                 }
             }
         }
@@ -921,6 +958,7 @@ impl PeerService {
             .await?
             .ok_or(AppError::PeerNotFound)?;
         let normalized = normalize_subnets(subnets)?;
+        self.ensure_no_group_route_collision(&normalized).await?;
         // 不得与其他节点的站点网段重叠（否则 wg allowed-ips 互抢、站点静默不可达）。
         self.ensure_no_subnet_collision(&normalized, Some(peer_id), None)
             .await?;
@@ -2201,6 +2239,38 @@ mod tests {
         // 未知 peer。
         let err = svc.update_peer_routes("missing", &[]).await.unwrap_err();
         assert!(matches!(err, AppError::PeerNotFound));
+    }
+
+    #[tokio::test]
+    async fn update_peer_routes_rejects_existing_group_route_overlap() {
+        let pool = setup_pool().await;
+        let groups = SqliteUserGroupRepository::new(pool.clone());
+        groups
+            .insert("group-1", "production", "192.168.40.0/24")
+            .await
+            .unwrap();
+        let svc = service(pool);
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        let peer = svc
+            .peer_repo
+            .find_active_by_user("user-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = svc
+            .update_peer_routes(&peer.id, &["192.168.40.128/25".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Validation(_)));
+        assert!(svc
+            .peer_repo
+            .find_by_id(&peer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .routed_subnets
+            .is_empty());
     }
 
     #[tokio::test]

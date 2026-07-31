@@ -10,17 +10,18 @@ use vpn_server::{
     build_router,
     ratelimit::LoginAttempts,
     repositories::{
-        SqliteApiKeyRepository, SqliteAuditLogRepository, SqliteDomainEventRepository,
-        SqliteNotificationEventRepository, SqlitePeerRepository, SqliteSessionRepository,
-        SqliteSubnetRepository, SqliteSystemConfigRepository, SqliteUserGroupRepository,
-        SqliteUserRepository,
+        SqliteAccessGrantRepository, SqliteApiKeyRepository, SqliteAuditLogRepository,
+        SqliteDomainEventRepository, SqliteNotificationEventRepository, SqlitePeerRepository,
+        SqliteSessionRepository, SqliteSubnetRepository, SqliteSystemConfigRepository,
+        SqliteUserGroupRepository, SqliteUserRepository,
     },
     services::{
         build_peer_service_with_backend, domain_event_service, ApiKeyService, Argon2Hasher,
         AuditService, AuthService, ConfigService, DomainEventService, ExternalOptionsService,
-        FeishuAuthService, JwtTokenIssuer, NotificationService, PeerService,
-        ReqwestFeishuIdentityProvider, SubnetExternalOptionProvider, SubnetService,
-        UserGroupExternalOptionProvider, UserGroupService, UserService,
+        FeishuApprovalService, FeishuAuthService, JwtTokenIssuer, NetworkAclService,
+        NotificationService, PeerService, ReqwestFeishuApprovalApi, ReqwestFeishuIdentityProvider,
+        SubnetExternalOptionProvider, SubnetService, UserGroupExternalOptionProvider,
+        UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -56,6 +57,12 @@ async fn main() -> anyhow::Result<()> {
         .context("数据库 migration 失败")?;
     tracing::info!("数据库 migration 完成");
 
+    let subnet: ipnet::Ipv4Net = config
+        .vpn_subnet
+        .parse()
+        .with_context(|| format!("VPN_SUBNET 非法 CIDR：{}", config.vpn_subnet))?;
+    let peer_repo = SqlitePeerRepository::new(pool.clone());
+
     // 初始化业务服务
     let user_repo = SqliteUserRepository::new(pool.clone());
     let session_repo = SqliteSessionRepository::new(pool.clone());
@@ -68,10 +75,13 @@ async fn main() -> anyhow::Result<()> {
         hasher.clone(),
     ));
     // 用户组服务:组 CRUD + 用户分配(组的可路由网段用于访问控制)。
-    let user_group_service = Arc::new(UserGroupService::new(
-        SqliteUserGroupRepository::new(pool.clone()),
-        user_repo.clone(),
-    ));
+    let user_group_service = Arc::new(
+        UserGroupService::new(
+            SqliteUserGroupRepository::new(pool.clone()),
+            user_repo.clone(),
+        )
+        .with_route_policy(subnet, peer_repo.clone()),
+    );
     // 网段目录服务:集中维护命名网段,供各处下拉选择。
     let subnet_service = Arc::new(SubnetService::new(SqliteSubnetRepository::new(
         pool.clone(),
@@ -92,21 +102,33 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .context("注册用户组外部选项数据源失败")?;
+    // 冻结规格使用下划线；保留既有连字符地址，避免已发布的飞书表单失效。
+    external_options_service
+        .register(
+            "user_groups",
+            Arc::new(UserGroupExternalOptionProvider::new(
+                user_group_service.clone(),
+            )),
+        )
+        .context("注册用户组外部选项兼容数据源失败")?;
     let external_options_service = Arc::new(external_options_service);
     let auth_service = Arc::new(AuthService {
         user_repo,
         session_repo,
-        hasher,
+        hasher: hasher.clone(),
         issuer,
         login_attempts: LoginAttempts::new(),
     });
     let feishu_auth_service = if config.feishu.enabled() {
-        Some(Arc::new(FeishuAuthService::new(
-            config.feishu.clone(),
-            Arc::new(ReqwestFeishuIdentityProvider::new(config.feishu.clone())?),
-            auth_service.user_repo.clone(),
-            auth_service.clone(),
-        )))
+        Some(Arc::new(
+            FeishuAuthService::new(
+                config.feishu.clone(),
+                Arc::new(ReqwestFeishuIdentityProvider::new(config.feishu.clone())?),
+                auth_service.user_repo.clone(),
+                auth_service.clone(),
+            )
+            .with_approval_required_for_new_accounts(config.feishu_approval.enabled()),
+        ))
     } else {
         None
     };
@@ -115,13 +137,34 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Epic 4：装配 PeerService（load-or-generate 服务端 WG 密钥 + IpPool 回填 + Noop control）
-    let peer_repo = SqlitePeerRepository::new(pool.clone());
     let config_repo = SqliteSystemConfigRepository::new(pool.clone());
     let config_service = Arc::new(ConfigService::new(config_repo.clone()));
-    let subnet: ipnet::Ipv4Net = config
-        .vpn_subnet
-        .parse()
-        .with_context(|| format!("VPN_SUBNET 非法 CIDR：{}", config.vpn_subnet))?;
+    const APPROVAL_ACL_MARKER: &str = "feishu_approval_acl_installed";
+    if config.feishu_approval.enabled() {
+        // WireGuard 接口恢复已有 peer 前先安装最小 drop ACL，关闭重启期间的数据面窗口。
+        let bootstrap_acl = vpn_wireguard::NftAclController::new(&config.wg_interface, subnet)?;
+        bootstrap_acl.verify_available().await?;
+        // 先持久化清理义务，再触碰内核状态；即使后续安装或启动失败，下次关闭功能
+        // 也不会把可能残留的 final-drop 误判为“无需清理”。
+        config_repo.set(APPROVAL_ACL_MARKER, "1").await?;
+        bootstrap_acl
+            .apply(&[], &[])
+            .await
+            .context("安装 nftables 启动保护规则失败（拒绝启动）")?;
+    } else {
+        // 标记表明本服务确实安装过 ACL；此时缺少 nft CLI 不能被当作“无需清理”。
+        if config_repo.get(APPROVAL_ACL_MARKER).await?.as_deref() == Some("1") {
+            let cleanup_probe = vpn_wireguard::NftAclController::new(&config.wg_interface, subnet)?;
+            cleanup_probe
+                .verify_available()
+                .await
+                .context("审批 ACL 已安装但 nft 不可用，拒绝在未清理规则时启动")?;
+        }
+        vpn_wireguard::NftAclController::cleanup_owned_table_if_present()
+            .await
+            .context("清理已停用的审批 nftables ACL 失败")?;
+        config_repo.set(APPROVAL_ACL_MARKER, "0").await?;
+    }
     let peer_service = Arc::new(
         build_peer_service_with_backend(
             peer_repo,
@@ -142,6 +185,38 @@ async fn main() -> anyhow::Result<()> {
         subnet = %config.vpn_subnet,
         "服务端 WireGuard 状态已就绪"
     );
+    let network_acl_service = if config.feishu_approval.enabled() {
+        let service = Arc::new(NetworkAclService::new(
+            pool.clone(),
+            peer_service.clone(),
+            &config.wg_interface,
+            subnet,
+        )?);
+        service
+            .start()
+            .await
+            .context("初始化 nftables 强制 ACL 失败（拒绝启动）")?;
+        service.clone().spawn();
+        Some(service)
+    } else {
+        None
+    };
+    let feishu_approval_service = if config.feishu_approval.enabled() {
+        let mut service = FeishuApprovalService::new(
+            config.feishu_approval.clone(),
+            SqliteAccessGrantRepository::new(pool.clone()),
+            Arc::new(ReqwestFeishuApprovalApi::new(config.feishu.clone())?),
+            hasher,
+        );
+        if let Some(network_acl) = &network_acl_service {
+            service = service.with_network_acl(network_acl.clone());
+        }
+        let service = Arc::new(service);
+        service.spawn_worker();
+        Some(service)
+    } else {
+        None
+    };
 
     // Epic 5：审计服务 + 清理任务
     let audit_repo = SqliteAuditLogRepository::new(pool.clone());
@@ -179,8 +254,14 @@ async fn main() -> anyhow::Result<()> {
         .with_domain_event_service(domain_event_service)
         .with_notification_service(notification_service)
         .with_db_pool(pool.clone());
+    if let Some(service) = network_acl_service {
+        state = state.with_network_acl_service(service);
+    }
     if let Some(service) = feishu_auth_service {
         state = state.with_feishu_auth_service(service);
+    }
+    if let Some(service) = feishu_approval_service {
+        state = state.with_feishu_approval_service(service);
     }
     let app = build_router(state);
 

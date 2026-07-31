@@ -43,13 +43,25 @@ pub struct ServerConfig {
     pub feishu: FeishuConfig,
     /// 飞书审批外部选项 webhook。
     pub feishu_approval_options: FeishuApprovalOptionsConfig,
+    /// 飞书审批事件与实例字段配置。
+    pub feishu_approval: FeishuApprovalConfig,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct FeishuConfig {
     pub app_id: Option<String>,
     pub app_secret: Option<String>,
     pub redirect_uri: Option<String>,
+}
+
+impl std::fmt::Debug for FeishuConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FeishuConfig")
+            .field("enabled", &self.enabled())
+            .field("app_id", &self.app_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FeishuConfig {
@@ -69,6 +81,41 @@ impl FeishuConfig {
 #[derive(Clone, Default)]
 pub struct FeishuApprovalOptionsConfig {
     pub token: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct FeishuApprovalConfig {
+    pub approval_code: Option<String>,
+    pub group_control_id: Option<String>,
+    pub expiry_control_id: Option<String>,
+    pub reason_control_id: Option<String>,
+    pub verification_token: Option<String>,
+    pub encrypt_key: Option<String>,
+}
+
+impl FeishuApprovalConfig {
+    pub fn enabled(&self) -> bool {
+        [
+            self.approval_code.as_deref(),
+            self.group_control_id.as_deref(),
+            self.expiry_control_id.as_deref(),
+            self.reason_control_id.as_deref(),
+            self.verification_token.as_deref(),
+            self.encrypt_key.as_deref(),
+        ]
+        .into_iter()
+        .all(|value| value.is_some_and(|value| !value.trim().is_empty()))
+    }
+}
+
+impl std::fmt::Debug for FeishuApprovalConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FeishuApprovalConfig")
+            .field("enabled", &self.enabled())
+            .field("approval_code", &self.approval_code)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for FeishuApprovalOptionsConfig {
@@ -165,6 +212,52 @@ impl ServerConfig {
             token: optional_non_blank(env::var("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN").ok()),
         };
         validate_approval_options_token(feishu_approval_options.token.as_deref())?;
+        let feishu_approval = FeishuApprovalConfig {
+            approval_code: optional_non_blank(env::var("VPN_FEISHU_APPROVAL_CODE").ok()),
+            group_control_id: optional_non_blank(
+                env::var("VPN_FEISHU_APPROVAL_GROUP_CONTROL_ID").ok(),
+            ),
+            expiry_control_id: optional_non_blank(
+                env::var("VPN_FEISHU_APPROVAL_EXPIRY_CONTROL_ID").ok(),
+            ),
+            reason_control_id: optional_non_blank(
+                env::var("VPN_FEISHU_APPROVAL_REASON_CONTROL_ID").ok(),
+            ),
+            verification_token: optional_non_blank(
+                env::var("VPN_FEISHU_APPROVAL_VERIFICATION_TOKEN").ok(),
+            ),
+            encrypt_key: optional_non_blank(env::var("VPN_FEISHU_APPROVAL_ENCRYPT_KEY").ok()),
+        };
+        let approval_fields = [
+            feishu_approval.approval_code.is_some(),
+            feishu_approval.group_control_id.is_some(),
+            feishu_approval.expiry_control_id.is_some(),
+            feishu_approval.reason_control_id.is_some(),
+            feishu_approval.verification_token.is_some(),
+            feishu_approval.encrypt_key.is_some(),
+        ];
+        if approval_fields.iter().any(|set| *set) && !feishu_approval.enabled() {
+            anyhow::bail!("飞书审批配置必须六项同时设置");
+        }
+        if feishu_approval.enabled() && wg_backend != "kernel" {
+            anyhow::bail!("飞书审批网络授权首期仅支持 VPN_WG_BACKEND=kernel");
+        }
+        if feishu_approval.enabled() && !feishu.enabled() {
+            anyhow::bail!(
+                "飞书审批需要同时配置 VPN_FEISHU_APP_ID、VPN_FEISHU_APP_SECRET 与 VPN_FEISHU_REDIRECT_URI"
+            );
+        }
+        if feishu_approval
+            .verification_token
+            .as_deref()
+            .is_some_and(|value| value.len() < 16)
+            || feishu_approval
+                .encrypt_key
+                .as_deref()
+                .is_some_and(|value| value.len() < 16)
+        {
+            anyhow::bail!("飞书审批 Verification Token 与 Encrypt Key 至少需要 16 个字符");
+        }
 
         if feishu.enabled() {
             if let Some(uri) = feishu.redirect_uri.as_deref() {
@@ -190,6 +283,7 @@ impl ServerConfig {
             notifications,
             feishu,
             feishu_approval_options,
+            feishu_approval,
         })
     }
 }
@@ -255,6 +349,9 @@ mod tests {
             redirect_uri: Some("https://vpn.example.com/callback".into()),
         };
         assert!(complete.enabled());
+        let debug = format!("{complete:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("callback"));
         assert!(!FeishuConfig {
             app_id: Some("   ".into()),
             ..complete.clone()

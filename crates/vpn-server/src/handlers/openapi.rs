@@ -100,11 +100,11 @@ pub async fn openapi_json() -> Json<Value> {
                 "post": {
                     "tags": ["Integrations"],
                     "summary": "获取飞书审批外部选项",
-                    "description": "当前 source 支持 subnets 和 user-groups。使用请求体 token 校验来源；首版仅支持明文 result，飞书后台 Key 应留空。",
+                    "description": "当前 source 支持 subnets、user_groups 和兼容别名 user-groups。使用请求体 token 校验来源；首版仅支持明文 result，飞书后台 Key 应留空。",
                     "security": [],
                     "parameters": [{
                         "name": "source", "in": "path", "required": true,
-                        "schema": { "type": "string", "enum": ["subnets", "user-groups"] }
+                        "schema": { "type": "string", "enum": ["subnets", "user_groups", "user-groups"] }
                     }],
                     "requestBody": { "$ref": "#/components/requestBodies/FeishuExternalOptions" },
                     "responses": {
@@ -115,6 +115,25 @@ pub async fn openapi_json() -> Json<Value> {
                         "500": { "$ref": "#/components/responses/FeishuExternalOptions" },
                         "503": { "$ref": "#/components/responses/FeishuExternalOptions" },
                         "504": { "$ref": "#/components/responses/FeishuExternalOptions" }
+                    }
+                }
+            },
+            "/api/v1/integrations/feishu/approval-events": {
+                "post": {
+                    "tags": ["Integrations"],
+                    "summary": "接收加密的飞书网络授权审批事件",
+                    "description": "普通事件校验时间窗、X-Lark-Signature、AES-CBC 密文和 Verification Token 后持久化并快速 ACK；URL challenge 可不带签名头，但仍须通过解密和 token 校验。",
+                    "security": [],
+                    "parameters": [
+                        { "name": "X-Lark-Request-Timestamp", "in": "header", "required": false, "schema": { "type": "string" } },
+                        { "name": "X-Lark-Request-Nonce", "in": "header", "required": false, "schema": { "type": "string" } },
+                        { "name": "X-Lark-Signature", "in": "header", "required": false, "schema": { "type": "string" } }
+                    ],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["encrypt"], "properties": { "encrypt": { "type": "string" } } } } } },
+                    "responses": {
+                        "200": { "description": "事件 ACK 或 URL challenge" },
+                        "400": { "description": "验签、解密、token 或载荷校验失败" },
+                        "503": { "description": "飞书审批未配置" }
                     }
                 }
             },

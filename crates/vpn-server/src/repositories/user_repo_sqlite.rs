@@ -62,6 +62,7 @@ type UserRowTuple = (
     i64,
     i64,
     i64,
+    String,
     Option<String>,
 );
 
@@ -79,9 +80,10 @@ impl From<UserRowTuple> for UserRow {
             created_at: r.8,
             updated_at: r.9,
             max_devices: r.10,
+            access_mode: r.11,
             // group_concat 结果：CSV 或 NULL（无任何组）→ 解析为 Vec。
             group_ids: r
-                .11
+                .12
                 .map(|csv| {
                     csv.split(',')
                         .filter(|s| !s.is_empty())
@@ -107,6 +109,8 @@ pub struct UserRow {
     pub updated_at: i64,
     /// 允许同时注册的终端数量上限（≥1，默认 1）。
     pub max_devices: i64,
+    /// `legacy` 保持历史未分组回退；`approval_required` 无有效组时仅有 VPN 基础网段。
+    pub access_mode: String,
     /// 所属用户组 id 列表（可属多个组；未分组为空）。
     pub group_ids: Vec<String>,
 }
@@ -136,7 +140,7 @@ impl SqliteUserRepository {
     pub async fn find_by_username(&self, username: &str) -> Result<Option<UserRow>> {
         let row: Option<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                          last_login_at, created_at, updated_at, max_devices,
+                          last_login_at, created_at, updated_at, max_devices, access_mode,
                       (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                    FROM users WHERE username = ?1"#,
         )
@@ -169,7 +173,7 @@ impl SqliteUserRepository {
     pub async fn find_by_id(&self, id: &str) -> Result<Option<UserRow>> {
         let row: Option<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                          last_login_at, created_at, updated_at, max_devices,
+                          last_login_at, created_at, updated_at, max_devices, access_mode,
                       (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                    FROM users WHERE id = ?1"#,
         )
@@ -183,7 +187,7 @@ impl SqliteUserRepository {
     pub async fn find_by_email(&self, email: &str) -> Result<Option<UserRow>> {
         let rows: Vec<UserRowTuple> = sqlx::query_as(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                      last_login_at, created_at, updated_at, max_devices,
+                      last_login_at, created_at, updated_at, max_devices, access_mode,
                       (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id)
                FROM users WHERE email = ?1 COLLATE NOCASE"#,
         )
@@ -212,6 +216,35 @@ impl SqliteUserRepository {
         user_id: &str,
         password_hash: &str,
     ) -> Result<UserRow> {
+        self.resolve_external_identity_with_mode(
+            provider,
+            subject,
+            email,
+            preferred_username,
+            username_suffix,
+            user_id,
+            password_hash,
+            "legacy",
+        )
+        .await
+    }
+
+    /// 审批功能启用时，新建的外部身份账号进入审批管控；已有身份或邮箱账号不改模式。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_external_identity_with_mode(
+        &self,
+        provider: &str,
+        subject: &str,
+        email: &str,
+        preferred_username: &str,
+        username_suffix: &str,
+        user_id: &str,
+        password_hash: &str,
+        new_access_mode: &str,
+    ) -> Result<UserRow> {
+        if !matches!(new_access_mode, "legacy" | "approval_required") {
+            return Err(AppError::Validation("账号访问模式非法".into()));
+        }
         // SQLite 单写者模型下主动串行化本进程的首次绑定，避免并发首次登录退化为
         // SQLITE_BUSY；数据库唯一约束仍负责跨进程冲突的最终保护。
         let _guard = self.external_identity_lock.lock().await;
@@ -275,13 +308,14 @@ impl SqliteUserRepository {
                 let now = Utc::now().timestamp_millis();
                 sqlx::query(
                     r#"INSERT INTO users (id, username, email, password_hash, role, status,
-                       must_change_password, max_devices, created_at, updated_at)
-                       VALUES (?1, ?2, ?3, ?4, 'user', 'active', 0, 1, ?5, ?5)"#,
+                       must_change_password, max_devices, access_mode, created_at, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, 'user', 'active', 0, 1, ?5, ?6, ?6)"#,
                 )
                 .bind(user_id)
                 .bind(username)
                 .bind(email)
                 .bind(password_hash)
+                .bind(new_access_mode)
                 .bind(now)
                 .execute(&mut *tx)
                 .await
@@ -359,6 +393,7 @@ impl SqliteUserRepository {
                 created_at: now,
                 updated_at: now,
                 max_devices,
+                access_mode: "legacy".to_string(),
                 group_ids: Vec::new(),
             }),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
@@ -487,7 +522,7 @@ impl SqliteUserRepository {
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"SELECT id, username, email, password_hash, role, status, must_change_password,
-                      last_login_at, created_at, updated_at, max_devices,
+                      last_login_at, created_at, updated_at, max_devices, access_mode,
                       (SELECT group_concat(m.group_id) FROM user_group_members m WHERE m.user_id = users.id) AS group_ids
                FROM users"#,
         );
@@ -607,7 +642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_identity_creates_restricted_user_and_is_idempotent() {
+    async fn external_identity_defaults_legacy_and_explicit_mode_is_restricted() {
         let pool = setup_pool().await;
         let repo = SqliteUserRepository::new(pool);
         let created = repo
@@ -624,6 +659,7 @@ mod tests {
             .unwrap();
         assert_eq!(created.role, "user");
         assert_eq!(created.max_devices, 1);
+        assert_eq!(created.access_mode, "legacy");
         assert!(created.group_ids.is_empty());
         assert!(!created.must_change_password);
 
@@ -641,6 +677,21 @@ mod tests {
             .unwrap();
         assert_eq!(again.id, created.id);
         assert_eq!(again.email, "new@example.com");
+
+        let restricted = repo
+            .resolve_external_identity_with_mode(
+                "feishu",
+                "subject-2",
+                "restricted@example.com",
+                "restricted",
+                "abcd5678",
+                "u-restricted",
+                "random-hash",
+                "approval_required",
+            )
+            .await
+            .unwrap();
+        assert_eq!(restricted.access_mode, "approval_required");
     }
 
     #[tokio::test]

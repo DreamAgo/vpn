@@ -6,8 +6,8 @@ use vpn_core::time::{Clock, SystemClock};
 
 use crate::services::{
     ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService,
-    ExternalOptionsService, FeishuAuthService, NotificationService, PeerService, SubnetService,
-    UserGroupService, UserService,
+    ExternalOptionsService, FeishuApprovalService, FeishuAuthService, NetworkAclService,
+    NotificationService, PeerService, SubnetService, UserGroupService, UserService,
 };
 
 /// AppState 持有所有跨 handler 共享的资源。
@@ -18,6 +18,7 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub auth_service: Option<Arc<AuthService>>,
     pub feishu_auth_service: Option<Arc<FeishuAuthService>>,
+    pub feishu_approval_service: Option<Arc<FeishuApprovalService>>,
     pub external_options_service: Option<Arc<ExternalOptionsService>>,
     pub api_key_service: Option<Arc<ApiKeyService>>,
     pub user_service: Option<Arc<UserService>>,
@@ -28,6 +29,7 @@ pub struct AppState {
     pub config_service: Option<Arc<ConfigService>>,
     pub domain_event_service: Option<Arc<DomainEventService>>,
     pub notification_service: Option<Arc<NotificationService>>,
+    pub network_acl_service: Option<Arc<NetworkAclService>>,
     pub db_pool: Option<SqlitePool>,
 }
 
@@ -38,6 +40,7 @@ impl AppState {
             clock: Arc::new(SystemClock),
             auth_service: None,
             feishu_auth_service: None,
+            feishu_approval_service: None,
             external_options_service: None,
             api_key_service: None,
             user_service: None,
@@ -48,6 +51,7 @@ impl AppState {
             config_service: None,
             domain_event_service: None,
             notification_service: None,
+            network_acl_service: None,
             db_pool: None,
         }
     }
@@ -60,6 +64,24 @@ impl AppState {
     pub fn with_feishu_auth_service(mut self, svc: Arc<FeishuAuthService>) -> Self {
         self.feishu_auth_service = Some(svc);
         self
+    }
+
+    pub fn with_feishu_approval_service(mut self, svc: Arc<FeishuApprovalService>) -> Self {
+        self.feishu_approval_service = Some(svc);
+        self
+    }
+
+    pub fn with_network_acl_service(mut self, svc: Arc<NetworkAclService>) -> Self {
+        self.network_acl_service = Some(svc);
+        self
+    }
+
+    /// 变更后立即重建 kernel ACL；非 kernel/测试状态下为空操作。
+    pub async fn refresh_network_acl(&self) -> Result<(), vpn_core::AppError> {
+        if let Some(service) = &self.network_acl_service {
+            service.refresh().await?;
+        }
+        Ok(())
     }
 
     pub fn with_external_options_service(mut self, svc: Arc<ExternalOptionsService>) -> Self {
@@ -128,6 +150,14 @@ impl AppState {
         self.feishu_auth_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("飞书登录未配置".to_string()))
+    }
+
+    pub fn feishu_approval_service(
+        &self,
+    ) -> Result<Arc<FeishuApprovalService>, vpn_core::AppError> {
+        self.feishu_approval_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("飞书审批未配置".to_string()))
     }
 
     pub fn api_key_service(&self) -> Result<Arc<ApiKeyService>, vpn_core::AppError> {

@@ -56,6 +56,7 @@ pub async fn update_group(
     let dto = svc
         .update(&id, body.name.as_deref(), body.routes.as_deref())
         .await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, dto))
 }
 
@@ -67,5 +68,6 @@ pub async fn delete_group(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.user_group_service()?;
     svc.delete(&id).await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }

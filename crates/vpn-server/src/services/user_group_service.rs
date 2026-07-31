@@ -4,20 +4,33 @@
 //! 据此计算 allowed_routes(访问控制)。网段校验/归一化复用
 //! [`normalize_subnets`](super::peer_service::normalize_subnets)。
 
+use std::sync::Arc;
+
+use ipnet::Ipv4Net;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use vpn_api_types::group::UserGroupDto;
 use vpn_core::{AppError, Result};
 
 use crate::repositories::{
+    peer_repo_sqlite::SqlitePeerRepository,
     user_group_repo_sqlite::{SqliteUserGroupRepository, UserGroupRow},
     user_repo_sqlite::SqliteUserRepository,
 };
-use crate::services::peer_service::normalize_subnets;
+use crate::services::peer_service::{normalize_subnets, route_policy_lock};
 
 #[derive(Clone)]
 pub struct UserGroupService {
     pub group_repo: SqliteUserGroupRepository,
     pub user_repo: SqliteUserRepository,
+    route_policy: Option<GroupRoutePolicy>,
+}
+
+#[derive(Clone)]
+struct GroupRoutePolicy {
+    vpn_subnet: Ipv4Net,
+    peer_repo: SqlitePeerRepository,
+    lock: Arc<Mutex<()>>,
 }
 
 impl UserGroupService {
@@ -25,7 +38,21 @@ impl UserGroupService {
         Self {
             group_repo,
             user_repo,
+            route_policy: None,
         }
+    }
+
+    pub fn with_route_policy(
+        mut self,
+        vpn_subnet: Ipv4Net,
+        peer_repo: SqlitePeerRepository,
+    ) -> Self {
+        self.route_policy = Some(GroupRoutePolicy {
+            vpn_subnet,
+            peer_repo,
+            lock: route_policy_lock(),
+        });
+        self
     }
 
     /// 列出所有组(含成员数)。
@@ -41,11 +68,15 @@ impl UserGroupService {
 
     /// 创建组。名称去空白且非空;routes 校验/归一化为 CIDR。名称冲突 → DuplicateResource。
     pub async fn create(&self, name: &str, routes: &[String]) -> Result<UserGroupDto> {
+        let _route_guard = match &self.route_policy {
+            Some(policy) => Some(policy.lock.lock().await),
+            None => None,
+        };
         let name = name.trim();
         if name.is_empty() {
             return Err(AppError::Validation("用户组名称不能为空".to_string()));
         }
-        let normalized = normalize_subnets(routes)?;
+        let normalized = self.normalize_group_routes(routes).await?;
         let id = Uuid::now_v7().to_string();
         let row = self
             .group_repo
@@ -61,6 +92,10 @@ impl UserGroupService {
         name: Option<&str>,
         routes: Option<&[String]>,
     ) -> Result<UserGroupDto> {
+        let _route_guard = match &self.route_policy {
+            Some(policy) => Some(policy.lock.lock().await),
+            None => None,
+        };
         // 名称去空白校验
         let name_owned = match name {
             Some(n) => {
@@ -73,7 +108,7 @@ impl UserGroupService {
             None => None,
         };
         let routes_csv = match routes {
-            Some(r) => Some(normalize_subnets(r)?.join(",")),
+            Some(r) => Some(self.normalize_group_routes(r).await?.join(",")),
             None => None,
         };
         let affected = self
@@ -121,6 +156,40 @@ impl UserGroupService {
         self.group_repo.set_groups(user_id, group_ids).await?;
         Ok(())
     }
+
+    async fn normalize_group_routes(&self, routes: &[String]) -> Result<Vec<String>> {
+        let normalized = normalize_subnets(routes)?;
+        let Some(policy) = &self.route_policy else {
+            return Ok(normalized);
+        };
+        let nets = normalized
+            .iter()
+            .filter_map(|route| route.parse::<Ipv4Net>().ok())
+            .collect::<Vec<_>>();
+        if nets.iter().any(|net| overlaps(*net, policy.vpn_subnet)) {
+            return Err(AppError::Validation(
+                "用户组路由不得包含或重叠 VPN 基础网段".into(),
+            ));
+        }
+        let gateways = policy.peer_repo.list_active_gateway_routes().await?;
+        for (_, _, csv) in gateways {
+            for site in csv
+                .split(',')
+                .filter_map(|route| route.parse::<Ipv4Net>().ok())
+            {
+                if nets.iter().any(|net| overlaps(*net, site)) {
+                    return Err(AppError::Validation(
+                        "用户组路由不得包含或重叠站点源网段".into(),
+                    ));
+                }
+            }
+        }
+        Ok(normalized)
+    }
+}
+
+fn overlaps(left: Ipv4Net, right: Ipv4Net) -> bool {
+    left.contains(&right.network()) || right.contains(&left.network())
 }
 
 fn row_to_dto(row: UserGroupRow, member_count: u32) -> UserGroupDto {
@@ -157,10 +226,12 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        let peer_repo = SqlitePeerRepository::new(pool.clone());
         UserGroupService::new(
             SqliteUserGroupRepository::new(pool.clone()),
             SqliteUserRepository::new(pool),
         )
+        .with_route_policy("10.8.0.0/24".parse().unwrap(), peer_repo)
     }
 
     #[tokio::test]
@@ -169,13 +240,13 @@ mod tests {
         let g = svc
             .create(
                 "ops",
-                &["172.31.100.5/24".to_string(), "10.0.0.0/8".to_string()],
+                &["172.31.100.5/24".to_string(), "100.64.0.0/10".to_string()],
             )
             .await
             .unwrap();
         assert_eq!(g.name, "ops");
         assert!(g.routes.contains(&"172.31.100.0/24".to_string())); // 已归一化
-        assert!(g.routes.contains(&"10.0.0.0/8".to_string()));
+        assert!(g.routes.contains(&"100.64.0.0/10".to_string()));
         assert_eq!(g.member_count, 0);
     }
 
@@ -184,6 +255,48 @@ mod tests {
         let svc = setup().await;
         assert!(svc.create("  ", &[]).await.is_err());
         assert!(svc.create("g", &["not-a-cidr".to_string()]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_vpn_and_site_source_networks() {
+        let svc = setup().await;
+        assert!(svc
+            .create("vpn-overlap", &["10.8.0.128/25".to_string()])
+            .await
+            .is_err());
+
+        svc.user_repo
+            .insert(
+                "gateway-user",
+                "gateway",
+                "gateway@example.com",
+                "h",
+                "user",
+                false,
+                1,
+            )
+            .await
+            .unwrap();
+        svc.route_policy
+            .as_ref()
+            .unwrap()
+            .peer_repo
+            .insert(
+                "gateway-peer",
+                "gateway-user",
+                "gateway",
+                "gateway-public-key",
+                "10.8.0.2",
+                None,
+                None,
+                "192.168.50.0/24",
+            )
+            .await
+            .unwrap();
+        assert!(svc
+            .create("site-overlap", &["192.168.50.128/25".to_string()])
+            .await
+            .is_err());
     }
 
     #[tokio::test]

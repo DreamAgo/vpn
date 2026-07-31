@@ -177,17 +177,37 @@ impl SqliteUserGroupRepository {
     /// 某用户所属**所有组**可路由网段的并集;用户未属任何组 → None
     /// (None=回退全局默认;Some(空)=有组但组无网段,仅放行 VPN 子网+站点网关)。
     pub async fn routes_for_user(&self, user_id: &str) -> Result<Option<Vec<String>>> {
+        let now = Utc::now().timestamp_millis();
         let rows: Vec<(String,)> = sqlx::query_as(
             r#"SELECT g.routes FROM user_group_members m
-                 JOIN user_groups g ON m.group_id = g.id
-                WHERE m.user_id = ?1"#,
+                 JOIN user_groups g ON m.group_id = g.id WHERE m.user_id = ?1
+               UNION
+               SELECT g.routes FROM access_grants a
+                 JOIN user_groups g ON a.group_id = g.id
+                WHERE a.user_id = ?1 AND a.expires_at > ?2"#,
         )
         .bind(user_id)
+        .bind(now)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?;
         if rows.is_empty() {
-            return Ok(None);
+            let mode: Option<(String,)> =
+                sqlx::query_as("SELECT access_mode FROM users WHERE id=?1")
+                    .bind(user_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| AppError::Database(Box::new(e)))?;
+            return Ok(
+                if mode
+                    .as_ref()
+                    .is_some_and(|(mode,)| mode == "approval_required")
+                {
+                    Some(Vec::new())
+                } else {
+                    None
+                },
+            );
         }
         let mut merged: Vec<String> = Vec::new();
         for (csv,) in rows {

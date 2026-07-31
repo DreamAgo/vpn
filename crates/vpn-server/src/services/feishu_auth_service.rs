@@ -188,6 +188,7 @@ pub struct FeishuAuthService {
     flows: Arc<Mutex<Flows>>,
     user_repo: SqliteUserRepository,
     auth_service: Arc<AuthService>,
+    new_accounts_require_approval: bool,
 }
 
 impl FeishuAuthService {
@@ -203,9 +204,15 @@ impl FeishuAuthService {
             flows: Arc::new(Mutex::new(Flows::default())),
             user_repo,
             auth_service,
+            new_accounts_require_approval: false,
         };
         service.spawn_expiry_cleanup();
         service
+    }
+
+    pub fn with_approval_required_for_new_accounts(mut self, enabled: bool) -> Self {
+        self.new_accounts_require_approval = enabled;
+        self
     }
 
     pub fn enabled(&self) -> bool {
@@ -415,7 +422,7 @@ impl FeishuAuthService {
         let password_hash = self.auth_service.hasher.hash(&random_password)?;
         let user = self
             .user_repo
-            .resolve_external_identity(
+            .resolve_external_identity_with_mode(
                 PROVIDER,
                 &identity.subject,
                 &identity.email,
@@ -423,6 +430,11 @@ impl FeishuAuthService {
                 suffix,
                 &Uuid::now_v7().to_string(),
                 &password_hash,
+                if self.new_accounts_require_approval {
+                    "approval_required"
+                } else {
+                    "legacy"
+                },
             )
             .await?;
         if user.status == "disabled" {

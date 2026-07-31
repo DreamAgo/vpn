@@ -93,7 +93,7 @@ JSON API 统一返回 `ApiResponse` 信封：
 用于在飞书审批单选/多选控件中动态展示易链目录数据。当前数据源：
 
 - `subnets`：网段目录，显示为“名称（CIDR）”，选项 ID 使用网段的稳定 ID。
-- `user-groups`：用户组目录，显示用户组名称，选项 ID 使用用户组的稳定 ID。
+- `user_groups`：用户组目录，显示用户组名称，选项 ID 使用用户组的稳定 ID；`user-groups` 是兼容别名。
 
 配置：
 
@@ -101,10 +101,10 @@ JSON API 统一返回 `ApiResponse` 信封：
 2. 在飞书审批后台把请求 URL 填为 `https://<域名>/api/v1/integrations/feishu/approval-options/subnets`。
 3. Token 填写与环境变量相同的值；首版不支持可选 Key 加密，因此 Key 必须留空。
 
-用户组控件使用同一 Token，并将 URL 中的数据源替换为 `user-groups`：
+用户组控件使用同一 Token，并将 URL 中的数据源替换为 `user_groups`：
 
 ```text
-https://<域名>/api/v1/integrations/feishu/approval-options/user-groups
+https://<域名>/api/v1/integrations/feishu/approval-options/user_groups
 ```
 
 接口为公网 `POST`，支持飞书的 `query` 与 `page_token` 参数，固定每页最多 50 项。`query` 最长 256 字节，`page_token` 最长 4096 字节。token 缺失或错误时返回 HTTP 401；未配置时返回 HTTP 503；数据源读取超过 2.5 秒时返回 HTTP 504。请求 token 不会写入日志。
@@ -140,6 +140,35 @@ https://<域名>/api/v1/integrations/feishu/approval-options/user-groups
 ```
 
 新增类似目录时，实现并注册一个外部选项 provider 即可复用 token 校验、搜索、签名游标与飞书响应包装。
+
+## 飞书网络授权审批事件
+
+事件回调地址：
+
+```text
+https://<域名>/api/v1/integrations/feishu/approval-events
+```
+
+运维步骤：
+
+1. 在飞书审批后台发布“网络授权申请”，记下审批定义 `approval_code` 与三个控件的稳定 ID。
+2. “网络组”使用上节 `user_groups` 外部选项，首期必须单选；既有 `user-groups` 地址继续兼容。
+3. 在应用“事件与回调”中配置上述请求地址、Verification Token 和 Encrypt Key，并添加审批实例状态事件；配置或权限变化后发布应用。
+4. 给应用开通读取原生审批实例和联系人基础信息/邮箱所需权限，获取应用 `tenant_access_token`。
+5. **按审批定义手动订阅一次**（仅在后台添加事件还不会收到该定义的推送）：
+
+   ```bash
+   curl -X POST 'https://open.feishu.cn/open-apis/approval/v4/approvals/<approval_code>/subscribe' \
+     -H 'Authorization: Bearer <tenant_access_token>' \
+     -H 'Content-Type: application/json; charset=utf-8'
+   ```
+
+   返回 `code: 0` 后才表示订阅成功。更换审批定义时需要对新的 `approval_code` 再执行一次；首期不会由服务端自动订阅。
+6. 将 `approval_code`、三个控件 ID、Verification Token、Encrypt Key 写入对应 `VPN_FEISHU_APPROVAL_*` 环境变量并重启服务。
+
+普通事件由服务端先校验 5 分钟时间窗和 `X-Lark-Signature`，再 AES-CBC 解密并校验 Verification Token。飞书首次保存回调地址所发的 challenge 可能没有签名头，此时只允许返回已成功解密且 Verification Token 正确的 challenge，不会写入业务数据。只把匹配 `approval_code` 且状态为 `APPROVED` 的普通事件写入 durable inbox，然后快速 ACK；后台 worker 会重新查询审批实例并再次确认状态。授权严格按控件 ID 和外部选项的用户组 ID 解析，不依赖中文标题或显示文案。
+
+每张审批保存独立 `expires_at`。同一审批重推幂等，延期只延长不缩短；人工用户组不会被审批覆盖。新飞书原生账号没有有效审批时只能访问 VPN 基础网段，历史账号继续保持原未分组回退行为。撤回后的追溯撤权、单张审批多组及 userspace/auto 后端 ACL 不在首期范围。
 
 ## 主要资源
 

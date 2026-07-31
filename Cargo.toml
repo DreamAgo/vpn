@@ -79,6 +79,8 @@ validator = { version = "0.20", features = ["derive"] }
 zeroize = "1"
 sha2 = "0.10"
 hmac = "0.12"
+aes = "0.8"
+cbc = "0.1"
 
 # === WireGuard 数据平面 ===
 boringtun = "0.6"

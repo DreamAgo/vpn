@@ -44,6 +44,7 @@ pub async fn register(
 ) -> Result<Json<ApiResponse<PeerRegisterResponse>>, ApiError> {
     let svc = state.peer_service()?;
     let resp = svc.register(&current.user_id, &body).await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, resp))
 }
 
@@ -95,6 +96,7 @@ pub async fn delete_me(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.peer_service()?;
     svc.delete_me(&current.user_id).await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }
 
@@ -146,6 +148,7 @@ pub async fn update_peer_routes(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.peer_service()?;
     svc.update_peer_routes(&id, &body.routed_subnets).await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }
 
@@ -158,6 +161,7 @@ pub async fn force_remove_peer(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.peer_service()?;
     svc.force_remove(&id).await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }
 
@@ -182,5 +186,6 @@ pub async fn purge_peer(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.peer_service()?;
     svc.purge(&id).await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }

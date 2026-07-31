@@ -18,6 +18,12 @@
 | `VPN_WG_INTERFACE` | `wg0` | WireGuard 接口名（`kernel`/`userspace` 后端创建的接口）。 |
 | `VPN_AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期由后台任务自动清理。 |
 | `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` | （无） | 飞书审批“关联外部选项”请求校验 token。至少 32 个字符；应使用独立高熵随机值。 |
+| `VPN_FEISHU_APPROVAL_CODE` | （无） | 只接受该审批定义 Code 的网络授权审批。与下列五项全部配置时启用审批 webhook。 |
+| `VPN_FEISHU_APPROVAL_GROUP_CONTROL_ID` | （无） | “网络组”控件的稳定 ID；值必须是 `user_groups` 外部选项返回的用户组 ID。 |
+| `VPN_FEISHU_APPROVAL_EXPIRY_CONTROL_ID` | （无） | “授权到期日期”控件的稳定 ID。到期日按上海时区次日 00:00 保存为独占 `expires_at`。 |
+| `VPN_FEISHU_APPROVAL_REASON_CONTROL_ID` | （无） | “申请事由”控件的稳定 ID。 |
+| `VPN_FEISHU_APPROVAL_VERIFICATION_TOKEN` | （无） | 飞书事件订阅 Verification Token（敏感值）。 |
+| `VPN_FEISHU_APPROVAL_ENCRYPT_KEY` | （无） | 飞书事件订阅 Encrypt Key（敏感值）；服务端只接受验签成功的加密事件。 |
 | `RUST_LOG` | `info` | 日志级别（tracing EnvFilter 语法），如 `vpn_server=debug,info`。 |
 
 ## 启动校验
@@ -26,6 +32,8 @@
 - 数据目录与数据库父目录会在启动时自动创建。
 - 未配置 `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` 时，飞书审批外部选项接口返回 HTTP 503。
 - `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` 少于 32 个字符时启动失败。
+- 飞书审批配置只设置一部分时启动失败；启用审批时还必须完整配置飞书 App ID、App Secret 和 HTTPS Redirect URI，确保审批创建的账号可以通过飞书登录；Verification Token 少于 16 字符或 Encrypt Key 少于 16 字符时启动失败。
+- 启用飞书审批网络授权时会强制探测 `nft` 并在恢复 kernel peer 前安装 ACL；缺少 `nftables`、权限不足或规则失败时拒绝启动，不会退化为仅下发客户端路由。未启用审批的既有 kernel 部署保持原行为。
 
 ## WireGuard 数据平面后端（`VPN_WG_BACKEND`）
 
@@ -33,7 +41,7 @@
 
 | 取值 | 行为 | 依赖 | 适用 |
 |---|---|---|---|
-| `kernel` | 用内核 WireGuard（`ip link add type wireguard`） | **内核 WG 模块** + `CAP_NET_ADMIN` + `wireguard-tools` | 现代 Linux，性能最佳 |
+| `kernel` | 用内核 WireGuard；配置审批网络授权后启用强制 ACL | **内核 WG 模块** + `CAP_NET_ADMIN` + `wireguard-tools`；审批另需 `nftables` | 当前审批授权支持的生产模式 |
 | `userspace` | 用用户态 `wireguard-go` | 仅 `/dev/net/tun` + `wireguard-go`（镜像已内置） | 无内核 WG 的老内核（如 CentOS 7） |
 | `auto` | 先试 `kernel`，失败回退 `userspace` | 同上两者取其一 | 一套配置通吃新旧机器 |
 | `noop` | 仅记账、不建隧道 | 无 | 开发 / 无特权环境 / 演示 |
@@ -61,6 +69,8 @@ WireGuard 自 **Linux 5.6（2020-03）** 并入主线，之后的内核默认带
 
 - `kernel`/`userspace` 都需容器 `--cap-add NET_ADMIN`；`userspace` 额外需 `--device /dev/net/tun`。
 - 接口名由 `VPN_WG_INTERFACE`（默认 `wg0`）决定。
+- 审批授权首期只支持显式 `kernel`。`userspace`/`auto` 不启用审批 ACL；不要在这些后端配置飞书审批事件环境变量。
+- ACL 使用独立 `inet yilian_vpn_acl` table，只处理 `iifname=wg0` 的 FORWARD 流量，不修改 INPUT、OUTPUT 或 NAT。授权以短租约刷新；服务异常后租约自动到期并停止业务访问。
 
 ## 端口
 

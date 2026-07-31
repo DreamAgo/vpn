@@ -6,7 +6,9 @@ pub mod auth_service;
 pub mod config_service;
 pub mod domain_event_service;
 pub mod external_options_service;
+pub mod feishu_approval_service;
 pub mod feishu_auth_service;
+pub mod network_acl_service;
 pub mod notification_channels;
 pub mod notification_service;
 pub mod password_hasher;
@@ -26,7 +28,12 @@ pub use external_options_service::{
     ExternalOptionsRegistrationError, ExternalOptionsService, SubnetExternalOptionProvider,
     UserGroupExternalOptionProvider,
 };
+pub use feishu_approval_service::{
+    ApprovalEventHeaders, ApprovalWebhookReply, FeishuApprovalApi, FeishuApprovalService,
+    ReqwestFeishuApprovalApi,
+};
 pub use feishu_auth_service::{FeishuAuthService, ReqwestFeishuIdentityProvider};
+pub use network_acl_service::{NetworkAclService, ACL_LEASE_CAP_MS, ACL_REFRESH_INTERVAL};
 pub use notification_service::NotificationService;
 pub use password_hasher::Argon2Hasher;
 pub use peer_service::{

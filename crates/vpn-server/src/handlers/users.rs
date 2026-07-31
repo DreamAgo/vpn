@@ -89,6 +89,7 @@ pub async fn update_user(
                 ps.force_remove_by_user(&id).await?;
             }
         }
+        state.refresh_network_acl().await?;
     }
     Ok(success(&state, dto.expect("至少一个字段已校验")))
 }
@@ -115,6 +116,7 @@ pub async fn set_user_groups(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let svc = state.user_group_service()?;
     svc.set_user_groups(&id, &body.group_ids).await?;
+    state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }
 
@@ -141,5 +143,6 @@ pub async fn delete_user(
     if let Ok(gs) = state.user_group_service() {
         let _ = gs.remove_user_from_groups(&id).await;
     }
+    state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }

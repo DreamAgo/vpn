@@ -8,7 +8,7 @@
 # glibc 与运行时(debian:bookworm-slim)及客户端容器一致。
 #
 # 与 docker/Dockerfile 的关键差异（复刻线上 vpn:deploy 实际形态）：
-# - 运行时安装内核 WireGuard 所需 CLI：wireguard-tools / iproute2 / iptables
+# - 运行时安装内核 WireGuard 所需 CLI：wireguard-tools / iproute2 / iptables / nftables
 # - 二进制置于 /usr/local/bin/vpn-server，以 root 运行（CAP_NET_ADMIN）
 # - 通过 /entrypoint.sh 开启 ip_forward + 对 VPN 子网做 MASQUERADE，再 exec 服务端
 
@@ -62,7 +62,7 @@ FROM debian:bookworm-slim AS runtime
 # （无内核 WG 模块的老内核如 CentOS 7 / 3.10 只需 /dev/net/tun 即可建隧道）。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 wireguard-tools wireguard-go iproute2 iptables \
+        ca-certificates libssl3 wireguard-tools wireguard-go iproute2 iptables nftables \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /var/lib/vpn

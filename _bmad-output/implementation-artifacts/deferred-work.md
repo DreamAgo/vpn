@@ -21,6 +21,15 @@
 
 - `crates/vpn-server/src/handlers/auth.rs`：`FeishuCallbackQuery.state` 由 Axum 在进入 handler 前强制反序列化；完全缺失或畸形的 `state` 会返回框架通用 400，而非项目的飞书失败提示页。这是自动关闭改动前已存在的 extractor 行为；后续可接收可失败的 query 提取结果并补充无 `state` 的路由级测试，使所有无效回调都呈现统一重试指引。
 
+## Feishu approval network access — later phases
+
+- 审批表单单次选择多个用户组：首版每个审批只接受一个 `user_group.id`，需要多组时分别提交审批；后续扩展多选解析与逐组到期展示。
+- 自动调用飞书 `approval/v4/approvals/{approval_code}/subscribe` 并监控订阅状态：首版由部署人员按文档执行一次订阅，避免把订阅生命周期并入事件处理事务。
+- 管理后台展示审批授权明细、按组到期时间及操作历史：首版已在 SQLite 逐组记录 `expires_at` 和审计数据，但不新增管理 UI。
+- ACL 跨后端/跨发行版支持：首版只交付当前生产的 Linux kernel WireGuard + Docker + `CAP_NET_ADMIN`；后续补 userspace/auto、systemd 裸机、iptables-nft/legacy 组合与完整真机矩阵。
+- 多服务副本 worker fencing：首版是单 Docker 服务、单 worker；横向扩容前应为 inbox claim 增加 claim token/版本及条件完成写，避免超时旧 worker 覆盖新 worker 状态。
+- v1 旧备份生成时尚未导出 `external_identities`，恢复该类历史备份会缺少飞书身份绑定；后续备份工具应区分“字段缺失”和“明确为空”，并提供旧备份迁移/合并策略。
+
 ## External options pagination consistency
 
 - `crates/vpn-server/src/services/external_options_service.rs`：现有签名游标使用排序结果的数字 offset；若两个分页请求之间目录项被新增、删除或重命名，后续页可能重复、遗漏或因 offset 越界返回 400。该问题源自既有 `subnets` 通用分页实现，并非本次 `user-groups` provider 引入；后续可改为携带 `(label, id)` 的 keyset 游标，并补并发目录变更测试。

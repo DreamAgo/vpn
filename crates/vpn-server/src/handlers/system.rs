@@ -52,6 +52,7 @@ pub async fn update_server_routes(
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let svc = state.peer_service()?;
     let routes = svc.set_server_routes(&body.routes).await?;
+    state.refresh_network_acl().await?;
     Ok(Json(ApiResponse::success(
         routes,
         "n/a".to_string(),
