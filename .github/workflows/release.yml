@@ -131,7 +131,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -237,7 +237,7 @@ jobs:
           workspaces: desktop/src-tauri -> target
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -313,7 +313,7 @@ jobs:
           workspaces: desktop/src-tauri -> target
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -388,7 +388,7 @@ jobs:
           workspaces: desktop/src-tauri -> target
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
