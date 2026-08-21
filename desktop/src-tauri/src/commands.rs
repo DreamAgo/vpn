@@ -111,7 +111,7 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
     if let Some(stale) = app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL) {
         let _ = stale.close();
     }
-    let auth_window = tauri::WebviewWindowBuilder::new(
+    let mut auth_window_builder = tauri::WebviewWindowBuilder::new(
         &app,
         FEISHU_AUTH_WINDOW_LABEL,
         tauri::WebviewUrl::External(authorization_url),
@@ -120,9 +120,16 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
     .inner_size(520.0, 720.0)
     .center()
     .focused(true)
-    .on_navigation(|url| url.scheme() == "https")
-    .build()
-    .map_err(|error| format!("无法打开飞书授权窗口：{error}"))?;
+    .always_on_top(true)
+    .on_navigation(|url| url.scheme() == "https");
+    if let Some(main_window) = app.get_webview_window("main") {
+        auth_window_builder = auth_window_builder
+            .parent(&main_window)
+            .map_err(|error| format!("无法绑定飞书授权窗口：{error}"))?;
+    }
+    let auth_window = auth_window_builder
+        .build()
+        .map_err(|error| format!("无法打开飞书授权窗口：{error}"))?;
     let auth_window = FeishuAuthWindowGuard {
         window: auth_window,
     };
