@@ -99,6 +99,40 @@ impl SqliteSessionRepository {
         Ok(row.map(SessionRow::from))
     }
 
+    /// 滑动续期一个仍有效的 session，返回实际更新的行数。
+    ///
+    /// 有效性检查与更新在同一条 SQL 中完成，避免 session 在查询后被撤销时
+    /// 又被续期。`refresh_token_hash` 有唯一索引，因此正常结果只可能是 0 或 1。
+    pub async fn renew_active_by_token_hash(
+        &self,
+        hash: &str,
+        user_id: &str,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"UPDATE sessions
+               SET expires_at = MAX(expires_at, ?1)
+               WHERE refresh_token_hash = ?2
+                 AND user_id = ?3
+                 AND revoked_at IS NULL
+                 AND expires_at > ?4
+                 AND EXISTS (
+                     SELECT 1 FROM users
+                     WHERE users.id = sessions.user_id
+                       AND users.status = 'active'
+                 )"#,
+        )
+        .bind(expires_at_ms)
+        .bind(hash)
+        .bind(user_id)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(result.rows_affected())
+    }
+
     /// 撤销单个 session。
     pub async fn revoke(&self, hash: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
@@ -237,5 +271,198 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    async fn session_expiry(pool: &SqlitePool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT expires_at FROM sessions WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn renew_updates_only_matching_active_session() {
+        let pool = setup_pool().await;
+        let repo = SqliteSessionRepository::new(pool.clone());
+        let now = Utc::now().timestamp_millis();
+        let original_expiry = now + Duration::days(1).num_milliseconds();
+        let renewed_expiry = now + Duration::days(30).num_milliseconds();
+        repo.create("s1", "user-1", "h1", None, None, original_expiry)
+            .await
+            .unwrap();
+        repo.create("s2", "user-1", "h2", None, None, original_expiry)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.renew_active_by_token_hash("h1", "user-1", now, renewed_expiry)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(session_expiry(&pool, "s1").await, renewed_expiry);
+        assert_eq!(session_expiry(&pool, "s2").await, original_expiry);
+    }
+
+    #[tokio::test]
+    async fn renew_rejects_expired_revoked_and_unknown_sessions() {
+        let pool = setup_pool().await;
+        let repo = SqliteSessionRepository::new(pool.clone());
+        let now = Utc::now().timestamp_millis();
+        let expired_at = now - 1;
+        let active_until = now + Duration::days(1).num_milliseconds();
+        let renewed_expiry = now + Duration::days(30).num_milliseconds();
+        repo.create("expired", "user-1", "expired-hash", None, None, expired_at)
+            .await
+            .unwrap();
+        repo.create("boundary", "user-1", "boundary-hash", None, None, now)
+            .await
+            .unwrap();
+        repo.create(
+            "revoked",
+            "user-1",
+            "revoked-hash",
+            None,
+            None,
+            active_until,
+        )
+        .await
+        .unwrap();
+        repo.revoke("revoked-hash").await.unwrap();
+
+        for hash in [
+            "expired-hash",
+            "boundary-hash",
+            "revoked-hash",
+            "unknown-hash",
+        ] {
+            assert_eq!(
+                repo.renew_active_by_token_hash(hash, "user-1", now, renewed_expiry)
+                    .await
+                    .unwrap(),
+                0,
+                "{hash} must not be renewed"
+            );
+        }
+        assert_eq!(session_expiry(&pool, "expired").await, expired_at);
+        assert_eq!(session_expiry(&pool, "boundary").await, now);
+        assert_eq!(session_expiry(&pool, "revoked").await, active_until);
+    }
+
+    #[tokio::test]
+    async fn renew_rechecks_user_is_active_in_the_update() {
+        let pool = setup_pool().await;
+        let repo = SqliteSessionRepository::new(pool.clone());
+        let now = Utc::now().timestamp_millis();
+        let original_expiry = now + Duration::days(1).num_milliseconds();
+        repo.create("s1", "user-1", "hash", None, None, original_expiry)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET status = 'disabled' WHERE id = 'user-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.renew_active_by_token_hash(
+                "hash",
+                "user-1",
+                now,
+                now + Duration::days(30).num_milliseconds(),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(session_expiry(&pool, "s1").await, original_expiry);
+    }
+
+    #[tokio::test]
+    async fn renewed_session_can_still_be_revoked() {
+        let pool = setup_pool().await;
+        let repo = SqliteSessionRepository::new(pool);
+        let now = Utc::now().timestamp_millis();
+        repo.create("s1", "user-1", "hash", None, None, now + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.renew_active_by_token_hash(
+                "hash",
+                "user-1",
+                now,
+                now + Duration::days(30).num_milliseconds(),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        repo.revoke("hash").await.unwrap();
+        assert!(repo
+            .find_active_by_token_hash("hash", now)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo.renew_active_by_token_hash(
+                "hash",
+                "user-1",
+                now,
+                now + Duration::days(30).num_milliseconds(),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_never_shortens_session_expiry() {
+        let pool = setup_pool().await;
+        let repo = SqliteSessionRepository::new(pool.clone());
+        let now = Utc::now().timestamp_millis();
+        let later_expiry = now + Duration::days(30).num_milliseconds();
+        let earlier_expiry = later_expiry - 1_000;
+        repo.create("s1", "user-1", "hash", None, None, later_expiry)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.renew_active_by_token_hash("hash", "user-1", now, earlier_expiry)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(session_expiry(&pool, "s1").await, later_expiry);
+    }
+
+    #[tokio::test]
+    async fn revocation_between_lookup_and_renewal_wins() {
+        let pool = setup_pool().await;
+        let repo = SqliteSessionRepository::new(pool);
+        let now = Utc::now().timestamp_millis();
+        repo.create("s1", "user-1", "hash", None, None, now + 1_000)
+            .await
+            .unwrap();
+
+        assert!(repo
+            .find_active_by_token_hash("hash", now)
+            .await
+            .unwrap()
+            .is_some());
+        repo.revoke("hash").await.unwrap();
+
+        assert_eq!(
+            repo.renew_active_by_token_hash(
+                "hash",
+                "user-1",
+                now,
+                now + Duration::days(30).num_milliseconds(),
+            )
+            .await
+            .unwrap(),
+            0
+        );
     }
 }

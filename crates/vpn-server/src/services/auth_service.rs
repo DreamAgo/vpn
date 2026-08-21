@@ -137,7 +137,24 @@ impl AuthService {
         if user.status == "disabled" {
             return Err(AppError::AccountDisabled);
         }
-        self.issuer.issue_access(&user.id, &user.role).await
+        // 先准备 Access Token，避免签发器失败时 session 已被延长；只有后续原子续期
+        // 成功才会把 token 返回给调用方。
+        let access = self.issuer.issue_access(&user.id, &user.role).await?;
+        // 续期条件必须使用紧邻 UPDATE 的时间，避免 session 在前置查询期间
+        // 到期后仍被旧的 now_ms 重新续活。SQL 同时复核用户仍为 active，
+        // 避免查询后被管理员禁用的账号获得续期。
+        let renew_now = Utc::now();
+        let renew_now_ms = renew_now.timestamp_millis();
+        let renewed_expires_at =
+            (renew_now + Duration::seconds(REFRESH_TOKEN_TTL_SECS)).timestamp_millis();
+        let updated = self
+            .session_repo
+            .renew_active_by_token_hash(&hash, &user.id, renew_now_ms, renewed_expires_at)
+            .await?;
+        if updated != 1 {
+            return Err(AppError::TokenExpired);
+        }
+        Ok(access)
     }
 
     /// 主动注销（撤销 Refresh Token）。

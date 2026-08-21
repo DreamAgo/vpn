@@ -9,7 +9,7 @@ use vpn_api_types::{
 };
 use vpn_cli::api::ApiClient;
 use vpn_cli::error::CliError;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn ok_envelope<T: serde::Serialize>(data: T) -> serde_json::Value {
@@ -260,4 +260,68 @@ async fn heartbeat_posts_endpoint() {
     };
     let resp = client.heartbeat(&req).await.unwrap();
     assert_eq!(resp.allowed_routes, vec!["10.8.0.0/24", "172.31.100.0/24"]);
+}
+
+#[tokio::test]
+async fn heartbeat_unauthorized_refreshes_and_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/auth/login"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(LoginResponse {
+                access_token: "stale".into(),
+                refresh_token: "rtk".into(),
+                access_expires_in: 900,
+                must_change_password: false,
+            })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/peers/heartbeat"))
+        .and(header("authorization", "Bearer stale"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(401).set_body_json(err_envelope(1002, "token 过期")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/auth/refresh"))
+        .and(body_json(serde_json::json!({ "refresh_token": "rtk" })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(RefreshResponse {
+                access_token: "fresh".into(),
+                access_expires_in: 900,
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/peers/heartbeat"))
+        .and(header("authorization", "Bearer fresh"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(
+            vpn_api_types::peer::PeerHeartbeatResponse {
+                allowed_routes: vec!["10.8.0.0/24".into()],
+            },
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ApiClient::new(server.uri()).unwrap();
+    client.login("alice", "pw").await.unwrap();
+    let response = client
+        .heartbeat(&vpn_api_types::peer::PeerHeartbeatRequest {
+            endpoint: None,
+            wg_public_key: None,
+            rtt_ms: None,
+            loss_pct: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response.allowed_routes, vec!["10.8.0.0/24"]);
+    assert_eq!(client.access_token().as_deref(), Some("fresh"));
 }

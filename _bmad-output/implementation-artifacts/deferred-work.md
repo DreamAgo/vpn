@@ -16,6 +16,7 @@
 ## Authentication session consistency
 
 - `crates/vpn-server/src/services/auth_service.rs`：密码与飞书登录都在检查用户启用状态后再签发并持久化 session；管理员若在该窗口内并发禁用用户，仍可能产生一个随后会在 refresh 时被拒绝、但短期 access token 仍有效的会话。该 TOCTOU 属于既有认证通用问题，后续应把“用户仍启用”校验与 session 创建纳入同一事务，或在每次 access-token 鉴权时校验用户状态。
+- `crates/vpn-cli/src/wg_userspace.rs:105`、`:109`：全 workspace 严格 clippy 被两处既有 `manual_inspect` 告警阻断；后续将仅用于记录错误副作用的 `map_err` 改为 `inspect_err`，再恢复 `cargo clippy --workspace --all-targets -- -D warnings` 门禁。
 
 ## Feishu callback error UX
 
