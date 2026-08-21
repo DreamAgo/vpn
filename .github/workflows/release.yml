@@ -378,6 +378,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
+            xdg-utils \
             libssl-dev \
             libdbus-1-dev \
             pkg-config
