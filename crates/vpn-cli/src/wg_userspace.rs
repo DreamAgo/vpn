@@ -102,13 +102,11 @@ impl UserspaceTunnel {
             "初始化用户态 WireGuard 引擎"
         );
         // 1) boringtun 状态机：本地私钥 + 服务端公钥。
-        let static_private = StaticSecret::from(decode_key(client_private_key).map_err(|error| {
+        let static_private = StaticSecret::from(decode_key(client_private_key).inspect_err(|error| {
             tracing::warn!(stage = "wireguard_engine", result = "failed", elapsed_ms = bring_up_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "初始化客户端 WireGuard 密钥失败");
-            error
         })?);
-        let peer_public = PublicKey::from(decode_key(server_public_key).map_err(|error| {
+        let peer_public = PublicKey::from(decode_key(server_public_key).inspect_err(|error| {
             tracing::warn!(stage = "wireguard_engine", result = "failed", elapsed_ms = bring_up_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "初始化服务端 WireGuard 公钥失败");
-            error
         })?);
         let tunn = Tunn::new(
             static_private,

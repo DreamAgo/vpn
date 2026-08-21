@@ -84,6 +84,11 @@ pub struct ApiClient {
 impl ApiClient {
     /// 创建客户端。`base_url` 形如 `https://vpn.example.com`（不含末尾 `/`）。
     pub fn new(base_url: impl Into<String>) -> CliResult<Self> {
+        // reqwest 的 `rustls-tls` 默认使用 ring，而部分企业网络会重置不包含
+        // X25519MLKEM768 的 TLS ClientHello。vpn-cli 已经通过 WireGuard 依赖
+        // aws-lc-rs；在创建首个 HTTP 客户端前将其注册为 rustls provider，
+        // 既复用现有密码学后端，也保留 X25519/P-256 等传统回退。
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let http = reqwest::Client::builder()
             .user_agent(concat!("vpn-cli/", env!("CARGO_PKG_VERSION")))
             .build()?;
@@ -412,5 +417,15 @@ mod tests {
         assert_eq!(c.refresh_token(), None);
         c.set_refresh_token("rtk");
         assert_eq!(c.refresh_token(), Some("rtk".to_string()));
+    }
+
+    #[test]
+    fn client_installs_post_quantum_aws_lc_provider() {
+        let _ = ApiClient::new("https://x.com").unwrap();
+        let provider = rustls::crypto::CryptoProvider::get_default().unwrap();
+        assert!(provider
+            .kx_groups
+            .iter()
+            .any(|group| group.name() == rustls::NamedGroup::X25519MLKEM768));
     }
 }
