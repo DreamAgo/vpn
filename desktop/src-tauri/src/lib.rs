@@ -149,6 +149,12 @@ fn maybe_elevate() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // This must be the first network-related initialization in the desktop
+    // process. Tauri's updater also uses rustls and otherwise may select ring
+    // before vpn-cli can install the AWS-LC provider required on networks that
+    // accept only the post-quantum ClientHello used by the working client.
+    vpn_cli::api::install_tls_crypto_provider()
+        .expect("failed to initialize the required TLS crypto provider");
     let _diagnostics = observability::init();
     // 必须在创建任何窗口/事件循环之前完成提权(否则会出现两个实例的窗口)。
     maybe_elevate();

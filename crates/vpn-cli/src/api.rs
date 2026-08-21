@@ -81,6 +81,48 @@ pub struct ApiClient {
     tokens: Mutex<Tokens>,
 }
 
+/// Install the TLS crypto provider required by this client before any HTTP
+/// stack in the process can choose a different rustls provider.
+///
+/// Desktop applications must call this during process startup, before Tauri
+/// plugins are initialized. Calling it again is harmless when AWS-LC is
+/// already active, but returns an error if another provider won the global
+/// rustls race.
+pub fn install_tls_crypto_provider() -> CliResult<()> {
+    if let Some(provider) = rustls::crypto::CryptoProvider::get_default() {
+        if provider_supports_required_key_exchange(provider) {
+            return Ok(());
+        }
+        return Err(CliError::Other(
+            "TLS 密码学后端已被其他组件提前初始化".to_string(),
+        ));
+    }
+
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // Another thread may have installed the same provider between the first
+    // `get_default` and `install_default` calls.
+    if rustls::crypto::CryptoProvider::get_default()
+        .is_some_and(|provider| provider_supports_required_key_exchange(provider))
+    {
+        Ok(())
+    } else {
+        Err(CliError::Other("无法初始化 TLS 密码学后端".to_string()))
+    }
+}
+
+fn provider_supports_required_key_exchange(provider: &rustls::crypto::CryptoProvider) -> bool {
+    provider
+        .kx_groups
+        .iter()
+        .any(|group| group.name() == rustls::NamedGroup::X25519MLKEM768)
+}
+
 impl ApiClient {
     /// 创建客户端。`base_url` 形如 `https://vpn.example.com`（不含末尾 `/`）。
     pub fn new(base_url: impl Into<String>) -> CliResult<Self> {
@@ -88,7 +130,7 @@ impl ApiClient {
         // X25519MLKEM768 的 TLS ClientHello。vpn-cli 已经通过 WireGuard 依赖
         // aws-lc-rs；在创建首个 HTTP 客户端前将其注册为 rustls provider，
         // 既复用现有密码学后端，也保留 X25519/P-256 等传统回退。
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        install_tls_crypto_provider()?;
         let http = reqwest::Client::builder()
             .user_agent(concat!("vpn-cli/", env!("CARGO_PKG_VERSION")))
             .build()?;
@@ -421,6 +463,7 @@ mod tests {
 
     #[test]
     fn client_installs_post_quantum_aws_lc_provider() {
+        install_tls_crypto_provider().unwrap();
         let _ = ApiClient::new("https://x.com").unwrap();
         let provider = rustls::crypto::CryptoProvider::get_default().unwrap();
         assert!(provider
