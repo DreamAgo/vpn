@@ -12,7 +12,6 @@
     "core:window:allow-start-dragging",
     "core:event:default",
     "core:app:default",
-    "opener:allow-open-url",
     "notification:default",
     "process:default",
     "updater:default",

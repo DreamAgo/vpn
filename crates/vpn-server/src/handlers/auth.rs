@@ -86,12 +86,8 @@ const FEISHU_CALLBACK_SUCCESS_HTML: &str = r#"<!doctype html>
 </head>
 <body>
 <p>飞书授权成功。</p>
-<p>如未自动关闭，请手动关闭此窗口并返回客户端。</p>
-<script>
-window.setTimeout(function () {
-    window.close();
-}, 1200);
-</script>
+<p>授权结果已发送到易链客户端。</p>
+<p>受浏览器安全限制，本页面无法自动关闭；若客户端未自动回到前台，请手动切回，确认登录后即可关闭本页。</p>
 </body>
 </html>"#;
 
@@ -292,12 +288,11 @@ mod tests {
     use super::{feishu_callback_html, FEISHU_CALLBACK_FAILURE_HTML, FEISHU_CALLBACK_SUCCESS_HTML};
 
     #[test]
-    fn feishu_callback_success_page_attempts_close_with_visible_fallback() {
-        assert!(FEISHU_CALLBACK_SUCCESS_HTML
-            .contains("window.setTimeout(function () {\n    window.close();\n}, 1200);"));
-        assert!(
-            FEISHU_CALLBACK_SUCCESS_HTML.contains("如未自动关闭，请手动关闭此窗口并返回客户端。")
-        );
+    fn feishu_callback_success_page_explains_browser_close_limit() {
+        assert!(FEISHU_CALLBACK_SUCCESS_HTML.contains("授权结果已发送到易链客户端"));
+        assert!(FEISHU_CALLBACK_SUCCESS_HTML.contains("若客户端未自动回到前台"));
+        assert!(FEISHU_CALLBACK_SUCCESS_HTML.contains("浏览器安全限制"));
+        assert!(!FEISHU_CALLBACK_SUCCESS_HTML.contains("window.close"));
     }
 
     #[test]

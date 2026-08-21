@@ -9,7 +9,7 @@ use std::sync::{
     Arc,
 };
 
-use tauri_plugin_opener::OpenerExt;
+use tauri::Manager;
 use vpn_api_types::auth::FeishuAuthPollStatus;
 use vpn_cli::api::ApiClient;
 use vpn_cli::cli::{run_login, run_logout};
@@ -20,6 +20,7 @@ use crate::manager::VpnManager;
 use crate::observability::{self, DiagnosticsInfo, LogSnapshot};
 
 static FEISHU_LOGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+const FEISHU_AUTH_WINDOW_LABEL: &str = "feishu-auth";
 
 struct FeishuLoginGuard;
 
@@ -35,6 +36,22 @@ impl FeishuLoginGuard {
 impl Drop for FeishuLoginGuard {
     fn drop(&mut self) {
         FEISHU_LOGIN_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+struct FeishuAuthWindowGuard {
+    window: tauri::WebviewWindow,
+}
+
+impl FeishuAuthWindowGuard {
+    fn close(&self) {
+        let _ = self.window.close();
+    }
+}
+
+impl Drop for FeishuAuthWindowGuard {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -81,7 +98,7 @@ pub async fn feishu_login_available(server: String) -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
-/// 发起飞书授权，在真实用户 GUI 会话中打开系统浏览器并限时短轮询。
+/// 发起飞书授权，在独立受控 WebView 中完成扫码，并限时短轮询。
 #[tauri::command]
 pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), String> {
     let _single_flight = FeishuLoginGuard::acquire()?;
@@ -89,9 +106,26 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
     let api = ApiClient::new(&server).map_err(|e| e.to_string())?;
     let started = api.feishu_start().await.map_err(|e| e.to_string())?;
     validate_authorization_url(&started.authorization_url)?;
-    app.opener()
-        .open_url(&started.authorization_url, None::<&str>)
-        .map_err(|e| format!("无法打开系统浏览器：{e}"))?;
+    let authorization_url = url::Url::parse(&started.authorization_url)
+        .map_err(|_| "服务端返回了无效的飞书授权地址".to_string())?;
+    if let Some(stale) = app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL) {
+        let _ = stale.close();
+    }
+    let auth_window = tauri::WebviewWindowBuilder::new(
+        &app,
+        FEISHU_AUTH_WINDOW_LABEL,
+        tauri::WebviewUrl::External(authorization_url),
+    )
+    .title("飞书授权")
+    .inner_size(520.0, 720.0)
+    .center()
+    .focused(true)
+    .on_navigation(|url| url.scheme() == "https")
+    .build()
+    .map_err(|error| format!("无法打开飞书授权窗口：{error}"))?;
+    let auth_window = FeishuAuthWindowGuard {
+        window: auth_window,
+    };
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(started.expires_in.max(1) as u64);
     loop {
@@ -127,6 +161,8 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
                 let _ = api.logout().await;
                 return Err(error);
             }
+            auth_window.close();
+            crate::show_window(&app);
             return Ok(());
         }
     }

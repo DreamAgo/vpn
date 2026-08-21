@@ -27,7 +27,7 @@ struct TrayUi {
 }
 
 /// Show + focus the main popover window(健壮版:取消最小化 + 置顶一次 + 聚焦)。
-fn show_window(app: &tauri::AppHandle) {
+pub(crate) fn show_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
@@ -160,7 +160,6 @@ pub fn run() {
     maybe_elevate();
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
