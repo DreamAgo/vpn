@@ -6,7 +6,7 @@
 
 - 一台有公网 IP 的 Linux 服务器（建议 1C1G 起步，50 节点规模 2C2G）。
 - 一个解析到该服务器的域名（用于自动 HTTPS）。
-- 开放端口：TCP 80/443（Web + ACME），UDP 51820（WireGuard）。
+- 开放端口：TCP 80/443（Web + ACME），UDP 47358（混淆数据平面）。内部 WireGuard 51820 不公开。
 - 内核支持 WireGuard 数据面所需的 TUN 与 `CAP_NET_ADMIN` 权限。
 
 ## 方式一：Docker（推荐）
@@ -27,7 +27,7 @@ docker compose -f docker/docker-compose.yml logs -f
 
 - 以非 root 运行，但需 `CAP_NET_ADMIN`（compose 已声明）创建/配置网络接口。
 - 数据卷挂载 `VPN_DATA_DIR` 与数据库目录，确保重启/升级后密钥与数据不丢。
-- UDP 51820 需在 compose 与宿主防火墙同时放行。
+- UDP 47358 需在 compose 与宿主防火墙同时放行；启用方法与 PSK 生成见 [udp-obfuscation.md](udp-obfuscation.md)。
 
 首次访问 `https://<VPN_DOMAIN>`，按**首次配置向导**创建首位管理员账号。
 
@@ -68,6 +68,6 @@ sudo VPN_HTTPS=true VPN_DOMAIN=vpn.example.com \
 ## 故障排查
 
 - 看日志：`docker compose logs -f` 或 `journalctl -u vpn-server`。
-- 客户端连不上：依次检查 UDP 51820 是否放行、`VPN_ENDPOINT` 是否为客户端可达的公网地址、节点在后台是否 `online`。
+- 客户端连不上：依次检查 UDP 47358 是否放行、`VPN_OBFS_ENDPOINT` 是否为客户端可达的公网地址、两端时钟偏差及节点在后台是否 `online`。
 - 证书申请失败：确认域名解析正确且 80 端口可达。
 - 真实隧道相关限制见 [REAL-HARDWARE-CHECKLIST.md](REAL-HARDWARE-CHECKLIST.md)。

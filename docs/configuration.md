@@ -14,6 +14,12 @@
 | `VPN_SUBNET` | `10.8.0.0/24` | VPN 虚拟子网（CIDR）。`.1` 预留给服务端，`.2` 起分配给节点。 |
 | `VPN_LISTEN_PORT` | `51820` | WireGuard UDP 监听端口。 |
 | `VPN_ENDPOINT` | `<VPN_DOMAIN 或 127.0.0.1>:<VPN_LISTEN_PORT>` | 客户端连接服务端用的 `host:port`。多数情况留空由域名推导即可。 |
+| `VPN_OBFS_ENABLED` | `false` | 启用并强制使用 `obfs-v1` UDP 混淆；要求 HTTPS。 |
+| `VPN_OBFS_PSK` | 无 | 32 字节标准 Base64 PSK；启用混淆时必填。 |
+| `VPN_OBFS_MODE` | `low-overhead-v1` | 混淆模式，也可设 `paranoid-v1`。 |
+| `VPN_OBFS_BIND_ADDR` | `0.0.0.0:47358` | 混淆公网监听地址。 |
+| `VPN_OBFS_ENDPOINT` | `<VPN_DOMAIN>:47358` | 下发给新客户端的混淆 endpoint。 |
+| `VPN_OBFS_PATH_MTU` | `1500` | 外层路径 MTU（576–9000）。 |
 | `VPN_WG_BACKEND` | `noop` | WireGuard 数据平面后端：`kernel` / `userspace` / `auto` / `noop`。**生产必须显式设置**（默认 `noop` 不建真实隧道）。详见下节。 |
 | `VPN_WG_INTERFACE` | `wg0` | WireGuard 接口名（`kernel`/`userspace` 后端创建的接口）。 |
 | `VPN_AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期由后台任务自动清理。 |
@@ -78,7 +84,7 @@ WireGuard 自 **Linux 5.6（2020-03）** 并入主线，之后的内核默认带
 |---|---|---|
 | `VPN_BIND_ADDR` 端口（默认 8080） | TCP | HTTP API + Web 后台 |
 | 80 / 443 | TCP | 启用 HTTPS 时：80 用于 ACME HTTP-01 + 跳转，443 用于 Web/API |
-| `VPN_LISTEN_PORT`（默认 51820） | UDP | WireGuard 数据平面 |
+| `VPN_OBFS_BIND_ADDR`（默认 47358） | UDP | 唯一公网混淆数据平面；51820 仅容器内部使用 |
 
 ## 最小生产配置示例
 

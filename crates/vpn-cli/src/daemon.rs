@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use crate::api::ApiClient;
 use crate::config::DaemonConfig;
@@ -170,6 +171,29 @@ pub struct TunnelParams {
     pub client_private_key: String,
     /// 应导入隧道的网段（AllowedIPs）：VPN 子网 + 各站点 LAN。
     pub allowed_routes: Vec<String>,
+    /// 可选 Rust 原生 UDP 混淆配置。
+    pub transport: Option<TunnelTransport>,
+}
+
+/// 已验证并以可清零内存保存的客户端混淆配置。
+#[derive(Clone)]
+pub struct TunnelTransport {
+    /// 线协议模式。
+    pub mode: vpn_api_types::peer::ObfsMode,
+    /// Base64 PSK；离开作用域时清零。
+    pub psk: Zeroizing<String>,
+    /// 外层路径 MTU。
+    pub path_mtu: u16,
+}
+
+impl std::fmt::Debug for TunnelTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TunnelTransport")
+            .field("mode", &self.mode)
+            .field("path_mtu", &self.path_mtu)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 纯逻辑：计算客户端隧道实际使用的 allowed-ips。
@@ -238,6 +262,7 @@ pub async fn connect_once(
         os_info: Some(detect_os_info()),
         // 节点健康监控：上报客户端版本。
         client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        capabilities: vec!["obfs-v1".to_string()],
     };
     let register_started = Instant::now();
     tracing::info!(
@@ -260,19 +285,46 @@ pub async fn connect_once(
         "节点注册响应已接收"
     );
 
-    // Split-horizon：内网节点可经 `VPN_ENDPOINT_OVERRIDE` 用内网 endpoint 直连，
-    // 避开公网 IP 的 NAT 回环；外网节点不设置该变量，用服务端下发的(公网) endpoint。
-    let server_endpoint = std::env::var("VPN_ENDPOINT_OVERRIDE")
+    // Split-horizon：原生 WG 与混淆传输使用不同的 override，避免把混淆报文误发到
+    // 内网原生 WG 端口。外网节点不设置变量，直接使用服务端下发的公网 endpoint。
+    let advertised_endpoint = resp
+        .transport
+        .as_ref()
+        .map(|transport| transport.endpoint.clone())
+        .unwrap_or_else(|| resp.server_endpoint.clone());
+    let endpoint_override = if resp.transport.is_some() {
+        "VPN_OBFS_ENDPOINT_OVERRIDE"
+    } else {
+        "VPN_ENDPOINT_OVERRIDE"
+    };
+    let server_endpoint = std::env::var(endpoint_override)
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| resp.server_endpoint.clone());
-    if server_endpoint != resp.server_endpoint {
+        .unwrap_or_else(|| advertised_endpoint.clone());
+    if server_endpoint != advertised_endpoint {
         tracing::info!(
             stage = "endpoint_select",
             result = "override",
-            "使用 VPN_ENDPOINT_OVERRIDE 覆盖隧道 endpoint"
+            variable = endpoint_override,
+            "使用本地配置覆盖隧道 endpoint"
         );
     }
+    let transport = resp
+        .transport
+        .map(|transport| {
+            if transport.protocol != "obfs-v1" {
+                return Err(CliError::Invalid(format!(
+                    "不支持的数据面传输协议: {}",
+                    transport.protocol
+                )));
+            }
+            Ok(TunnelTransport {
+                mode: transport.mode,
+                psk: transport.psk,
+                path_mtu: transport.path_mtu,
+            })
+        })
+        .transpose()?;
 
     tracing::info!(
         stage = "control_plane",
@@ -288,6 +340,7 @@ pub async fn connect_once(
         server_endpoint,
         client_private_key: keypair.private_key.clone(),
         allowed_routes: resp.allowed_routes.clone(),
+        transport,
     })
 }
 
@@ -324,6 +377,7 @@ pub async fn bring_up_tunnel(
         &keypair.private_key,
         &params.server_public_key,
         &params.server_endpoint,
+        params.transport.as_ref(),
         vpn_ip,
         prefix,
         &allowed,
@@ -793,6 +847,7 @@ mod tests {
             server_endpoint: "1.2.3.4:51820".into(),
             client_private_key: "priv".into(),
             allowed_routes: allowed,
+            transport: None,
         }
     }
 

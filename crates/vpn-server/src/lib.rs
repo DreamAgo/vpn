@@ -15,6 +15,7 @@ pub mod shutdown;
 pub mod startup;
 pub mod state;
 pub mod tls;
+pub mod udp_obfs;
 
 pub use app::build_router;
 pub use config::ServerConfig;

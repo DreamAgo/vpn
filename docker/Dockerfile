@@ -74,7 +74,7 @@ COPY --from=builder /app/migrations /app/migrations
 
 USER vpn
 
-EXPOSE 80 443 8080 51820/udp
+EXPOSE 80 443 8080 51820/udp 47358/udp
 
 ENV VPN_BIND_ADDR=0.0.0.0:8080
 ENV VPN_DATA_DIR=/var/lib/vpn

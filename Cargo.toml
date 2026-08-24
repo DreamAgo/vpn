@@ -7,6 +7,7 @@ members = [
     "crates/vpn-platform",
     "crates/vpn-server",
     "crates/vpn-cli",
+    "crates/vpn-obfs",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ vpn-api-types = { path = "crates/vpn-api-types" }
 vpn-core = { path = "crates/vpn-core" }
 vpn-wireguard = { path = "crates/vpn-wireguard" }
 vpn-platform = { path = "crates/vpn-platform" }
+vpn-obfs = { path = "crates/vpn-obfs" }
 
 # === 序列化 ===
 serde = { version = "1.0", features = ["derive"] }
@@ -76,11 +78,13 @@ rand = "0.8"
 rsa = { version = "0.9", features = ["pem"] }
 tower_governor = "0.8"
 validator = { version = "0.20", features = ["derive"] }
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 sha2 = "0.10"
 hmac = "0.12"
 aes = "0.8"
 cbc = "0.1"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
 
 # === WireGuard 数据平面 ===
 boringtun = "0.6"

@@ -1,6 +1,42 @@
 //! 服务端配置：环境变量 + 默认值。
 
 use std::env;
+use std::net::SocketAddr;
+
+use base64::Engine;
+use vpn_api_types::peer::ObfsMode;
+use zeroize::Zeroizing;
+
+/// UDP 混淆监听配置。PSK 的 Debug 输出始终脱敏。
+#[derive(Clone)]
+pub struct ObfsConfig {
+    pub bind_addr: String,
+    pub public_endpoint: String,
+    pub mode: ObfsMode,
+    pub path_mtu: u16,
+    pub psk: Zeroizing<[u8; 32]>,
+    pub max_sessions: usize,
+    pub new_sessions_per_ip_per_minute: u32,
+    pub session_idle_secs: u64,
+}
+
+impl std::fmt::Debug for ObfsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObfsConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("public_endpoint", &self.public_endpoint)
+            .field("mode", &self.mode)
+            .field("path_mtu", &self.path_mtu)
+            .field("max_sessions", &self.max_sessions)
+            .field(
+                "new_sessions_per_ip_per_minute",
+                &self.new_sessions_per_ip_per_minute,
+            )
+            .field("session_idle_secs", &self.session_idle_secs)
+            .finish_non_exhaustive()
+    }
+}
 
 /// 服务端启动配置。
 ///
@@ -28,6 +64,8 @@ pub struct ServerConfig {
     /// 若未显式设置 `VPN_ENDPOINT`，则用 `VPN_DOMAIN:vpn_listen_port`（若有域名），
     /// 否则回退占位 `127.0.0.1:vpn_listen_port`（开发用）。
     pub vpn_endpoint: String,
+    /// 可选的 Rust 原生 UDP 混淆传输。
+    pub obfs: Option<ObfsConfig>,
     /// 审计日志保留天数（Story 5.3 清理任务）。默认 180。
     pub audit_retention_days: u32,
     /// WireGuard 后端："noop"（默认，仅记账，无需特权）或 "kernel"（Linux 内核 WireGuard，需 root/CAP_NET_ADMIN + wg 工具）。
@@ -166,6 +204,67 @@ impl ServerConfig {
             let host = domain.clone().unwrap_or_else(|| "127.0.0.1".to_string());
             format!("{host}:{vpn_listen_port}")
         });
+        let obfs = if env_bool("VPN_OBFS_ENABLED", false) {
+            if !enable_https {
+                anyhow::bail!("启用 UDP 混淆时必须启用 HTTPS，禁止通过 HTTP 下发 PSK");
+            }
+            let encoded = Zeroizing::new(
+                env::var("VPN_OBFS_PSK")
+                    .map_err(|_| anyhow::anyhow!("启用 UDP 混淆时必须设置 VPN_OBFS_PSK"))?,
+            );
+            let decoded = Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .map_err(|_| anyhow::anyhow!("VPN_OBFS_PSK 必须是 32 字节标准 Base64"))?,
+            );
+            let psk: [u8; 32] = decoded
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("VPN_OBFS_PSK 解码后必须恰好为 32 字节"))?;
+            let mode = match env::var("VPN_OBFS_MODE")
+                .unwrap_or_else(|_| "low-overhead-v1".to_string())
+                .as_str()
+            {
+                "low-overhead-v1" => ObfsMode::LowOverheadV1,
+                "paranoid-v1" => ObfsMode::ParanoidV1,
+                other => anyhow::bail!("VPN_OBFS_MODE 不支持: {other}"),
+            };
+            let bind_addr =
+                env::var("VPN_OBFS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:47358".to_string());
+            let parsed_bind: SocketAddr = bind_addr
+                .parse()
+                .map_err(|_| anyhow::anyhow!("VPN_OBFS_BIND_ADDR 必须是 IPv4 socket 地址"))?;
+            if !parsed_bind.is_ipv4() {
+                anyhow::bail!("VPN_OBFS_BIND_ADDR 当前仅支持 IPv4");
+            }
+            let public_endpoint = env::var("VPN_OBFS_ENDPOINT").unwrap_or_else(|_| {
+                let host = domain.as_deref().unwrap_or("127.0.0.1");
+                format!("{host}:47358")
+            });
+            validate_ipv4_endpoint(&public_endpoint)?;
+            let path_mtu = match env::var("VPN_OBFS_PATH_MTU") {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("VPN_OBFS_PATH_MTU 必须是整数"))?,
+                Err(env::VarError::NotPresent) => 1500,
+                Err(error) => return Err(error.into()),
+            };
+            if !(576..=9000).contains(&path_mtu) {
+                anyhow::bail!("VPN_OBFS_PATH_MTU 必须在 576..=9000");
+            }
+            Some(ObfsConfig {
+                bind_addr,
+                public_endpoint,
+                mode,
+                path_mtu,
+                psk: Zeroizing::new(psk),
+                max_sessions: 4096,
+                new_sessions_per_ip_per_minute: 20,
+                session_idle_secs: 180,
+            })
+        } else {
+            None
+        };
 
         let audit_retention_days = env::var("VPN_AUDIT_RETENTION_DAYS")
             .ok()
@@ -173,6 +272,9 @@ impl ServerConfig {
             .unwrap_or(180);
 
         let wg_backend = env::var("VPN_WG_BACKEND").unwrap_or_else(|_| "noop".to_string());
+        if obfs.is_some() && wg_backend == "noop" {
+            anyhow::bail!("启用 UDP 混淆时必须配置真实 WireGuard 后端，不能使用 noop");
+        }
         let wg_interface = env::var("VPN_WG_INTERFACE").unwrap_or_else(|_| "wg0".to_string());
         let server_routes = env::var("VPN_SERVER_ROUTES")
             .ok()
@@ -276,6 +378,7 @@ impl ServerConfig {
             vpn_subnet,
             vpn_listen_port,
             vpn_endpoint,
+            obfs,
             audit_retention_days,
             wg_backend,
             wg_interface,
@@ -297,6 +400,19 @@ fn optional_non_blank(value: Option<String>) -> Option<String> {
 fn validate_approval_options_token(token: Option<&str>) -> anyhow::Result<()> {
     if token.is_some_and(|token| token.len() < 32) {
         anyhow::bail!("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN 至少需要 32 个字符");
+    }
+    Ok(())
+}
+
+fn validate_ipv4_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("VPN_OBFS_ENDPOINT 必须是 host:port"))?;
+    if host.is_empty()
+        || host.contains(':')
+        || port.parse::<u16>().ok().filter(|p| *p > 0).is_none()
+    {
+        anyhow::bail!("VPN_OBFS_ENDPOINT 必须是有效的 IPv4/域名 host:port");
     }
     Ok(())
 }
@@ -323,6 +439,12 @@ mod tests {
             env::remove_var("VPN_SUBNET");
             env::remove_var("VPN_LISTEN_PORT");
             env::remove_var("VPN_ENDPOINT");
+            env::remove_var("VPN_OBFS_ENABLED");
+            env::remove_var("VPN_OBFS_PSK");
+            env::remove_var("VPN_OBFS_MODE");
+            env::remove_var("VPN_OBFS_BIND_ADDR");
+            env::remove_var("VPN_OBFS_ENDPOINT");
+            env::remove_var("VPN_OBFS_PATH_MTU");
             env::remove_var("VPN_AUDIT_RETENTION_DAYS");
             env::remove_var("VPN_WG_BACKEND");
             env::remove_var("VPN_WG_INTERFACE");

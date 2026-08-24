@@ -19,7 +19,7 @@ pub async fn system_info(
     RequireAdmin(_): RequireAdmin,
 ) -> Result<Json<ApiResponse<SystemInfo>>, ApiError> {
     let svc = state.peer_service()?;
-    let endpoint = svc.server_endpoint().to_string();
+    let endpoint = svc.public_data_endpoint().to_string();
     // listen_port：从 endpoint(host:port) 解析，失败回退默认 51820。
     let listen_port = endpoint
         .rsplit_once(':')

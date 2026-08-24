@@ -8,15 +8,19 @@
 use std::net::Ipv4Addr;
 use std::sync::{Arc, OnceLock};
 
+use base64::Engine;
 use ipnet::Ipv4Net;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
-use vpn_api_types::peer::{PeerHeartbeatRequest, PeerRegisterRequest, PeerRegisterResponse};
+use vpn_api_types::peer::{
+    ObfsMode, ObfsTransport, PeerHeartbeatRequest, PeerRegisterRequest, PeerRegisterResponse,
+};
 use vpn_core::{AppError, Result};
 use vpn_wireguard::{
     generate_keypair, public_key_from_private, render_client_config, IpPool,
     KernelWireGuardControl, NoopWireGuardControl, WgMode, WgPeerConfig, WireGuardControl,
 };
+use zeroize::Zeroizing;
 
 use crate::repositories::{
     peer_event_repo_sqlite::SqlitePeerEventRepository, peer_repo_sqlite::SqlitePeerRepository,
@@ -176,6 +180,27 @@ pub struct PeerService {
     /// 串行化 peer 注册/槽位接管与 admin 路由修改，避免数据库和 WireGuard
     /// 使用不同时间点的 routed_subnets 快照。
     peer_route_lock: Arc<Mutex<()>>,
+    obfs_transport: Option<ObfsTransportSecret>,
+}
+
+#[derive(Clone)]
+struct ObfsTransportSecret {
+    mode: ObfsMode,
+    endpoint: String,
+    psk: Zeroizing<String>,
+    path_mtu: u16,
+}
+
+impl ObfsTransportSecret {
+    fn dto(&self) -> ObfsTransport {
+        ObfsTransport {
+            protocol: "obfs-v1".to_string(),
+            mode: self.mode,
+            endpoint: self.endpoint.clone(),
+            psk: self.psk.clone(),
+            path_mtu: self.path_mtu,
+        }
+    }
 }
 
 impl PeerService {
@@ -205,7 +230,21 @@ impl PeerService {
             server_endpoint,
             server_routes: Arc::new(RwLock::new(server_routes)),
             peer_route_lock: route_policy_lock(),
+            obfs_transport: None,
         }
+    }
+
+    /// 设置强制使用的 v1 混淆传输。启用后旧客户端注册会被明确拒绝。
+    pub fn with_obfs_transport(mut self, config: Option<&crate::config::ObfsConfig>) -> Self {
+        self.obfs_transport = config.map(|config| ObfsTransportSecret {
+            mode: config.mode,
+            endpoint: config.public_endpoint.clone(),
+            psk: Zeroizing::new(
+                base64::engine::general_purpose::STANDARD.encode(config.psk.as_ref()),
+            ),
+            path_mtu: config.path_mtu,
+        });
+        self
     }
 
     /// 当前服务端 LAN 网段（快照）。
@@ -238,6 +277,14 @@ impl PeerService {
         &self.server_endpoint
     }
 
+    /// 当前实际对客户端开放的数据面 endpoint。
+    pub fn public_data_endpoint(&self) -> &str {
+        self.obfs_transport
+            .as_ref()
+            .map(|transport| transport.endpoint.as_str())
+            .unwrap_or(&self.server_endpoint)
+    }
+
     /// VPN 子网 CIDR（system info 展示）。
     pub fn vpn_subnet_cidr(&self) -> String {
         self.subnet_cidr()
@@ -264,6 +311,12 @@ impl PeerService {
         user_id: &str,
         req: &PeerRegisterRequest,
     ) -> Result<PeerRegisterResponse> {
+        if self.obfs_transport.is_some() && !req.capabilities.iter().any(|value| value == "obfs-v1")
+        {
+            return Err(AppError::Validation(
+                "服务端已强制启用 obfs-v1；当前客户端版本过旧，请升级客户端".to_string(),
+            ));
+        }
         let _route_guard = self.peer_route_lock.lock().await;
         let peers = self.peer_repo.list_active_by_user(user_id).await?;
         // 终端匹配：公钥优先（同一运行内重连），其次设备名（重启后换了密钥对）。
@@ -445,6 +498,7 @@ impl PeerService {
             allowed_routes: self
                 .compute_allowed_routes(user_id, &routed_subnets)
                 .await?,
+            transport: self.obfs_transport.as_ref().map(ObfsTransportSecret::dto),
         })
     }
 
@@ -1406,12 +1460,32 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)));
     }
 
+    #[tokio::test]
+    async fn obfs_enabled_rejects_client_without_capability() {
+        let transport = crate::config::ObfsConfig {
+            bind_addr: "127.0.0.1:47358".into(),
+            public_endpoint: "vpn.example.com:47358".into(),
+            mode: vpn_api_types::peer::ObfsMode::LowOverheadV1,
+            path_mtu: 1500,
+            psk: Zeroizing::new([7u8; 32]),
+            max_sessions: 4096,
+            new_sessions_per_ip_per_minute: 20,
+            session_idle_secs: 180,
+        };
+        let svc = service(setup_pool().await).with_obfs_transport(Some(&transport));
+        let mut request = reg("PK1");
+        request.capabilities.clear();
+        let error = svc.register("user-1", &request).await.unwrap_err();
+        assert!(matches!(error, AppError::Validation(message) if message.contains("obfs-v1")));
+    }
+
     fn reg(pk: &str) -> PeerRegisterRequest {
         PeerRegisterRequest {
             wg_public_key: pk.to_string(),
             device_name: "MBP".to_string(),
             os_info: Some("macOS".to_string()),
             client_version: None,
+            capabilities: vec!["obfs-v1".to_string()],
         }
     }
 
@@ -1421,6 +1495,7 @@ mod tests {
             device_name: device.to_string(),
             os_info: None,
             client_version: None,
+            capabilities: vec!["obfs-v1".to_string()],
         }
     }
 
@@ -1637,6 +1712,7 @@ mod tests {
             device_name: "MBP".into(),
             os_info: Some("macOS 14".into()),
             client_version: Some("0.1.0".into()),
+            capabilities: vec!["obfs-v1".to_string()],
         };
         svc.register("user-1", &req1).await.unwrap();
         let peer = svc

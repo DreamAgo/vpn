@@ -74,7 +74,7 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 WORKDIR /app
-EXPOSE 80 443 8080 8889 51820/udp
+EXPOSE 80 443 8080 8889 51820/udp 47358/udp
 
 ENV VPN_DATA_DIR=/var/lib/vpn
 ENV DATABASE_URL=sqlite:////var/lib/vpn/vpn.db?mode=rwc

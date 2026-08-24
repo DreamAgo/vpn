@@ -4715,6 +4715,7 @@ version = "0.1.12"
 dependencies = [
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -4742,9 +4743,11 @@ dependencies = [
  "tun",
  "vpn-api-types",
  "vpn-core",
+ "vpn-obfs",
  "vpn-platform",
  "vpn-wireguard",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -4757,6 +4760,19 @@ dependencies = [
  "thiserror 2.0.18",
  "uuid",
  "vpn-api-types",
+]
+
+[[package]]
+name = "vpn-obfs"
+version = "0.1.12"
+dependencies = [
+ "aes",
+ "chacha20poly1305",
+ "hkdf",
+ "rand 0.8.6",
+ "sha2",
+ "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -4818,6 +4834,7 @@ dependencies = [
  "validator",
  "vpn-api-types",
  "vpn-core",
+ "vpn-obfs",
  "vpn-wireguard",
  "zeroize",
 ]
@@ -5782,6 +5799,7 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

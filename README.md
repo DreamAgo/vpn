@@ -27,7 +27,7 @@
    员工客户端 ─────▶ │  │ 用户/会话/节点/审计  (SQLite)   │  │
    (vpn-cli)        │  ├────────────────────────────────┤  │
        │            │  │ WireGuardControl + IP 池        │  │
-       │  WireGuard │  │ (boringtun 用户态, UDP 51820)   │  │
+       │  obfs-v1   │  │ (公网 UDP 47358 → 内部 WG)      │  │
        └───UDP──────┼─▶└────────────────────────────────┘  │
                     └─────────────────────────────────────┘
 ```
@@ -39,7 +39,7 @@
 | 层 | 选型 |
 |---|---|
 | 后端 | Rust · tokio · axum 0.8 · sqlx(SQLite) · argon2id · JWT(RS256) |
-| 数据平面 | WireGuard（boringtun 用户态）· x25519 密钥 · 静态 IP 池 |
+| 数据平面 | WireGuard（boringtun 用户态）· Rust 原生 UDP 混淆 · x25519 密钥 · 静态 IP 池 |
 | 客户端 | Rust · clap · tun-rs（跨平台 TUN）· keyring（系统凭据库）· Unix Socket / Named Pipe IPC |
 | 前端 | React 19 · TypeScript · Vite · Ant Design 5 + Pro Components · React Query · Zustand |
 | 部署 | Docker 单容器 · 自动 HTTPS（rustls-acme）· GitHub Actions 三平台 CI |

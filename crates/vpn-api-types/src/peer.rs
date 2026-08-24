@@ -6,6 +6,7 @@
 //! - admin 后台用 `PeerDto` 展示节点列表/状态
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// 注册节点请求（POST /api/v1/peers/register）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,46 @@ pub struct PeerRegisterRequest {
     /// 可选：客户端版本（如 "0.1.0"，节点健康监控展示用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// 客户端支持的数据面能力，例如 `obfs-v1`。
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// 混淆传输模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObfsMode {
+    /// 握手 AEAD、数据包仅首块加密的低开销模式。
+    LowOverheadV1,
+    /// 所有包 AEAD 并填充到路径上限的全填充模式。
+    ParanoidV1,
+}
+
+/// 服务端下发的可选数据面传输配置。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ObfsTransport {
+    /// 固定为 `obfs-v1`。
+    pub protocol: String,
+    /// 线协议模式。
+    pub mode: ObfsMode,
+    /// 混淆 UDP 公网 endpoint。
+    pub endpoint: String,
+    /// 32 字节 PSK 的标准 Base64；仅允许经 HTTPS 下发。
+    pub psk: Zeroizing<String>,
+    /// 外层路径 MTU。
+    pub path_mtu: u16,
+}
+
+impl std::fmt::Debug for ObfsTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObfsTransport")
+            .field("protocol", &self.protocol)
+            .field("mode", &self.mode)
+            .field("endpoint", &self.endpoint)
+            .field("path_mtu", &self.path_mtu)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 注册节点响应：客户端据此组装本地 WireGuard 隧道。
@@ -37,6 +78,9 @@ pub struct PeerRegisterResponse {
     /// 客户端据此实现分隧道（只把这些网段导入 VPN，普通上网走本地）。
     #[serde(default)]
     pub allowed_routes: Vec<String>,
+    /// 可选上层混淆传输；缺省时保持原生 WireGuard。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ObfsTransport>,
 }
 
 /// 心跳请求（POST /api/v1/peers/heartbeat），每 30s 一次。
@@ -167,7 +211,8 @@ pub struct AdminPeerQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::PeerRegisterRequest;
+    use super::{ObfsMode, ObfsTransport, PeerRegisterRequest};
+    use zeroize::Zeroizing;
 
     #[test]
     fn register_request_ignores_legacy_routed_subnets() {
@@ -180,7 +225,24 @@ mod tests {
 
         assert_eq!(request.wg_public_key, "pk");
         assert_eq!(request.device_name, "gateway");
+        assert!(request.capabilities.is_empty());
         let serialized = serde_json::to_value(request).unwrap();
         assert!(serialized.get("routed_subnets").is_none());
+    }
+
+    #[test]
+    fn transport_debug_redacts_psk_and_mode_uses_kebab_case() {
+        let transport = ObfsTransport {
+            protocol: "obfs-v1".into(),
+            mode: ObfsMode::ParanoidV1,
+            endpoint: "vpn.example.com:47358".into(),
+            psk: Zeroizing::new("TOP_SECRET".to_string()),
+            path_mtu: 1500,
+        };
+        assert!(!format!("{transport:?}").contains("TOP_SECRET"));
+        assert_eq!(
+            serde_json::to_value(ObfsMode::LowOverheadV1).unwrap(),
+            "low-overhead-v1"
+        );
     }
 }

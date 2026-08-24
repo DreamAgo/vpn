@@ -47,9 +47,11 @@ vpn-cli daemon install
 ## 工作原理
 
 1. `login` 调用服务端认证，拿到 access/refresh token，凭证存入系统凭据库（`CredentialStore`）。
-2. 连接时客户端本地生成 WireGuard 密钥对，向服务端 `POST /peers/register` 注册公钥，得到分配的**静态 VPN IP** 与服务端公钥/endpoint。
+2. 连接时客户端本地生成 WireGuard 密钥对，向服务端 `POST /peers/register` 注册公钥，得到分配的**静态 VPN IP**、服务端公钥和可选 `obfs-v1` 传输配置。
 3. daemon 打开 TUN 设备、配置 IP，建立隧道，并每 30 秒发送心跳。
 4. 连接中断或网络切换时按指数退避自动重连。
+
+服务端启用混淆后，客户端在同一进程内完成封装，不需要额外代理程序。配置或认证失败时会明确报错，不会回退到可被识别的原生 WireGuard。详见 [UDP 混淆传输](udp-obfuscation.md)。
 
 ## 凭据与隐私
 

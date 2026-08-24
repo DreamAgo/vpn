@@ -25,14 +25,18 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::Instrument;
 use tun::AbstractDevice;
+use vpn_api_types::peer::ObfsMode;
+use vpn_obfs::{Codec, Direction, Mode, ReplayCache};
+use zeroize::Zeroizing;
 
-use crate::daemon::SharedState;
+use crate::daemon::{SharedState, TunnelTransport};
 use crate::error::{CliError, CliResult};
 
-/// 缓冲区大小：WireGuard over UDP，留足 MTU + 协议开销。
-const BUF_SIZE: usize = 2048;
 /// TUN MTU：低于物理 MTU 以容纳 WireGuard 封装开销（~60B），避免分片。
 const TUN_MTU: u16 = 1420;
+const IP_UDP_OVERHEAD: u16 = 28;
+const OBFS_FRAME_OVERHEAD: u16 = 42;
+const WG_OVERHEAD: u16 = 32;
 /// 定时器步进：boringtun 建议 ~100–250ms 调一次 update_timers。
 const TIMER_TICK: Duration = Duration::from_millis(250);
 
@@ -45,6 +49,55 @@ fn decode_key(b64: &str) -> CliResult<[u8; 32]> {
         .as_slice()
         .try_into()
         .map_err(|_| CliError::Other("WireGuard 密钥长度非 32 字节".to_string()))
+}
+
+#[derive(Debug)]
+struct ObfsRuntime {
+    encoder: Codec,
+    decoder: Codec,
+    replay: ReplayCache,
+}
+
+fn build_obfs_runtime(transport: &TunnelTransport) -> CliResult<ObfsRuntime> {
+    let psk = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(transport.psk.trim())
+            .map_err(|_| CliError::Invalid("混淆 PSK Base64 非法".to_string()))?,
+    );
+    if psk.len() != 32 || !(576..=9000).contains(&transport.path_mtu) {
+        return Err(CliError::Invalid(
+            "混淆 PSK 或 path MTU 配置非法".to_string(),
+        ));
+    }
+    let mode = match transport.mode {
+        ObfsMode::LowOverheadV1 => Mode::LowOverheadV1,
+        ObfsMode::ParanoidV1 => Mode::ParanoidV1,
+    };
+    let max_datagram = usize::from(transport.path_mtu - IP_UDP_OVERHEAD);
+    let encoder = Codec::new(&psk, mode, Direction::ClientToServer, max_datagram)
+        .map_err(|error| CliError::Invalid(error.to_string()))?;
+    let decoder = Codec::new(&psk, mode, Direction::ServerToClient, max_datagram)
+        .map_err(|error| CliError::Invalid(error.to_string()))?;
+    Ok(ObfsRuntime {
+        encoder,
+        decoder,
+        replay: ReplayCache::new(),
+    })
+}
+
+fn tunnel_mtu(transport: Option<&TunnelTransport>) -> u16 {
+    match transport {
+        Some(value) if value.mode == ObfsMode::ParanoidV1 => {
+            value
+                .path_mtu
+                .saturating_sub(IP_UDP_OVERHEAD + OBFS_FRAME_OVERHEAD + WG_OVERHEAD)
+                & !15
+        }
+        Some(value) => {
+            TUN_MTU.min(value.path_mtu.saturating_sub(IP_UDP_OVERHEAD + WG_OVERHEAD) & !15)
+        }
+        None => TUN_MTU,
+    }
 }
 
 /// 前缀长度 → IPv4 子网掩码（如 24 → 255.255.255.0）。
@@ -81,6 +134,7 @@ impl UserspaceTunnel {
         client_private_key: &str,
         server_public_key: &str,
         server_endpoint: &str,
+        transport: Option<&TunnelTransport>,
         vpn_ip: Ipv4Addr,
         subnet_prefix: u8,
         allowed_routes: &[String],
@@ -101,6 +155,9 @@ impl UserspaceTunnel {
             result = "started",
             "初始化用户态 WireGuard 引擎"
         );
+        let obfs = transport.map(build_obfs_runtime).transpose()?;
+        let mtu = tunnel_mtu(transport);
+        tracing::info!(stage = "obfs_client", result = "configured", mode = ?transport.map(|value| value.mode), mtu, "客户端数据面传输已配置");
         // 1) boringtun 状态机：本地私钥 + 服务端公钥。
         let static_private = StaticSecret::from(decode_key(client_private_key).inspect_err(|error| {
             tracing::warn!(stage = "wireguard_engine", result = "failed", elapsed_ms = bring_up_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "初始化客户端 WireGuard 密钥失败");
@@ -125,7 +182,9 @@ impl UserspaceTunnel {
             "解析 VPN endpoint"
         );
         let server_addrs: Vec<SocketAddr> = match tokio::net::lookup_host(server_endpoint).await {
-            Ok(addresses) => addresses.collect(),
+            Ok(addresses) => addresses
+                .filter(|address| transport.is_none() || address.is_ipv4())
+                .collect(),
             Err(error) => {
                 tracing::warn!(stage = "endpoint_resolution", result = "failed", elapsed_ms = endpoint_started.elapsed().as_millis(), error = %crate::error::redact_sensitive(&error.to_string()), "解析 VPN endpoint 失败");
                 return Err(CliError::Other(format!(
@@ -164,7 +223,7 @@ impl UserspaceTunnel {
         let mut cfg = tun::Configuration::default();
         cfg.address(vpn_ip)
             .netmask(prefix_to_netmask_v4(subnet_prefix))
-            .mtu(TUN_MTU)
+            .mtu(mtu)
             .up();
         // macOS 的 utun 名称由内核分配（必须形如 utunN），不能用自定义名；
         // Linux/Windows 可指定接口名便于识别。
@@ -324,6 +383,8 @@ impl UserspaceTunnel {
                 shutdown_tx,
                 traffic,
                 routes_rx,
+                obfs,
+                usize::from(mtu) + usize::from(WG_OVERHEAD) + 64,
             )
             .instrument(tracing::Span::current()),
         );
@@ -344,6 +405,8 @@ async fn forward_loop(
     shutdown_tx: watch::Sender<bool>,
     traffic: Option<SharedState>,
     mut routes_rx: Option<watch::Receiver<Vec<String>>>,
+    mut obfs: Option<ObfsRuntime>,
+    packet_buffer_size: usize,
 ) -> CliResult<()> {
     let loop_started = std::time::Instant::now();
     tracing::info!(
@@ -352,9 +415,9 @@ async fn forward_loop(
         "WireGuard 转发循环已启动"
     );
     // 三个方向各用独立缓冲，避免 select! 多分支对同一缓冲的可变借用冲突。
-    let mut tun_read_buf = [0u8; BUF_SIZE];
-    let mut enc_buf = [0u8; BUF_SIZE];
-    let mut udp_read_buf = [0u8; BUF_SIZE];
+    let mut tun_read_buf = vec![0u8; packet_buffer_size];
+    let mut enc_buf = vec![0u8; packet_buffer_size];
+    let mut udp_read_buf = vec![0u8; 65535];
     let mut ticker = tokio::time::interval(TIMER_TICK);
 
     // 本地累加收发字节，按 TIMER_TICK 节奏批量刷回 SharedState——避免每包都锁 mutex
@@ -365,10 +428,11 @@ async fn forward_loop(
     let mut udp_send_failures: u64 = 0;
     let mut udp_recv_failures: u64 = 0;
     let mut last_udp_error_log = std::time::Instant::now();
+    let mut obfs_drops: u64 = 0;
 
     // 立即发起握手（无 src 触发 handshake initiation）。
     if let TunnResult::WriteToNetwork(p) = tunn.encapsulate(&[], &mut enc_buf) {
-        if udp.send(p).await.is_err() {
+        if send_network(&udp, obfs.as_ref(), p).await.is_err() {
             udp_send_failures += 1;
         }
     }
@@ -386,10 +450,11 @@ async fn forward_loop(
                         if let TunnResult::WriteToNetwork(p) =
                             tunn.encapsulate(&tun_read_buf[..n], &mut enc_buf)
                         {
-                            if udp.send(p).await.is_err() {
+                            if send_network(&udp, obfs.as_ref(), p).await.is_err() {
                                 udp_send_failures = udp_send_failures.saturating_add(1);
+                            } else {
+                                tx_acc = tx_acc.saturating_add(n as u64);
                             }
-                            tx_acc = tx_acc.saturating_add(n as u64);
                         }
                     }
                     Err(e) => {
@@ -409,7 +474,19 @@ async fn forward_loop(
             r = udp.recv(&mut udp_read_buf) => {
                 match r {
                     Ok(n) => {
-                        match handle_incoming(&mut tunn, &udp, &device, &udp_read_buf[..n]).await {
+                        let decoded;
+                        let incoming = if let Some(runtime) = obfs.as_mut() {
+                            match runtime.decoder.decode(&udp_read_buf[..n], &mut runtime.replay) {
+                                Ok(packet) => { decoded = packet; decoded.as_slice() }
+                                Err(_) => {
+                                    obfs_drops = obfs_drops.saturating_add(1);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            &udp_read_buf[..n]
+                        };
+                        match handle_incoming(&mut tunn, &udp, &device, incoming, obfs.as_ref(), packet_buffer_size).await {
                             Ok(bytes) => rx_acc = rx_acc.saturating_add(bytes),
                             Err(e) => {
                                 tracing::warn!(error = %e, "写入 TUN 失败，数据面停止");
@@ -442,18 +519,19 @@ async fn forward_loop(
             }
             // 定时器：握手重传 / keepalive，并顺带把累计流量刷回状态。
             _ = ticker.tick() => {
-                let mut tbuf = [0u8; BUF_SIZE];
+                let mut tbuf = vec![0u8; packet_buffer_size];
                 if let TunnResult::WriteToNetwork(p) = tunn.update_timers(&mut tbuf) {
-                    if udp.send(p).await.is_err() {
+                    if send_network(&udp, obfs.as_ref(), p).await.is_err() {
                         udp_send_failures = udp_send_failures.saturating_add(1);
                     }
                 }
-                if (udp_send_failures > 0 || udp_recv_failures > 0)
+                if (udp_send_failures > 0 || udp_recv_failures > 0 || obfs_drops > 0)
                     && last_udp_error_log.elapsed() >= Duration::from_secs(10)
                 {
-                    tracing::debug!(send_failures = udp_send_failures, recv_failures = udp_recv_failures, "隧道 UDP 暂时不可用，保持连接等待恢复");
+                    tracing::debug!(send_failures = udp_send_failures, recv_failures = udp_recv_failures, obfs_drops, "隧道 UDP 暂时不可用或收到非法混淆包，保持连接等待恢复");
                     udp_send_failures = 0;
                     udp_recv_failures = 0;
+                    obfs_drops = 0;
                     last_udp_error_log = std::time::Instant::now();
                 }
                 if (tx_acc | rx_acc) != 0 {
@@ -583,17 +661,19 @@ async fn handle_incoming(
     udp: &UdpSocket,
     device: &tun::AsyncDevice,
     packet: &[u8],
+    obfs: Option<&ObfsRuntime>,
+    packet_buffer_size: usize,
 ) -> CliResult<u64> {
-    let mut out = [0u8; BUF_SIZE];
+    let mut out = vec![0u8; packet_buffer_size];
     match tunn.decapsulate(None, packet, &mut out) {
         TunnResult::WriteToNetwork(p) => {
-            let _ = udp.send(p).await;
+            let _ = send_network(udp, obfs, p).await;
             // boringtun 约定：收到握手类响应后，用空包重复调用以排空待发队列。
             loop {
-                let mut drain = [0u8; BUF_SIZE];
+                let mut drain = vec![0u8; packet_buffer_size];
                 match tunn.decapsulate(None, &[], &mut drain) {
                     TunnResult::WriteToNetwork(p) => {
-                        let _ = udp.send(p).await;
+                        let _ = send_network(udp, obfs, p).await;
                     }
                     TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
                         device
@@ -622,6 +702,23 @@ async fn handle_incoming(
     }
 }
 
+async fn send_network(udp: &UdpSocket, obfs: Option<&ObfsRuntime>, packet: &[u8]) -> CliResult<()> {
+    if let Some(runtime) = obfs {
+        let encoded = runtime
+            .encoder
+            .encode(packet)
+            .map_err(|error| CliError::Other(format!("混淆编码失败: {error}")))?;
+        udp.send(&encoded)
+            .await
+            .map_err(|error| CliError::Other(format!("UDP 发送失败: {error}")))?;
+    } else {
+        udp.send(packet)
+            .await
+            .map_err(|error| CliError::Other(format!("UDP 发送失败: {error}")))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +743,25 @@ mod tests {
         );
         assert!(parse_cidr_v4("nonsense").is_none());
         assert!(parse_cidr_v4("1.2.3.4/33").is_none());
+    }
+
+    #[test]
+    fn paranoid_mtu_accounts_for_ip_udp_frame_and_wireguard() {
+        let transport = TunnelTransport {
+            mode: ObfsMode::ParanoidV1,
+            psk: Zeroizing::new(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
+            path_mtu: 1500,
+        };
+        assert_eq!(tunnel_mtu(Some(&transport)), 1392);
+        assert!(build_obfs_runtime(&transport).is_ok());
+        let mut minimum = transport.clone();
+        minimum.mode = ObfsMode::LowOverheadV1;
+        minimum.path_mtu = 576;
+        assert_eq!(tunnel_mtu(Some(&minimum)), 512);
+        let mut jumbo = transport.clone();
+        jumbo.path_mtu = 9000;
+        assert_eq!(tunnel_mtu(Some(&jumbo)), 8896);
+        assert_eq!(tunnel_mtu(None), 1420);
     }
 
     #[test]

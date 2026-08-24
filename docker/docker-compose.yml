@@ -17,13 +17,17 @@ services:
     ports:
       - "80:80"      # ACME HTTP-01 + HTTPS 重定向
       - "443:443"    # HTTPS 管理后台 + API
-      - "51820:51820/udp"  # WireGuard 数据平面
+      - "47358:47358/udp"  # 加密混淆数据平面（唯一公网 UDP 端口）
     environment:
       VPN_BIND_ADDR: "0.0.0.0:8080"
       VPN_HTTPS: "true"
       VPN_DOMAIN: "vpn.example.com"  # ← 修改为你的真实域名
       DATABASE_URL: "sqlite:///var/lib/vpn/vpn.db?mode=rwc"
       VPN_DATA_DIR: "/var/lib/vpn"
+      VPN_WG_BACKEND: "auto"
+      VPN_OBFS_ENABLED: "true"
+      VPN_OBFS_ENDPOINT: "vpn.example.com:47358"
+      VPN_OBFS_PSK: "${VPN_OBFS_PSK:?请设置 32 字节 Base64 VPN_OBFS_PSK}"
       # VPN_FEISHU_APPROVAL_OPTIONS_TOKEN: "replace-with-a-random-secret"
       RUST_LOG: "info,sqlx=warn"
     volumes:

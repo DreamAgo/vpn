@@ -177,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
             config.server_routes.clone(),
         )
         .await
-        .context("装配 PeerService 失败")?,
+        .context("装配 PeerService 失败")?
+        .with_obfs_transport(config.obfs.as_ref()),
     );
     tracing::info!(
         server_public_key = %peer_service.server_public_key_string(),
@@ -185,6 +186,15 @@ async fn main() -> anyhow::Result<()> {
         subnet = %config.vpn_subnet,
         "服务端 WireGuard 状态已就绪"
     );
+    let obfs_proxy = if let Some(obfs) = config.obfs.clone() {
+        Some(
+            vpn_server::udp_obfs::UdpObfsServer::bind(obfs, config.vpn_listen_port)
+                .await
+                .context("初始化 UDP 混淆代理失败")?,
+        )
+    } else {
+        None
+    };
     let network_acl_service = if config.feishu_approval.enabled() {
         let service = Arc::new(NetworkAclService::new(
             pool.clone(),
@@ -273,10 +283,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %config.bind_addr, "vpn-server listening");
 
     // 启动服务（含优雅关闭）
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP 服务运行失败")?;
+    if let Some(proxy) = obfs_proxy {
+        tokio::select! {
+            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+                result.context("HTTP 服务运行失败")?;
+            }
+            result = proxy.run() => {
+                result.context("UDP 混淆代理运行失败")?;
+            }
+        }
+    } else {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("HTTP 服务运行失败")?;
+    }
 
     tracing::info!("vpn-server stopped");
     Ok(())
