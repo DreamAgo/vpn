@@ -92,6 +92,11 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::put(handlers::system::update_server_routes),
             )
             .route(
+                "/api/v1/admin/network/settings",
+                get(handlers::system::network_settings)
+                    .put(handlers::system::update_network_settings),
+            )
+            .route(
                 "/api/v1/admin/notifications/email",
                 get(handlers::system::email_notification_settings)
                     .put(handlers::system::update_email_notification_settings),

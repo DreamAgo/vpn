@@ -46,6 +46,25 @@ impl SqliteSystemConfigRepository {
         .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(())
     }
+
+    /// 仅在 key 不存在时写入，供环境变量的一次性种子初始化使用。
+    ///
+    /// 返回 true 表示本次插入成功；并发启动时只有一个进程会成功。
+    pub async fn set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        let now = Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            r#"INSERT INTO system_config (key, value, updated_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(key) DO NOTHING"#,
+        )
+        .bind(key)
+        .bind(value)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 #[cfg(test)]
@@ -88,5 +107,13 @@ mod tests {
         repo.set("k", "v1").await.unwrap();
         repo.set("k", "v2").await.unwrap();
         assert_eq!(repo.get("k").await.unwrap().unwrap(), "v2");
+    }
+
+    #[tokio::test]
+    async fn set_if_absent_never_overwrites_existing_value() {
+        let repo = SqliteSystemConfigRepository::new(setup_pool().await);
+        assert!(repo.set_if_absent("k", "seed").await.unwrap());
+        assert!(!repo.set_if_absent("k", "changed").await.unwrap());
+        assert_eq!(repo.get("k").await.unwrap().as_deref(), Some("seed"));
     }
 }

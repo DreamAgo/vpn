@@ -19,9 +19,9 @@ use vpn_server::{
         build_peer_service_with_backend, domain_event_service, ApiKeyService, Argon2Hasher,
         AuditService, AuthService, ConfigService, DomainEventService, ExternalOptionsService,
         FeishuApprovalService, FeishuAuthService, JwtTokenIssuer, NetworkAclService,
-        NotificationService, PeerService, ReqwestFeishuApprovalApi, ReqwestFeishuIdentityProvider,
-        SubnetExternalOptionProvider, SubnetService, UserGroupExternalOptionProvider,
-        UserGroupService, UserService,
+        NetworkSettingsService, NotificationService, PeerService, ReqwestFeishuApprovalApi,
+        ReqwestFeishuIdentityProvider, SubnetExternalOptionProvider, SubnetService,
+        UserGroupExternalOptionProvider, UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -139,6 +139,15 @@ async fn main() -> anyhow::Result<()> {
     // Epic 4：装配 PeerService（load-or-generate 服务端 WG 密钥 + IpPool 回填 + Noop control）
     let config_repo = SqliteSystemConfigRepository::new(pool.clone());
     let config_service = Arc::new(ConfigService::new(config_repo.clone()));
+    let network_settings_service = Arc::new(
+        NetworkSettingsService::load_or_seed(
+            config_repo.clone(),
+            &config.network_settings_seed,
+            config.obfs.as_ref(),
+        )
+        .await
+        .context("初始化网络参数失败")?,
+    );
     const APPROVAL_ACL_MARKER: &str = "feishu_approval_acl_installed";
     if config.feishu_approval.enabled() {
         // WireGuard 接口恢复已有 peer 前先安装最小 drop ACL，关闭重启期间的数据面窗口。
@@ -178,7 +187,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         .context("装配 PeerService 失败")?
-        .with_obfs_transport(config.obfs.as_ref()),
+        .with_obfs_transport(config.obfs.as_ref())
+        .with_network_settings(network_settings_service.shared_settings()),
     );
     tracing::info!(
         server_public_key = %peer_service.server_public_key_string(),
@@ -261,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         .with_peer_service(peer_service)
         .with_audit_service(audit_service)
         .with_config_service(config_service)
+        .with_network_settings_service(network_settings_service)
         .with_domain_event_service(domain_event_service)
         .with_notification_service(notification_service)
         .with_db_pool(pool.clone());

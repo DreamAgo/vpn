@@ -122,6 +122,7 @@ async fn register_peer_succeeds_with_bearer() {
                 vpn_subnet: "10.8.0.0/24".into(),
                 allowed_routes: vec!["10.8.0.0/24".into()],
                 transport: None,
+                network_settings: None,
             })),
         )
         .mount(&server)
@@ -191,6 +192,7 @@ async fn expired_access_token_triggers_refresh_and_retry() {
                 vpn_subnet: "10.8.0.0/24".into(),
                 allowed_routes: vec!["10.8.0.0/24".into()],
                 transport: None,
+                network_settings: None,
             })),
         )
         .mount(&server)

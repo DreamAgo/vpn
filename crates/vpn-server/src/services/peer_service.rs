@@ -15,6 +15,7 @@ use uuid::Uuid;
 use vpn_api_types::peer::{
     ObfsMode, ObfsTransport, PeerHeartbeatRequest, PeerRegisterRequest, PeerRegisterResponse,
 };
+use vpn_api_types::system::NetworkSettings;
 use vpn_core::{AppError, Result};
 use vpn_wireguard::{
     generate_keypair, public_key_from_private, render_client_config, IpPool,
@@ -181,6 +182,7 @@ pub struct PeerService {
     /// 使用不同时间点的 routed_subnets 快照。
     peer_route_lock: Arc<Mutex<()>>,
     obfs_transport: Option<ObfsTransportSecret>,
+    network_settings: Arc<RwLock<NetworkSettings>>,
 }
 
 #[derive(Clone)]
@@ -231,7 +233,14 @@ impl PeerService {
             server_routes: Arc::new(RwLock::new(server_routes)),
             peer_route_lock: route_policy_lock(),
             obfs_transport: None,
+            network_settings: Arc::new(RwLock::new(NetworkSettings::default())),
         }
+    }
+
+    /// 共享管理员可更新的网络参数快照；仅影响之后的注册/重连响应。
+    pub fn with_network_settings(mut self, settings: Arc<RwLock<NetworkSettings>>) -> Self {
+        self.network_settings = settings;
+        self
     }
 
     /// 设置强制使用的 v1 混淆传输。启用后旧客户端注册会被明确拒绝。
@@ -497,6 +506,7 @@ impl PeerService {
                 .compute_allowed_routes(user_id, &routed_subnets)
                 .await?,
             transport: self.obfs_transport.as_ref().map(ObfsTransportSecret::dto),
+            network_settings: Some(self.network_settings.read().await.clone()),
         })
     }
 
@@ -1351,6 +1361,26 @@ mod tests {
         let resp = svc.register("user-1", &reg("PK1")).await.unwrap();
         assert!(resp.allowed_routes.contains(&"10.8.0.0/24".to_string()));
         assert!(resp.allowed_routes.contains(&"172.31.100.0/24".to_string()));
+    }
+
+    #[tokio::test]
+    async fn network_settings_snapshot_propagates_to_new_registration() {
+        let settings = Arc::new(RwLock::new(NetworkSettings {
+            mode: vpn_api_types::system::NetworkMtuMode::Auto,
+            default_mtu: 1340,
+            min_mtu: 1280,
+            max_mtu: 1400,
+        }));
+        let svc = service(setup_pool().await).with_network_settings(settings.clone());
+        let first = svc.register("user-1", &reg("PK-MTU-1")).await.unwrap();
+        assert_eq!(first.network_settings.as_ref().unwrap().default_mtu, 1340);
+
+        settings.write().await.default_mtu = 1360;
+        let reconnected = svc.register("user-1", &reg("PK-MTU-2")).await.unwrap();
+        assert_eq!(
+            reconnected.network_settings.as_ref().unwrap().default_mtu,
+            1360
+        );
     }
 
     #[tokio::test]

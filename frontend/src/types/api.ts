@@ -79,6 +79,17 @@ export interface SystemInfo {
   serverRoutes?: string[];
 }
 
+export type NetworkMtuMode = 'fixed' | 'auto';
+
+export interface NetworkSettings {
+  mode: NetworkMtuMode;
+  defaultMtu: number;
+  minMtu: number;
+  maxMtu: number;
+}
+
+export type UpdateNetworkSettingsRequest = NetworkSettings;
+
 export interface EmailNotificationSettings {
   enabled: boolean;
   smtpHost: string | null;

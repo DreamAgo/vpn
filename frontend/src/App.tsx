@@ -28,6 +28,7 @@ import { ConnectionGuidePage } from './pages/ConnectionGuidePage';
 import { BackupPage } from './pages/BackupPage';
 import { ApiKeysPage } from './pages/ApiKeysPage';
 import { NotificationSettingsPage } from './pages/NotificationSettingsPage';
+import { NetworkSettingsPage } from './pages/NetworkSettingsPage';
 import { useAuthStore } from './stores/authStore';
 
 const queryClient = new QueryClient({
@@ -174,6 +175,14 @@ function App() {
                     element={
                       <RequireAdminRoute>
                         <NotificationSettingsPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/network-settings"
+                    element={
+                      <RequireAdminRoute>
+                        <NetworkSettingsPage />
                       </RequireAdminRoute>
                     }
                   />

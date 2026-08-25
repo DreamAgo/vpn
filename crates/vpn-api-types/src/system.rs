@@ -2,6 +2,88 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::peer::ObfsMode;
+
+pub const DEFAULT_TUN_MTU: u16 = 1360;
+pub const MIN_TUN_MTU: u16 = 1280;
+pub const MAX_TUN_MTU: u16 = 1420;
+const IP_UDP_OVERHEAD: u16 = 28;
+const OBFS_FRAME_OVERHEAD: u16 = 42;
+const WG_OVERHEAD: u16 = 32;
+
+/// 按当前混淆线协议计算不会超过外层 path MTU 的最大内层 MTU。
+pub fn obfs_transport_safe_mtu(mode: ObfsMode, path_mtu: u16) -> u16 {
+    let overhead = match mode {
+        ObfsMode::LowOverheadV1 => IP_UDP_OVERHEAD + WG_OVERHEAD,
+        ObfsMode::ParanoidV1 => IP_UDP_OVERHEAD + OBFS_FRAME_OVERHEAD + WG_OVERHEAD,
+    };
+    path_mtu.saturating_sub(overhead) & !15
+}
+
+/// 服务端下发的隧道 MTU 策略模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMtuMode {
+    Fixed,
+    Auto,
+}
+
+/// 管理后台维护并下发给客户端的网络参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkSettings {
+    pub mode: NetworkMtuMode,
+    pub default_mtu: u16,
+    pub min_mtu: u16,
+    pub max_mtu: u16,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            mode: NetworkMtuMode::Fixed,
+            default_mtu: DEFAULT_TUN_MTU,
+            min_mtu: MIN_TUN_MTU,
+            max_mtu: MAX_TUN_MTU,
+        }
+    }
+}
+
+impl NetworkSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if MIN_TUN_MTU <= self.min_mtu
+            && self.min_mtu <= self.default_mtu
+            && self.default_mtu <= self.max_mtu
+            && self.max_mtu <= MAX_TUN_MTU
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "MTU 必须满足 {MIN_TUN_MTU} <= min_mtu <= default_mtu <= max_mtu <= {MAX_TUN_MTU}"
+            ))
+        }
+    }
+}
+
+/// 更新网络参数请求（PUT /api/v1/admin/network/settings）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateNetworkSettingsRequest {
+    pub mode: NetworkMtuMode,
+    pub default_mtu: u16,
+    pub min_mtu: u16,
+    pub max_mtu: u16,
+}
+
+impl From<UpdateNetworkSettingsRequest> for NetworkSettings {
+    fn from(value: UpdateNetworkSettingsRequest) -> Self {
+        Self {
+            mode: value.mode,
+            default_mtu: value.default_mtu,
+            min_mtu: value.min_mtu,
+            max_mtu: value.max_mtu,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
     pub version: String,
@@ -107,4 +189,16 @@ fn default_quiet_minutes() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn obfs_safe_mtu_matches_both_transport_modes() {
+        assert_eq!(obfs_transport_safe_mtu(ObfsMode::ParanoidV1, 1500), 1392);
+        assert_eq!(obfs_transport_safe_mtu(ObfsMode::LowOverheadV1, 1500), 1440);
+        assert_eq!(obfs_transport_safe_mtu(ObfsMode::LowOverheadV1, 1200), 1136);
+    }
 }

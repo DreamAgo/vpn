@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
+use vpn_api_types::system::NetworkSettings;
 use zeroize::Zeroizing;
 
 use crate::api::ApiClient;
@@ -173,6 +174,8 @@ pub struct TunnelParams {
     pub allowed_routes: Vec<String>,
     /// 可选 Rust 原生 UDP 混淆配置。
     pub transport: Option<TunnelTransport>,
+    /// 服务端下发的隧道 MTU 策略；旧服务端缺省时使用兼容默认值。
+    pub network_settings: NetworkSettings,
 }
 
 /// 已验证并以可清零内存保存的客户端混淆配置。
@@ -325,6 +328,10 @@ pub async fn connect_once(
             })
         })
         .transpose()?;
+    let network_settings = resp.network_settings.unwrap_or_default();
+    network_settings
+        .validate()
+        .map_err(|error| CliError::Invalid(format!("服务端下发的网络参数非法：{error}")))?;
 
     tracing::info!(
         stage = "control_plane",
@@ -341,6 +348,7 @@ pub async fn connect_once(
         client_private_key: keypair.private_key.clone(),
         allowed_routes: resp.allowed_routes.clone(),
         transport,
+        network_settings,
     })
 }
 
@@ -378,6 +386,7 @@ pub async fn bring_up_tunnel(
         &params.server_public_key,
         &params.server_endpoint,
         params.transport.as_ref(),
+        &params.network_settings,
         vpn_ip,
         prefix,
         &allowed,
@@ -943,6 +952,7 @@ mod tests {
             client_private_key: "priv".into(),
             allowed_routes: allowed,
             transport: None,
+            network_settings: NetworkSettings::default(),
         }
     }
 

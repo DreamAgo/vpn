@@ -61,6 +61,8 @@ sudo VPN_HTTPS=true VPN_DOMAIN=vpn.example.com \
 2. 重启服务——启动时自动执行数据库 migration、加载已有 WireGuard 服务端密钥、从 `peers` 表恢复节点。
 3. 数据卷保持不变即可平滑升级。
 
+升级到支持网络设置的版本后，服务端会在数据库无 `network_settings_v1` 时，把 `VPN_TUN_MTU_MODE/DEFAULT/MIN/MAX` 作为一次性初始值写入。之后请在管理后台“网络设置”页面调整；修改环境变量不会覆盖已保存值。页面保存的策略在客户端下一次连接或重连时生效，不会中断当前在线节点。
+
 ## 健康检查
 
 - `GET /health` 返回 200 表示进程存活（compose 已配置 healthcheck）。

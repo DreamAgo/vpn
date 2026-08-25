@@ -27,16 +27,14 @@ use tokio::sync::watch;
 use tracing::Instrument;
 use tun::AbstractDevice;
 use vpn_api_types::peer::ObfsMode;
+use vpn_api_types::system::{obfs_transport_safe_mtu, NetworkMtuMode, NetworkSettings};
 use vpn_obfs::{Codec, Direction, Mode, ReplayCache};
 use zeroize::Zeroizing;
 
 use crate::daemon::{SharedState, TunnelTransport};
 use crate::error::{CliError, CliResult};
 
-/// TUN MTU：低于物理 MTU 以容纳 WireGuard 封装开销（~60B），避免分片。
-const TUN_MTU: u16 = 1420;
 const IP_UDP_OVERHEAD: u16 = 28;
-const OBFS_FRAME_OVERHEAD: u16 = 42;
 const WG_OVERHEAD: u16 = 32;
 const WG_BLOCK_SIZE: usize = 16;
 /// 定时器步进：boringtun 建议 ~100–250ms 调一次 update_timers。
@@ -182,19 +180,30 @@ fn build_obfs_runtime(transport: &TunnelTransport) -> CliResult<ObfsRuntime> {
     })
 }
 
-fn tunnel_mtu(transport: Option<&TunnelTransport>) -> u16 {
-    match transport {
-        Some(value) if value.mode == ObfsMode::ParanoidV1 => {
-            value
-                .path_mtu
-                .saturating_sub(IP_UDP_OVERHEAD + OBFS_FRAME_OVERHEAD + WG_OVERHEAD)
-                & !15
+fn transport_safe_mtu(transport: &TunnelTransport) -> u16 {
+    obfs_transport_safe_mtu(transport.mode, transport.path_mtu)
+}
+
+fn tunnel_mtu(transport: Option<&TunnelTransport>, settings: &NetworkSettings) -> CliResult<u16> {
+    settings
+        .validate()
+        .map_err(|error| CliError::Invalid(format!("网络参数非法：{error}")))?;
+    let mtu = match settings.mode {
+        NetworkMtuMode::Fixed => settings.default_mtu,
+        NetworkMtuMode::Auto => transport
+            .map(transport_safe_mtu)
+            .unwrap_or(settings.default_mtu)
+            .clamp(settings.min_mtu, settings.max_mtu),
+    };
+    if let Some(transport) = transport {
+        let safe_mtu = transport_safe_mtu(transport);
+        if mtu > safe_mtu {
+            return Err(CliError::Invalid(format!(
+                "网络参数 MTU {mtu} 超过当前混淆路径可承载的 {safe_mtu}"
+            )));
         }
-        Some(value) => {
-            TUN_MTU.min(value.path_mtu.saturating_sub(IP_UDP_OVERHEAD + WG_OVERHEAD) & !15)
-        }
-        None => TUN_MTU,
     }
+    Ok(mtu)
 }
 
 /// 前缀长度 → IPv4 子网掩码（如 24 → 255.255.255.0）。
@@ -232,6 +241,7 @@ impl UserspaceTunnel {
         server_public_key: &str,
         server_endpoint: &str,
         transport: Option<&TunnelTransport>,
+        network_settings: &NetworkSettings,
         vpn_ip: Ipv4Addr,
         subnet_prefix: u8,
         allowed_routes: &[String],
@@ -253,8 +263,8 @@ impl UserspaceTunnel {
             "初始化用户态 WireGuard 引擎"
         );
         let obfs = transport.map(build_obfs_runtime).transpose()?;
-        let mtu = tunnel_mtu(transport);
-        tracing::info!(stage = "obfs_client", result = "configured", mode = ?transport.map(|value| value.mode), mtu, "客户端数据面传输已配置");
+        let mtu = tunnel_mtu(transport, network_settings)?;
+        tracing::info!(stage = "obfs_client", result = "configured", transport_mode = ?transport.map(|value| value.mode), mtu_mode = ?network_settings.mode, default_mtu = network_settings.default_mtu, min_mtu = network_settings.min_mtu, max_mtu = network_settings.max_mtu, mtu, "客户端数据面传输已配置");
         // 1) boringtun 状态机：本地私钥 + 服务端公钥。
         let static_private = StaticSecret::from(decode_key(client_private_key).inspect_err(|error| {
             tracing::warn!(stage = "wireguard_engine", result = "failed", elapsed_ms = bring_up_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "初始化客户端 WireGuard 密钥失败");
@@ -960,22 +970,33 @@ mod tests {
     }
 
     #[test]
-    fn paranoid_mtu_accounts_for_ip_udp_frame_and_wireguard() {
+    fn network_policy_controls_and_bounds_tunnel_mtu() {
         let transport = TunnelTransport {
             mode: ObfsMode::ParanoidV1,
             psk: Zeroizing::new(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
             path_mtu: 1500,
         };
-        assert_eq!(tunnel_mtu(Some(&transport)), 1392);
+        let fixed = NetworkSettings::default();
+        assert_eq!(tunnel_mtu(Some(&transport), &fixed).unwrap(), 1360);
         assert!(build_obfs_runtime(&transport).is_ok());
+        let automatic = NetworkSettings {
+            mode: NetworkMtuMode::Auto,
+            ..fixed
+        };
+        assert_eq!(tunnel_mtu(Some(&transport), &automatic).unwrap(), 1392);
         let mut minimum = transport.clone();
         minimum.mode = ObfsMode::LowOverheadV1;
         minimum.path_mtu = 576;
-        assert_eq!(tunnel_mtu(Some(&minimum)), 512);
+        assert!(tunnel_mtu(Some(&minimum), &automatic).is_err());
         let mut jumbo = transport.clone();
         jumbo.path_mtu = 9000;
-        assert_eq!(tunnel_mtu(Some(&jumbo)), 8896);
-        assert_eq!(tunnel_mtu(None), 1420);
+        assert_eq!(tunnel_mtu(Some(&jumbo), &automatic).unwrap(), 1420);
+        assert_eq!(tunnel_mtu(None, &automatic).unwrap(), 1360);
+        let unsafe_fixed = NetworkSettings {
+            default_mtu: 1420,
+            ..NetworkSettings::default()
+        };
+        assert!(tunnel_mtu(Some(&transport), &unsafe_fixed).is_err());
     }
 
     #[test]

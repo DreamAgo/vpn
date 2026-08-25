@@ -16,6 +16,7 @@ import {
   DatabaseOutlined,
   KeyOutlined,
   BellOutlined,
+  GlobalOutlined,
   MoonOutlined,
   SunOutlined,
 } from '@ant-design/icons';
@@ -38,6 +39,7 @@ const adminRoutes: NonNullable<ProLayoutProps['route']>['routes'] = [
   { path: '/audit-logs', name: '日志', icon: <FileTextOutlined /> },
   { path: '/api-keys', name: 'API Key', icon: <KeyOutlined /> },
   { path: '/notifications', name: '通知设置', icon: <BellOutlined /> },
+  { path: '/network-settings', name: '网络设置', icon: <GlobalOutlined /> },
   { path: '/backup', name: '备份恢复', icon: <DatabaseOutlined /> },
   { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
 ];

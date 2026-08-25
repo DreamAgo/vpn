@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::system::NetworkSettings;
+
 /// 注册节点请求（POST /api/v1/peers/register）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRegisterRequest {
@@ -81,6 +83,9 @@ pub struct PeerRegisterResponse {
     /// 可选上层混淆传输；缺省时保持原生 WireGuard。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<ObfsTransport>,
+    /// 可选隧道 MTU 策略；旧服务端缺省时客户端使用兼容默认值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_settings: Option<NetworkSettings>,
 }
 
 /// 心跳请求（POST /api/v1/peers/heartbeat），每 30s 一次。
@@ -211,7 +216,7 @@ pub struct AdminPeerQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObfsMode, ObfsTransport, PeerRegisterRequest};
+    use super::{ObfsMode, ObfsTransport, PeerRegisterRequest, PeerRegisterResponse};
     use zeroize::Zeroizing;
 
     #[test]
@@ -244,5 +249,17 @@ mod tests {
             serde_json::to_value(ObfsMode::LowOverheadV1).unwrap(),
             "low-overhead-v1"
         );
+    }
+
+    #[test]
+    fn register_response_without_network_settings_remains_compatible() {
+        let response: PeerRegisterResponse = serde_json::from_value(serde_json::json!({
+            "vpn_ip": "10.8.0.2",
+            "server_public_key": "pk",
+            "server_endpoint": "vpn.example.com:51820",
+            "vpn_subnet": "10.8.0.0/24"
+        }))
+        .unwrap();
+        assert!(response.network_settings.is_none());
     }
 }

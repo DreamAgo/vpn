@@ -14,11 +14,13 @@ import type {
   LogoutRequest,
   NotificationEventQuery,
   NotificationEventView,
+  NetworkSettings,
   RefreshResponse,
   SetupStatusResponse,
   SystemInfo,
   TestEmailNotificationRequest,
   UpdateEmailNotificationSettingsRequest,
+  UpdateNetworkSettingsRequest,
 } from '@/types/api';
 
 export const authApi = {
@@ -61,6 +63,16 @@ export const systemApi = {
   /** 更新服务端 LAN 网段（PUT /admin/system/routes），返回规整后的网段。 */
   async updateServerRoutes(routes: string[]): Promise<string[]> {
     const res = await http.put<string[]>('/admin/system/routes', { routes });
+    return res.data;
+  },
+
+  async getNetworkSettings(): Promise<NetworkSettings> {
+    const res = await http.get<NetworkSettings>('/admin/network/settings');
+    return res.data;
+  },
+
+  async updateNetworkSettings(req: UpdateNetworkSettingsRequest): Promise<NetworkSettings> {
+    const res = await http.put<NetworkSettings>('/admin/network/settings', req);
     return res.data;
   },
 

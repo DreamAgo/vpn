@@ -1,15 +1,16 @@
 //! 系统信息 handler。
 
-use axum::extract::Query;
+use axum::extract::{rejection::JsonRejection, Query};
 use axum::{extract::State, Json};
 use vpn_api_types::{
     system::{
-        EmailNotificationSettings, NotificationEventQuery, NotificationEventView, SystemInfo,
-        TestEmailNotificationRequest, UpdateEmailNotificationSettingsRequest,
-        UpdateServerRoutesRequest,
+        EmailNotificationSettings, NetworkSettings, NotificationEventQuery, NotificationEventView,
+        SystemInfo, TestEmailNotificationRequest, UpdateEmailNotificationSettingsRequest,
+        UpdateNetworkSettingsRequest, UpdateServerRoutesRequest,
     },
     ApiResponse,
 };
+use vpn_core::AppError;
 
 use crate::{auth::RequireAdmin, error::ApiError, state::AppState};
 
@@ -36,6 +37,40 @@ pub async fn system_info(
     };
     Ok(Json(ApiResponse::success(
         info,
+        "n/a".to_string(),
+        state.clock.now_unix_ms(),
+    )))
+}
+
+/// GET /api/v1/admin/network/settings：读取网络参数（需 admin）。
+#[tracing::instrument(skip(state))]
+pub async fn network_settings(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+) -> Result<Json<ApiResponse<NetworkSettings>>, ApiError> {
+    let settings = state.network_settings_service()?.settings().await;
+    Ok(Json(ApiResponse::success(
+        settings,
+        "n/a".to_string(),
+        state.clock.now_unix_ms(),
+    )))
+}
+
+/// PUT /api/v1/admin/network/settings：原子更新网络参数（需 admin）。
+#[tracing::instrument(skip(state, body))]
+pub async fn update_network_settings(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+    body: Result<Json<UpdateNetworkSettingsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<NetworkSettings>>, ApiError> {
+    let Json(body) =
+        body.map_err(|error| AppError::Validation(format!("网络参数请求格式非法：{error}")))?;
+    let settings = state
+        .network_settings_service()?
+        .update(body.into())
+        .await?;
+    Ok(Json(ApiResponse::success(
+        settings,
         "n/a".to_string(),
         state.clock.now_unix_ms(),
     )))

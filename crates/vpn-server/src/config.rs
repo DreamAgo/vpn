@@ -75,6 +75,8 @@ pub struct ServerConfig {
     /// 服务端自身网关的网段（CIDR 列表，如所在 Docker 网络），
     /// 会作为 allowed_routes 下发给客户端，使其经隧道访问这些网段。默认空。
     pub server_routes: Vec<String>,
+    /// 隧道 MTU 环境变量原始值。仅在数据库尚无整组配置时解析并作为一次性种子。
+    pub network_settings_seed: NetworkSettingsSeed,
     /// 事件通知配置（SMTP 邮件）。
     pub notifications: NotificationConfig,
     /// 飞书 OAuth。三项同时存在时启用。
@@ -83,6 +85,14 @@ pub struct ServerConfig {
     pub feishu_approval_options: FeishuApprovalOptionsConfig,
     /// 飞书审批事件与实例字段配置。
     pub feishu_approval: FeishuApprovalConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkSettingsSeed {
+    pub mode: Option<String>,
+    pub default_mtu: Option<String>,
+    pub min_mtu: Option<String>,
+    pub max_mtu: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -285,6 +295,12 @@ impl ServerConfig {
                     .collect()
             })
             .unwrap_or_default();
+        let network_settings_seed = NetworkSettingsSeed {
+            mode: env::var("VPN_TUN_MTU_MODE").ok(),
+            default_mtu: env::var("VPN_TUN_MTU_DEFAULT").ok(),
+            min_mtu: env::var("VPN_TUN_MTU_MIN").ok(),
+            max_mtu: env::var("VPN_TUN_MTU_MAX").ok(),
+        };
         let notifications = NotificationConfig {
             email_enabled: env_bool("VPN_NOTIFY_EMAIL_ENABLED", false),
             smtp_host: env::var("VPN_SMTP_HOST").ok(),
@@ -383,6 +399,7 @@ impl ServerConfig {
             wg_backend,
             wg_interface,
             server_routes,
+            network_settings_seed,
             notifications,
             feishu,
             feishu_approval_options,

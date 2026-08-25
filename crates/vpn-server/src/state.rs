@@ -7,7 +7,8 @@ use vpn_core::time::{Clock, SystemClock};
 use crate::services::{
     ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService,
     ExternalOptionsService, FeishuApprovalService, FeishuAuthService, NetworkAclService,
-    NotificationService, PeerService, SubnetService, UserGroupService, UserService,
+    NetworkSettingsService, NotificationService, PeerService, SubnetService, UserGroupService,
+    UserService,
 };
 
 /// AppState 持有所有跨 handler 共享的资源。
@@ -30,6 +31,7 @@ pub struct AppState {
     pub domain_event_service: Option<Arc<DomainEventService>>,
     pub notification_service: Option<Arc<NotificationService>>,
     pub network_acl_service: Option<Arc<NetworkAclService>>,
+    pub network_settings_service: Option<Arc<NetworkSettingsService>>,
     pub db_pool: Option<SqlitePool>,
 }
 
@@ -52,6 +54,7 @@ impl AppState {
             domain_event_service: None,
             notification_service: None,
             network_acl_service: None,
+            network_settings_service: None,
             db_pool: None,
         }
     }
@@ -73,6 +76,11 @@ impl AppState {
 
     pub fn with_network_acl_service(mut self, svc: Arc<NetworkAclService>) -> Self {
         self.network_acl_service = Some(svc);
+        self
+    }
+
+    pub fn with_network_settings_service(mut self, svc: Arc<NetworkSettingsService>) -> Self {
+        self.network_settings_service = Some(svc);
         self
     }
 
@@ -205,6 +213,14 @@ impl AppState {
         self.notification_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("notification_service 未初始化".to_string()))
+    }
+
+    pub fn network_settings_service(
+        &self,
+    ) -> Result<Arc<NetworkSettingsService>, vpn_core::AppError> {
+        self.network_settings_service.clone().ok_or_else(|| {
+            vpn_core::AppError::Config("network_settings_service 未初始化".to_string())
+        })
     }
 
     pub fn config_service(&self) -> Result<Arc<ConfigService>, vpn_core::AppError> {

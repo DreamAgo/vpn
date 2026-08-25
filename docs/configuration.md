@@ -1,6 +1,6 @@
 # 配置参考
 
-`vpn-server` 全部配置通过**环境变量**注入，无需配置文件。下表与 `crates/vpn-server/src/config.rs` 一致。
+`vpn-server` 的启动配置通过环境变量注入；可运行时维护的网络参数在首次初始化后存入数据库，并通过管理后台修改。下表与 `crates/vpn-server/src/config.rs` 一致。
 
 ## 服务端环境变量
 
@@ -20,6 +20,10 @@
 | `VPN_OBFS_BIND_ADDR` | `0.0.0.0:47358` | 混淆公网监听地址。 |
 | `VPN_OBFS_ENDPOINT` | `<VPN_DOMAIN>:47358` | 下发给新客户端的混淆 endpoint。 |
 | `VPN_OBFS_PATH_MTU` | `1500` | 外层路径 MTU（576–9000）。 |
+| `VPN_TUN_MTU_MODE` | `fixed` | 首次初始化隧道 MTU 模式：`fixed` / `auto`。数据库已有 `network_settings_v1` 后忽略。 |
+| `VPN_TUN_MTU_DEFAULT` | `1360` | 首次初始化默认 MTU。 |
+| `VPN_TUN_MTU_MIN` | `1280` | 首次初始化自动模式下限。 |
+| `VPN_TUN_MTU_MAX` | `1420` | 首次初始化自动模式上限。 |
 | `VPN_WG_BACKEND` | `noop` | WireGuard 数据平面后端：`kernel` / `userspace` / `auto` / `noop`。**生产必须显式设置**（默认 `noop` 不建真实隧道）。详见下节。 |
 | `VPN_WG_INTERFACE` | `wg0` | WireGuard 接口名（`kernel`/`userspace` 后端创建的接口）。 |
 | `VPN_AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期由后台任务自动清理。 |
@@ -40,6 +44,12 @@
 - `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` 少于 32 个字符时启动失败。
 - 飞书审批配置只设置一部分时启动失败；启用审批时还必须完整配置飞书 App ID、App Secret 和 HTTPS Redirect URI，确保审批创建的账号可以通过飞书登录；Verification Token 少于 16 字符或 Encrypt Key 少于 16 字符时启动失败。
 - 启用飞书审批网络授权时会强制探测 `nft` 并在恢复 kernel peer 前安装 ACL；缺少 `nftables`、权限不足或规则失败时拒绝启动，不会退化为仅下发客户端路由。未启用审批的既有 kernel 部署保持原行为。
+- 数据库尚无网络参数时，四项 `VPN_TUN_MTU_*` 必须满足 `1280 <= min <= default <= max <= 1420`，否则拒绝启动并指出字段。整组 JSON 落库后，后续环境变量变化不会覆盖后台配置；存量 JSON 损坏时同样拒绝启动，不会静默回退。
+- 启用混淆传输时还会按 `VPN_OBFS_MODE` 与 `VPN_OBFS_PATH_MTU` 计算安全内层上限：`fixed` 的默认值、`auto` 的最小值不得超过该上限。路径连 1280 都无法承载时拒绝启动；后台保存同样返回明确校验错误，避免客户端重连后才失败。
+
+## 网络参数
+
+管理员可在“网络设置”页面维护隧道 MTU。`fixed` 模式直接使用默认值；`auto` 模式沿用当前传输路径的 MTU 计算，并限制在配置的最小值和最大值之间，无混淆传输时使用默认值。保存只影响之后的新连接或重连，不会强制断开在线节点。
 
 ## WireGuard 数据平面后端（`VPN_WG_BACKEND`）
 
