@@ -14,6 +14,7 @@
 //! 运行要求：仅需 root/管理员（开 TUN 设备），**无需安装任何 WireGuard 工具**。
 //! Windows 额外需随包分发的 `wintun.dll`（由 `tun` 依赖加载，非用户安装）。
 
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -37,8 +38,104 @@ const TUN_MTU: u16 = 1420;
 const IP_UDP_OVERHEAD: u16 = 28;
 const OBFS_FRAME_OVERHEAD: u16 = 42;
 const WG_OVERHEAD: u16 = 32;
+const WG_BLOCK_SIZE: usize = 16;
 /// 定时器步进：boringtun 建议 ~100–250ms 调一次 update_timers。
 const TIMER_TICK: Duration = Duration::from_millis(250);
+const SEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+// boringtun 的内部队列上限为 256；启动时空报文会占一个位置用于 keepalive。
+const MAX_TRACKED_QUEUED_PACKETS: usize = 255;
+
+#[derive(Debug)]
+struct NetworkSendError {
+    stage: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Default)]
+struct SendFailureLogger {
+    entries: HashMap<(&'static str, &'static str), (Option<std::time::Instant>, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct SendState {
+    failure_logger: SendFailureLogger,
+    pending_tx_lengths: VecDeque<u64>,
+}
+
+impl SendState {
+    fn track_pending_tx(&mut self, original_len: usize) {
+        if original_len > 0 && self.pending_tx_lengths.len() < MAX_TRACKED_QUEUED_PACKETS {
+            self.pending_tx_lengths.push_back(original_len as u64);
+        }
+    }
+
+    fn clear_pending_tx(&mut self) -> usize {
+        let cleared = self.pending_tx_lengths.len();
+        self.pending_tx_lengths.clear();
+        cleared
+    }
+}
+
+impl SendFailureLogger {
+    fn record(&mut self, operation: &'static str, packet: &[u8], error: &NetworkSendError) {
+        let now = std::time::Instant::now();
+        let entry = self
+            .entries
+            .entry((error.stage, operation))
+            .or_insert((None, 0));
+        let should_log = entry
+            .0
+            .is_none_or(|last| now.duration_since(last) >= SEND_ERROR_LOG_INTERVAL);
+        if should_log {
+            tracing::warn!(
+                stage = error.stage,
+                result = "failed",
+                operation,
+                wireguard_type = wireguard_packet_type(packet).unwrap_or_default(),
+                packet_len = packet.len(),
+                suppressed = entry.1,
+                error = %crate::error::redact_sensitive(&error.message),
+                "WireGuard 数据面操作失败"
+            );
+            *entry = (Some(now), 0);
+        } else {
+            entry.1 = entry.1.saturating_add(1);
+        }
+    }
+}
+
+fn wireguard_packet_type(packet: &[u8]) -> Option<u32> {
+    let header: [u8; 4] = packet.get(..4)?.try_into().ok()?;
+    let packet_type = u32::from_le_bytes(header);
+    (1..=4).contains(&packet_type).then_some(packet_type)
+}
+
+/// 在 WireGuard 加密前将非空 IP 报文零填充至 16 字节边界。
+///
+/// 返回包含填充的切片；`original_len` 仍应由调用方用于用户流量统计。
+fn pad_wireguard_plaintext(buffer: &mut [u8], original_len: usize) -> CliResult<&[u8]> {
+    if original_len > buffer.len() {
+        return Err(CliError::Other(format!(
+            "WireGuard 明文长度 {original_len} 超过缓冲区容量 {}",
+            buffer.len()
+        )));
+    }
+    if original_len == 0 {
+        return Ok(&buffer[..0]);
+    }
+    let padding = (WG_BLOCK_SIZE - original_len % WG_BLOCK_SIZE) % WG_BLOCK_SIZE;
+    let padded_len = original_len
+        .checked_add(padding)
+        .ok_or_else(|| CliError::Other("WireGuard 明文填充长度溢出".to_string()))?;
+    if padded_len > buffer.len() {
+        return Err(CliError::Other(format!(
+            "WireGuard 明文填充后长度 {padded_len} 超过缓冲区容量 {}",
+            buffer.len()
+        )));
+    }
+    buffer[original_len..padded_len].fill(0);
+    Ok(&buffer[..padded_len])
+}
 
 /// 解析 base64 WireGuard 密钥为 32 字节。
 fn decode_key(b64: &str) -> CliResult<[u8; 32]> {
@@ -427,13 +524,18 @@ async fn forward_loop(
     let mut rx_acc: u64 = 0; // 入站：从隧道收到的明文（Received）
     let mut udp_send_failures: u64 = 0;
     let mut udp_recv_failures: u64 = 0;
+    let mut timer_failures: u64 = 0;
     let mut last_udp_error_log = std::time::Instant::now();
     let mut obfs_drops: u64 = 0;
+    let mut send_state = SendState::default();
 
     // 立即发起握手（无 src 触发 handshake initiation）。
     if let TunnResult::WriteToNetwork(p) = tunn.encapsulate(&[], &mut enc_buf) {
-        if send_network(&udp, obfs.as_ref(), p).await.is_err() {
-            udp_send_failures += 1;
+        if let Err(error) = send_network(&udp, obfs.as_ref(), p).await {
+            send_state
+                .failure_logger
+                .record("initial_handshake", p, &error);
+            udp_send_failures = udp_send_failures.saturating_add(1);
         }
     }
 
@@ -447,14 +549,62 @@ async fn forward_loop(
             r = device.recv(&mut tun_read_buf) => {
                 match r {
                     Ok(n) => {
-                        if let TunnResult::WriteToNetwork(p) =
-                            tunn.encapsulate(&tun_read_buf[..n], &mut enc_buf)
-                        {
-                            if send_network(&udp, obfs.as_ref(), p).await.is_err() {
-                                udp_send_failures = udp_send_failures.saturating_add(1);
-                            } else {
-                                tx_acc = tx_acc.saturating_add(n as u64);
+                        if n == 0 {
+                            continue;
+                        }
+                        let plaintext = match pad_wireguard_plaintext(&mut tun_read_buf, n) {
+                            Ok(packet) => packet,
+                            Err(error) => {
+                                tracing::warn!(
+                                    stage = "wireguard_padding",
+                                    result = "failed",
+                                    original_len = n,
+                                    buffer_capacity = tun_read_buf.len(),
+                                    error = %error.safe_diagnostic(),
+                                    "WireGuard 业务报文填充失败，数据面停止"
+                                );
+                                if let Some(s) = &traffic {
+                                    s.set_error(
+                                        format!("数据面中断(WireGuard 填充失败): {}", error.safe_diagnostic()),
+                                        crate::daemon::now_unix(),
+                                    ).await;
+                                }
+                                let _ = shutdown_tx.send(true);
+                                break Err(error);
                             }
+                        };
+                        match tunn.encapsulate(plaintext, &mut enc_buf) {
+                            TunnResult::WriteToNetwork(p) => {
+                                let is_data = wireguard_packet_type(p) == Some(4);
+                                let sent = match send_network(&udp, obfs.as_ref(), p).await {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        send_state.failure_logger.record("tun_data", p, &error);
+                                        udp_send_failures = udp_send_failures.saturating_add(1);
+                                        false
+                                    }
+                                };
+                                if is_data && sent {
+                                    // 只在业务 Data 报文实际发送成功后统计；握手包不算用户流量。
+                                    tx_acc = tx_acc.saturating_add(n as u64);
+                                } else if !is_data {
+                                    send_state.track_pending_tx(n);
+                                }
+                            }
+                            TunnResult::Done => {
+                                send_state.track_pending_tx(n);
+                            }
+                            TunnResult::Err(error) => {
+                                tracing::warn!(
+                                    stage = "wireguard_encapsulate",
+                                    result = "failed",
+                                    original_len = n,
+                                    padded_len = plaintext.len(),
+                                    error = ?error,
+                                    "WireGuard 业务报文封装失败"
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     Err(e) => {
@@ -486,8 +636,20 @@ async fn forward_loop(
                         } else {
                             &udp_read_buf[..n]
                         };
-                        match handle_incoming(&mut tunn, &udp, &device, incoming, obfs.as_ref(), packet_buffer_size).await {
-                            Ok(bytes) => rx_acc = rx_acc.saturating_add(bytes),
+                        match handle_incoming(
+                            &mut tunn,
+                            &udp,
+                            &device,
+                            incoming,
+                            obfs.as_ref(),
+                            packet_buffer_size,
+                            &mut send_state,
+                        ).await {
+                            Ok((rx_bytes, tx_bytes, send_failures)) => {
+                                rx_acc = rx_acc.saturating_add(rx_bytes);
+                                tx_acc = tx_acc.saturating_add(tx_bytes);
+                                udp_send_failures = udp_send_failures.saturating_add(send_failures);
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, "写入 TUN 失败，数据面停止");
                                 if let Some(s) = &traffic {
@@ -520,17 +682,36 @@ async fn forward_loop(
             // 定时器：握手重传 / keepalive，并顺带把累计流量刷回状态。
             _ = ticker.tick() => {
                 let mut tbuf = vec![0u8; packet_buffer_size];
-                if let TunnResult::WriteToNetwork(p) = tunn.update_timers(&mut tbuf) {
-                    if send_network(&udp, obfs.as_ref(), p).await.is_err() {
-                        udp_send_failures = udp_send_failures.saturating_add(1);
+                match tunn.update_timers(&mut tbuf) {
+                    TunnResult::WriteToNetwork(p) => {
+                        if let Err(error) = send_network(&udp, obfs.as_ref(), p).await {
+                            send_state.failure_logger.record("timer", p, &error);
+                            udp_send_failures = udp_send_failures.saturating_add(1);
+                        }
                     }
+                    TunnResult::Err(error) => {
+                        let cleared_pending = send_state.clear_pending_tx();
+                        let diagnostic = NetworkSendError {
+                            stage: "wireguard_timer",
+                            message: format!("{error:?}; cleared_pending={cleared_pending}"),
+                        };
+                        send_state
+                            .failure_logger
+                            .record("timer_state", &[], &diagnostic);
+                        timer_failures = timer_failures.saturating_add(1);
+                    }
+                    _ => {}
                 }
-                if (udp_send_failures > 0 || udp_recv_failures > 0 || obfs_drops > 0)
+                if (udp_send_failures > 0
+                    || udp_recv_failures > 0
+                    || timer_failures > 0
+                    || obfs_drops > 0)
                     && last_udp_error_log.elapsed() >= Duration::from_secs(10)
                 {
-                    tracing::debug!(send_failures = udp_send_failures, recv_failures = udp_recv_failures, obfs_drops, "隧道 UDP 暂时不可用或收到非法混淆包，保持连接等待恢复");
+                    tracing::debug!(send_failures = udp_send_failures, recv_failures = udp_recv_failures, timer_failures, obfs_drops, "隧道 UDP 暂时不可用或收到非法混淆包，保持连接等待恢复");
                     udp_send_failures = 0;
                     udp_recv_failures = 0;
+                    timer_failures = 0;
                     obfs_drops = 0;
                     last_udp_error_log = std::time::Instant::now();
                 }
@@ -663,17 +844,41 @@ async fn handle_incoming(
     packet: &[u8],
     obfs: Option<&ObfsRuntime>,
     packet_buffer_size: usize,
-) -> CliResult<u64> {
+    send_state: &mut SendState,
+) -> CliResult<(u64, u64, u64)> {
     let mut out = vec![0u8; packet_buffer_size];
     match tunn.decapsulate(None, packet, &mut out) {
         TunnResult::WriteToNetwork(p) => {
-            let _ = send_network(udp, obfs, p).await;
+            let mut send_failures = 0u64;
+            let mut tx_bytes = 0u64;
+            if let Err(error) = send_network(udp, obfs, p).await {
+                send_state
+                    .failure_logger
+                    .record("handshake_response", p, &error);
+                send_failures = send_failures.saturating_add(1);
+            }
             // boringtun 约定：收到握手类响应后，用空包重复调用以排空待发队列。
             loop {
                 let mut drain = vec![0u8; packet_buffer_size];
                 match tunn.decapsulate(None, &[], &mut drain) {
                     TunnResult::WriteToNetwork(p) => {
-                        let _ = send_network(udp, obfs, p).await;
+                        let queued_user_bytes =
+                            if wireguard_packet_type(p) == Some(4) && p.len() > 32 {
+                                send_state.pending_tx_lengths.pop_front()
+                            } else {
+                                None
+                            };
+                        match send_network(udp, obfs, p).await {
+                            Ok(()) => {
+                                if let Some(bytes) = queued_user_bytes {
+                                    tx_bytes = tx_bytes.saturating_add(bytes);
+                                }
+                            }
+                            Err(error) => {
+                                send_state.failure_logger.record("queue_drain", p, &error);
+                                send_failures = send_failures.saturating_add(1);
+                            }
+                        }
                     }
                     TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
                         device
@@ -684,7 +889,7 @@ async fn handle_incoming(
                     _ => break,
                 }
             }
-            Ok(0)
+            Ok((0, tx_bytes, send_failures))
         }
         TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
             let n = p.len() as u64;
@@ -692,29 +897,38 @@ async fn handle_incoming(
                 .send(p)
                 .await
                 .map_err(|e| CliError::Other(format!("写入 TUN 失败: {e}")))?;
-            Ok(n)
+            Ok((n, 0, 0))
         }
-        TunnResult::Done => Ok(0),
+        TunnResult::Done => Ok((0, 0, 0)),
         TunnResult::Err(e) => {
             tracing::debug!(?e, "decapsulate 错误（忽略单包）");
-            Ok(0)
+            Ok((0, 0, 0))
         }
     }
 }
 
-async fn send_network(udp: &UdpSocket, obfs: Option<&ObfsRuntime>, packet: &[u8]) -> CliResult<()> {
+async fn send_network(
+    udp: &UdpSocket,
+    obfs: Option<&ObfsRuntime>,
+    packet: &[u8],
+) -> Result<(), NetworkSendError> {
     if let Some(runtime) = obfs {
         let encoded = runtime
             .encoder
             .encode(packet)
-            .map_err(|error| CliError::Other(format!("混淆编码失败: {error}")))?;
-        udp.send(&encoded)
-            .await
-            .map_err(|error| CliError::Other(format!("UDP 发送失败: {error}")))?;
+            .map_err(|error| NetworkSendError {
+                stage: "obfs_encode",
+                message: error.to_string(),
+            })?;
+        udp.send(&encoded).await.map_err(|error| NetworkSendError {
+            stage: "udp_send",
+            message: error.to_string(),
+        })?;
     } else {
-        udp.send(packet)
-            .await
-            .map_err(|error| CliError::Other(format!("UDP 发送失败: {error}")))?;
+        udp.send(packet).await.map_err(|error| NetworkSendError {
+            stage: "udp_send",
+            message: error.to_string(),
+        })?;
     }
     Ok(())
 }
@@ -773,5 +987,143 @@ mod tests {
         // 合法 base64 但长度不对
         let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
         assert!(decode_key(&short).is_err());
+    }
+
+    #[test]
+    fn wireguard_plaintext_padding_covers_empty_aligned_and_boundaries() {
+        let mut buffer = [0xa5; 1440];
+
+        assert_eq!(pad_wireguard_plaintext(&mut buffer, 0).unwrap().len(), 0);
+        assert_eq!(pad_wireguard_plaintext(&mut buffer, 16).unwrap().len(), 16);
+        assert_eq!(pad_wireguard_plaintext(&mut buffer, 96).unwrap().len(), 96);
+        assert_eq!(
+            pad_wireguard_plaintext(&mut buffer, 1424).unwrap().len(),
+            1424
+        );
+
+        let padded = pad_wireguard_plaintext(&mut buffer, 15).unwrap();
+        assert_eq!(padded.len(), 16);
+        assert_eq!(padded[15], 0);
+        let padded = pad_wireguard_plaintext(&mut buffer, 17).unwrap();
+        assert_eq!(padded.len(), 32);
+        assert!(padded[17..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn wireguard_plaintext_padding_preserves_packet_and_zero_fills() {
+        let original: Vec<u8> = (0..84).map(|value| value as u8).collect();
+        let mut buffer = vec![0xa5; 96];
+        buffer[..original.len()].copy_from_slice(&original);
+
+        let padded = pad_wireguard_plaintext(&mut buffer, original.len()).unwrap();
+
+        assert_eq!(padded.len(), 96);
+        assert_eq!(&padded[..original.len()], original.as_slice());
+        assert!(padded[original.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn wireguard_plaintext_padding_rejects_insufficient_capacity() {
+        let mut exact_original = [0u8; 84];
+        assert!(pad_wireguard_plaintext(&mut exact_original, 84).is_err());
+
+        let mut short = [0u8; 16];
+        assert!(pad_wireguard_plaintext(&mut short, 17).is_err());
+    }
+
+    #[test]
+    fn wireguard_packet_type_requires_complete_little_endian_header() {
+        assert_eq!(wireguard_packet_type(&[]), None);
+        assert_eq!(wireguard_packet_type(&[4]), None);
+        assert_eq!(wireguard_packet_type(&[4, 0, 0]), None);
+        assert_eq!(wireguard_packet_type(&[1, 0, 0, 0]), Some(1));
+        assert_eq!(wireguard_packet_type(&[4, 0, 0, 0, 99]), Some(4));
+        assert_eq!(wireguard_packet_type(&[4, 1, 0, 0]), None);
+        assert_eq!(wireguard_packet_type(&[0, 0, 0, 0]), None);
+        assert_eq!(wireguard_packet_type(&[5, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn send_state_ignores_empty_packets_and_clears_pending_on_session_error() {
+        let mut state = SendState::default();
+        state.track_pending_tx(0);
+        assert!(state.pending_tx_lengths.is_empty());
+
+        state.track_pending_tx(84);
+        state.track_pending_tx(96);
+        assert_eq!(state.clear_pending_tx(), 2);
+        assert!(state.pending_tx_lengths.is_empty());
+        assert_eq!(state.clear_pending_tx(), 0);
+    }
+
+    fn establish_tunn_pair() -> (Tunn, Tunn) {
+        let client_secret = StaticSecret::from([1u8; 32]);
+        let client_public = PublicKey::from(&client_secret);
+        let server_secret = StaticSecret::from([2u8; 32]);
+        let server_public = PublicKey::from(&server_secret);
+        let mut client = Tunn::new(client_secret, server_public, None, None, 1, None);
+        let mut server = Tunn::new(server_secret, client_public, None, None, 2, None);
+        let mut buffer = vec![0u8; 2048];
+
+        let initiation = match client.encapsulate(&[], &mut buffer) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            result => panic!("expected handshake initiation, got {result:?}"),
+        };
+        let response = match server.decapsulate(None, &initiation, &mut buffer) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            result => panic!("expected handshake response, got {result:?}"),
+        };
+        let keepalive = match client.decapsulate(None, &response, &mut buffer) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            result => panic!("expected keepalive, got {result:?}"),
+        };
+        assert!(matches!(
+            server.decapsulate(None, &keepalive, &mut buffer),
+            TunnResult::Done
+        ));
+        (client, server)
+    }
+
+    fn ipv4_packet_84_bytes() -> Vec<u8> {
+        let mut packet = vec![0u8; 84];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(84u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 1;
+        packet[12..16].copy_from_slice(&[10, 9, 0, 2]);
+        packet[16..20].copy_from_slice(&[10, 9, 0, 1]);
+        packet
+    }
+
+    #[test]
+    fn padded_ipv4_packet_round_trips_through_boringtun_and_both_obfs_modes() {
+        for mode in [Mode::LowOverheadV1, Mode::ParanoidV1] {
+            let (mut client, mut server) = establish_tunn_pair();
+            let original = ipv4_packet_84_bytes();
+            let mut plaintext = vec![0u8; 96];
+            plaintext[..original.len()].copy_from_slice(&original);
+            let padded = pad_wireguard_plaintext(&mut plaintext, original.len()).unwrap();
+            let mut network_buffer = vec![0u8; 2048];
+            let wireguard = match client.encapsulate(padded, &mut network_buffer) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                result => panic!("expected WireGuard data, got {result:?}"),
+            };
+
+            assert_eq!(wireguard.len(), 128);
+            assert_eq!(vpn_obfs::validate_wireguard(&wireguard, 1472), Ok(4));
+
+            let psk = [7u8; 32];
+            let encoder = Codec::new(&psk, mode, Direction::ClientToServer, 1472).unwrap();
+            let decoder = Codec::new(&psk, mode, Direction::ClientToServer, 1472).unwrap();
+            let encoded = encoder.encode(&wireguard).unwrap();
+            let decoded = decoder.decode(&encoded, &mut ReplayCache::new()).unwrap();
+            let decrypted = match server.decapsulate(None, &decoded, &mut network_buffer) {
+                TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+                result => panic!("expected IPv4 packet, got {result:?}"),
+            };
+
+            assert_eq!(decrypted.len(), original.len());
+            assert_eq!(decrypted, original);
+        }
     }
 }
