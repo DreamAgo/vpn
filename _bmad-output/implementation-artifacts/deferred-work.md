@@ -12,6 +12,8 @@
 - `update_peer_routes` 先写数据库再配置 WireGuard；数据面配置失败时会留下数据库与运行时状态不一致。后续应增加补偿回滚或可重放的 reconciliation。
 - 对 `force_removed` peer 清空/替换路由时，现有分支不会主动清理历史 OS 路由；后续应统一计算并释放不再被活跃 peer 使用的路由。
 - peer 身份仍允许同一账户通过相同 `device_name` 携新公钥匹配旧槽位，这是为客户端重启后密钥变化保留的既有语义，也意味着设备名可被同账户其他客户端冒用。后续应持久化设备密钥或引入管理员批准的设备身份。
+- `crates/vpn-cli/src/wg_userspace.rs`：客户端安装授权路由前未为当前 WireGuard/混淆服务端 endpoint 安装宿主旁路。任何包含 endpoint 地址的业务路由都可能把握手 UDP 卷入隧道；该问题在允许 VPN 超网前已可由普通站点路由触发。后续应在加业务路由前固定 endpoint `/32` 到原网关，并在 endpoint 变化时原子更新。
+- `crates/vpn-server/src/services/user_group_service.rs`：用户组 `update` 先执行写入，再单独读取记录和成员数；后续读失败时会出现“接口报错但更新已持久化”。该顺序在本次 VPN 超网校验修改前已存在；后续应把 update/get/member_count 收敛到同一事务。
 
 ## Authentication session consistency
 

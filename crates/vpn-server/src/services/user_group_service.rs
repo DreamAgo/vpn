@@ -144,17 +144,14 @@ impl UserGroupService {
             .iter()
             .filter_map(|route| route.parse::<Ipv4Net>().ok())
             .collect::<Vec<_>>();
-        if nets.iter().any(|net| overlaps(*net, policy.vpn_subnet)) {
-            return Err(AppError::Validation(
-                "用户组路由不得包含或重叠 VPN 基础网段".into(),
-            ));
+        if let Some(route) = nets.iter().find(|route| policy.vpn_subnet.contains(*route)) {
+            return Err(AppError::Validation(format!(
+                "用户组路由 {route} 不得等于或位于 VPN 基础网段 {} 内",
+                policy.vpn_subnet
+            )));
         }
         Ok(normalized)
     }
-}
-
-fn overlaps(left: Ipv4Net, right: Ipv4Net) -> bool {
-    left.contains(&right.network()) || right.contains(&left.network())
 }
 
 fn row_to_dto(row: UserGroupRow, member_count: u32) -> UserGroupDto {
@@ -179,7 +176,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::str::FromStr;
 
-    async fn setup() -> UserGroupService {
+    async fn setup_with_vpn_subnet(vpn_subnet: &str) -> UserGroupService {
         let url = format!(
             "sqlite:file:user_group_svc_{}?mode=memory&cache=private",
             Uuid::new_v4()
@@ -195,7 +192,11 @@ mod tests {
             SqliteUserGroupRepository::new(pool.clone()),
             SqliteUserRepository::new(pool),
         )
-        .with_route_policy("10.8.0.0/24".parse().unwrap())
+        .with_route_policy(vpn_subnet.parse().unwrap())
+    }
+
+    async fn setup() -> UserGroupService {
+        setup_with_vpn_subnet("10.8.0.0/24").await
     }
 
     #[tokio::test]
@@ -222,21 +223,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_rejects_vpn_but_allows_site_route_shapes() {
+    async fn create_enforces_asymmetric_vpn_route_matrix() {
         let svc = setup().await;
-        assert!(svc
-            .create("vpn-overlap", &["10.8.0.128/25".to_string()])
-            .await
-            .is_err());
 
         for (name, route) in [
+            ("vpn-supernet", "10.0.0.0/8"),
+            ("vpn-near-supernet", "10.8.0.0/23"),
             ("site-exact", "192.168.50.0/24"),
-            ("site-subnet", "192.168.50.128/25"),
-            ("site-supernet", "192.168.0.0/16"),
         ] {
             let group = svc.create(name, &[route.to_string()]).await.unwrap();
             assert_eq!(group.routes, vec![route.to_string()]);
         }
+
+        for (name, route) in [
+            ("vpn-exact", "10.8.0.0/24"),
+            ("vpn-subnet", "10.8.0.128/25"),
+            ("vpn-host", "10.8.0.3/32"),
+        ] {
+            let error = svc.create(name, &[route.to_string()]).await.unwrap_err();
+            let AppError::Validation(message) = error else {
+                panic!("expected validation error, got {error:?}");
+            };
+            assert!(message.contains(route));
+            assert!(message.contains("10.8.0.0/24"));
+            assert!(svc
+                .group_repo
+                .list_with_counts()
+                .await
+                .unwrap()
+                .iter()
+                .all(|(group, _)| group.name != name));
+        }
+
+        let error = svc
+            .create(
+                "mixed",
+                &["192.168.70.0/24".to_string(), "10.8.0.128/25".to_string()],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Validation(_)));
+        assert!(svc
+            .group_repo
+            .list_with_counts()
+            .await
+            .unwrap()
+            .iter()
+            .all(|(group, _)| group.name != "mixed"));
+
+        let error = svc
+            .create("default", &["0.0.0.0/0".to_string()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("暂不支持全隧道网段"));
     }
 
     #[tokio::test]
@@ -254,11 +293,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_allows_site_route_shapes_but_rejects_vpn_overlap() {
+    async fn update_enforces_asymmetric_vpn_route_matrix_without_partial_writes() {
         let svc = setup().await;
-        let group = svc.create("ops", &[]).await.unwrap();
+        let group = svc
+            .create("ops", &["192.168.50.0/24".to_string()])
+            .await
+            .unwrap();
 
-        for route in ["192.168.50.0/24", "192.168.50.128/25", "192.168.0.0/16"] {
+        for route in ["10.0.0.0/8", "10.8.0.0/23", "192.168.60.0/24"] {
             let updated = svc
                 .update(&group.id, None, Some(&[route.to_string()]))
                 .await
@@ -266,10 +308,95 @@ mod tests {
             assert_eq!(updated.routes, vec![route.to_string()]);
         }
 
-        assert!(svc
-            .update(&group.id, None, Some(&["10.8.0.128/25".to_string()]),)
+        let last_valid_route = "192.168.60.0/24";
+        for route in ["10.8.0.0/24", "10.8.0.128/25", "10.8.0.3/32"] {
+            let error = svc
+                .update(
+                    &group.id,
+                    Some("must-not-persist"),
+                    Some(&[route.to_string()]),
+                )
+                .await
+                .unwrap_err();
+            let AppError::Validation(message) = error else {
+                panic!("expected validation error, got {error:?}");
+            };
+            assert!(message.contains(route));
+            assert!(message.contains("10.8.0.0/24"));
+            let stored = svc.group_repo.get(&group.id).await.unwrap().unwrap();
+            assert_eq!(stored.name, "ops");
+            assert_eq!(stored.routes, last_valid_route);
+        }
+
+        let error = svc
+            .update(
+                &group.id,
+                Some("must-not-persist"),
+                Some(&["0.0.0.0/0".to_string()]),
+            )
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(error.to_string().contains("暂不支持全隧道网段"));
+        let stored = svc.group_repo.get(&group.id).await.unwrap().unwrap();
+        assert_eq!(stored.name, "ops");
+        assert_eq!(stored.routes, last_valid_route);
+
+        let error = svc
+            .update(
+                &group.id,
+                Some("mixed-must-not-persist"),
+                Some(&["192.168.70.0/24".to_string(), "10.8.0.128/25".to_string()]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Validation(_)));
+        let stored = svc.group_repo.get(&group.id).await.unwrap().unwrap();
+        assert_eq!(stored.name, "ops");
+        assert_eq!(stored.routes, last_valid_route);
+    }
+
+    #[tokio::test]
+    async fn runtime_10_9_policy_allows_supernet_and_rejects_exact_or_narrower_routes() {
+        let svc = setup_with_vpn_subnet("10.9.0.0/24").await;
+
+        let created = svc
+            .create("vpn-supernet", &["10.0.0.0/8".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(created.routes, vec!["10.0.0.0/8".to_string()]);
+
+        for (name, route) in [
+            ("vpn-exact-10-9", "10.9.0.0/24"),
+            ("vpn-subnet-10-9", "10.9.0.128/25"),
+            ("vpn-host-10-9", "10.9.0.3/32"),
+        ] {
+            let error = svc.create(name, &[route.to_string()]).await.unwrap_err();
+            let AppError::Validation(message) = error else {
+                panic!("expected validation error, got {error:?}");
+            };
+            assert!(message.contains(route));
+            assert!(message.contains("10.9.0.0/24"));
+        }
+
+        let updated = svc
+            .update(&created.id, None, Some(&["10.0.0.0/8".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(updated.routes, vec!["10.0.0.0/8".to_string()]);
+
+        for route in ["10.9.0.0/24", "10.9.0.128/25", "10.9.0.3/32"] {
+            let error = svc
+                .update(&created.id, None, Some(&[route.to_string()]))
+                .await
+                .unwrap_err();
+            let AppError::Validation(message) = error else {
+                panic!("expected validation error, got {error:?}");
+            };
+            assert!(message.contains(route));
+            assert!(message.contains("10.9.0.0/24"));
+            let stored = svc.group_repo.get(&created.id).await.unwrap().unwrap();
+            assert_eq!(stored.routes, "10.0.0.0/8");
+        }
     }
 
     #[tokio::test]

@@ -294,4 +294,30 @@ mod tests {
         assert!(script.contains("ip daddr 10.242.101.0/24 accept"));
         assert!(script.ends_with("iifname \"wg0\" counter drop\n"));
     }
+
+    #[test]
+    fn vpn_supernet_lease_is_source_bounded_and_keeps_fail_closed_drop() {
+        let script = render_nft_batch(
+            "wg0",
+            "10.8.0.0/24".parse().unwrap(),
+            &[AclLease {
+                source: "10.8.0.3".parse().unwrap(),
+                destination: "10.0.0.0/8".parse().unwrap(),
+                timeout_ms: 75_000,
+            }],
+            &[],
+            false,
+        );
+
+        assert!(script.contains("10.8.0.3 timeout 75000ms"));
+        assert!(!script.contains("10.8.0.4"));
+        let supernet_accepts = script
+            .lines()
+            .filter(|line| line.contains("ip daddr 10.0.0.0/8 accept"))
+            .collect::<Vec<_>>();
+        assert_eq!(supernet_accepts.len(), 1);
+        assert!(supernet_accepts[0].contains("ip saddr @route_0"));
+        assert!(!script.contains("iifname \"wg0\" ip daddr 10.0.0.0/8 accept"));
+        assert!(script.ends_with("iifname \"wg0\" counter drop\n"));
+    }
 }

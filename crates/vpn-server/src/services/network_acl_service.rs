@@ -250,6 +250,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vpn_supernet_is_a_valid_bounded_acl_destination_for_only_its_source() {
+        let mut leases = Vec::new();
+        append_routes(
+            &mut leases,
+            "10.8.0.3".parse().unwrap(),
+            "10.0.0.0/8",
+            ACL_LEASE_CAP_MS,
+            "10.8.0.0/24".parse().unwrap(),
+        );
+
+        assert_eq!(
+            leases,
+            vec![AclLease {
+                source: "10.8.0.3".parse().unwrap(),
+                destination: "10.0.0.0/8".parse().unwrap(),
+                timeout_ms: ACL_LEASE_CAP_MS,
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn database_authorization_snapshot_only_leases_authorized_vpn_ips() {
         let pool = setup_pool().await;
@@ -292,7 +313,7 @@ mod tests {
         }
         sqlx::query(
             r#"INSERT INTO user_groups (id,name,routes,created_at,updated_at)
-               VALUES ('site-group','site','10.242.0.0/16',0,0)"#,
+               VALUES ('site-group','site','10.242.0.0/16,10.0.0.0/8',0,0)"#,
         )
         .execute(&pool)
         .await
@@ -314,7 +335,8 @@ mod tests {
         .unwrap();
 
         let site: Ipv4Net = "10.242.101.0/24".parse().unwrap();
-        let authorized_destination: Ipv4Net = "10.242.0.0/16".parse().unwrap();
+        let site_destination = "10.242.0.0/16".parse::<Ipv4Net>().unwrap();
+        let vpn_supernet = "10.0.0.0/8".parse::<Ipv4Net>().unwrap();
         let (leases, site_sources) = build_acl_snapshot(
             &pool,
             &["172.31.9.0/24".to_string()],
@@ -325,18 +347,40 @@ mod tests {
         .unwrap();
 
         assert!(site_sources.contains(&site));
-        for source in ["10.8.0.2", "10.8.0.3"] {
-            assert!(leases.iter().any(|lease| {
-                lease.source == source.parse::<Ipv4Addr>().unwrap()
-                    && lease.destination == authorized_destination
-            }));
-        }
-        for source in ["10.8.0.4", "10.8.0.5", "10.8.0.6"] {
-            assert!(!leases.iter().any(|lease| {
-                lease.source == source.parse::<Ipv4Addr>().unwrap()
-                    && lease.destination == authorized_destination
-            }));
-        }
+        let mut supernet_leases = leases
+            .iter()
+            .filter(|lease| lease.destination == vpn_supernet)
+            .cloned()
+            .collect::<Vec<_>>();
+        supernet_leases.sort_by_key(|lease| lease.source);
+        assert_eq!(
+            supernet_leases,
+            vec![
+                AclLease {
+                    source: "10.8.0.2".parse().unwrap(),
+                    destination: vpn_supernet,
+                    timeout_ms: ACL_LEASE_CAP_MS,
+                },
+                AclLease {
+                    source: "10.8.0.3".parse().unwrap(),
+                    destination: vpn_supernet,
+                    timeout_ms: 60_000,
+                },
+            ]
+        );
+        let mut site_leases = leases
+            .iter()
+            .filter(|lease| lease.destination == site_destination)
+            .map(|lease| lease.source)
+            .collect::<Vec<_>>();
+        site_leases.sort();
+        assert_eq!(
+            site_leases,
+            vec![
+                "10.8.0.2".parse::<Ipv4Addr>().unwrap(),
+                "10.8.0.3".parse::<Ipv4Addr>().unwrap()
+            ]
+        );
         assert!(leases.iter().any(|lease| {
             lease.source == "10.8.0.5".parse::<Ipv4Addr>().unwrap()
                 && lease.destination == "172.31.9.0/24".parse::<Ipv4Net>().unwrap()

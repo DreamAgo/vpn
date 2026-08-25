@@ -2391,6 +2391,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vpn_supernet_group_route_reaches_register_and_heartbeat_only_when_authorized() {
+        let pool = setup_pool().await;
+        let groups = SqliteUserGroupRepository::new(pool.clone());
+        groups
+            .insert("group-supernet", "private-network", "10.0.0.0/8")
+            .await
+            .unwrap();
+        groups
+            .set_groups("user-1", &["group-supernet".to_string()])
+            .await
+            .unwrap();
+        let svc = service(pool);
+
+        let authorized = svc.register("user-1", &reg("PK-SUPERNET")).await.unwrap();
+        assert!(authorized
+            .allowed_routes
+            .contains(&"10.8.0.0/24".to_string()));
+        assert!(authorized
+            .allowed_routes
+            .contains(&"10.0.0.0/8".to_string()));
+        let authorized_heartbeat = svc
+            .heartbeat_checked("user-1", &hb(Some("PK-SUPERNET"), None), 1_000)
+            .await
+            .unwrap();
+        assert!(authorized_heartbeat.contains(&"10.8.0.0/24".to_string()));
+        assert!(authorized_heartbeat.contains(&"10.0.0.0/8".to_string()));
+
+        let unauthorized = svc
+            .register("user-2", &reg_named("PK-NO-SUPERNET", "Consumer"))
+            .await
+            .unwrap();
+        assert!(unauthorized
+            .allowed_routes
+            .contains(&"10.8.0.0/24".to_string()));
+        assert!(!unauthorized
+            .allowed_routes
+            .contains(&"10.0.0.0/8".to_string()));
+        let unauthorized_heartbeat = svc
+            .heartbeat_checked("user-2", &hb(Some("PK-NO-SUPERNET"), None), 1_000)
+            .await
+            .unwrap();
+        assert!(unauthorized_heartbeat.contains(&"10.8.0.0/24".to_string()));
+        assert!(!unauthorized_heartbeat.contains(&"10.0.0.0/8".to_string()));
+    }
+
+    #[tokio::test]
     async fn gateway_reregister_keeps_group_overlapping_site_but_excludes_own_route() {
         let pool = setup_pool().await;
         let groups = SqliteUserGroupRepository::new(pool.clone());
