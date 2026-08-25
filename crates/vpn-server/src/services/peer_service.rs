@@ -377,8 +377,6 @@ impl PeerService {
         if matched_existing {
             self.ensure_no_subnet_collision(&routed_subnets, target_id.as_deref(), None)
                 .await?;
-            self.ensure_no_group_route_collision(&routed_subnets)
-                .await?;
         }
 
         let vpn_ip: String = match target {
@@ -522,20 +520,28 @@ impl PeerService {
         };
         // base 解析为网段集合，用于判定站点网关 LAN 是否落在该用户的允许范围内。
         let allow_nets: Vec<Ipv4Net> = base.iter().filter_map(|s| s.parse().ok()).collect();
-        // 本网关自报 LAN 的网段形式,用于按 CIDR **包含**(而非精确字符串相等)做自排除:
-        // 若组/服务端路由是本网关 LAN 的子集(如本地 /24 下发组路由 /25),精确相等判不出来,
-        // 会把更具体的 /25 塞回该网关自己的隧道,使它对自己半个 LAN 的本地流量被卷进隧道兜圈。
+        // 本网关自报 LAN 的网段形式，用于从组/服务端授权路由中做 CIDR 差集。
+        // 例如组授权 /16、本网关 LAN 为其中 /24：仅排除该 /24，保留 /16 的其余部分，
+        // 既避免本地 LAN 流量回灌隧道，也不会丢失访问其他站点的授权。
         let own_nets: Vec<Ipv4Net> = own_subnets.iter().filter_map(|s| s.parse().ok()).collect();
         for s in base {
-            if routes.contains(&s) {
+            let Ok(net) = s.parse::<Ipv4Net>() else {
+                if !own_subnets.contains(&s) && !routes.contains(&s) {
+                    routes.push(s);
+                }
                 continue;
-            }
-            let covered_by_own = match s.parse::<Ipv4Net>() {
-                Ok(net) => own_nets.iter().any(|o| o.contains(&net)),
-                Err(_) => own_subnets.contains(&s),
             };
-            if !covered_by_own {
-                routes.push(s);
+            let fragments = own_nets.iter().fold(vec![net], |remaining, own| {
+                remaining
+                    .into_iter()
+                    .flat_map(|candidate| Self::subtract_net(candidate, *own))
+                    .collect()
+            });
+            for fragment in fragments {
+                let route = fragment.to_string();
+                if !routes.contains(&route) {
+                    routes.push(route);
+                }
             }
         }
         // 站点网关 LAN：仅当被允许集合覆盖时才下发（关闭“任意站点 LAN 泄漏给所有人”）。
@@ -558,6 +564,22 @@ impl PeerService {
     /// 两个 IPv4 网段是否重叠（CIDR 性质：要么不相交，要么一方包含另一方）。
     fn nets_overlap(a: &Ipv4Net, b: &Ipv4Net) -> bool {
         a.contains(b) || b.contains(a)
+    }
+
+    /// 返回 `base - excluded` 的最小 CIDR 集合。
+    fn subtract_net(base: Ipv4Net, excluded: Ipv4Net) -> Vec<Ipv4Net> {
+        if !Self::nets_overlap(&base, &excluded) {
+            return vec![base];
+        }
+        if excluded.contains(&base) {
+            return Vec::new();
+        }
+
+        // 此时 base 严格包含 excluded；递归二分，只继续拆分包含 excluded 的那一半。
+        base.subnets(base.prefix_len() + 1)
+            .expect("base strictly contains excluded, so a longer prefix exists")
+            .flat_map(|child| Self::subtract_net(child, excluded))
+            .collect()
     }
 
     /// 从待删除的残留 OS 路由中剔除仍被**其他活跃网关 peer** 声明的网段。
@@ -628,33 +650,6 @@ impl PeerService {
                             )));
                         }
                     }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// 站点源网段与用户组授权目的网段必须始终分离；同时校验反向写入顺序，
-    /// 防止“先建组、后声明站点”绕过 UserGroupService 的检查。
-    async fn ensure_no_group_route_collision(&self, new_subnets: &[String]) -> Result<()> {
-        if new_subnets.is_empty() {
-            return Ok(());
-        }
-        let news: Vec<Ipv4Net> = new_subnets
-            .iter()
-            .filter_map(|route| route.parse().ok())
-            .collect();
-        for (group, _) in self.user_group_repo.list_with_counts().await? {
-            for route in group
-                .routes
-                .split(',')
-                .filter_map(|route| route.parse::<Ipv4Net>().ok())
-            {
-                if news.iter().any(|net| Self::nets_overlap(net, &route)) {
-                    return Err(AppError::Validation(format!(
-                        "站点网段与用户组 {} 的授权网段 {route} 重叠，请先调整用户组路由",
-                        group.name
-                    )));
                 }
             }
         }
@@ -1012,7 +1007,6 @@ impl PeerService {
             .await?
             .ok_or(AppError::PeerNotFound)?;
         let normalized = normalize_subnets(subnets)?;
-        self.ensure_no_group_route_collision(&normalized).await?;
         // 不得与其他节点的站点网段重叠（否则 wg allowed-ips 互抢、站点静默不可达）。
         self.ensure_no_subnet_collision(&normalized, Some(peer_id), None)
             .await?;
@@ -2318,35 +2312,178 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_peer_routes_rejects_existing_group_route_overlap() {
+    async fn group_authorizes_site_for_manual_and_approved_users_only() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"INSERT INTO users
+               (id,username,email,password_hash,role,status,must_change_password,created_at,updated_at,access_mode)
+               VALUES ('user-3','carol','c@e.com','h','user','active',0,0,0,'approval_required'),
+                      ('user-4','dave','d@e.com','h','user','active',0,0,0,'approval_required'),
+                      ('user-5','eve','e@e.com','h','user','active',0,0,0,'legacy')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let groups = SqliteUserGroupRepository::new(pool.clone());
+        groups
+            .insert("group-1", "production", "10.242.101.0/24")
+            .await
+            .unwrap();
+        groups
+            .set_groups("user-1", &["group-1".to_string()])
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"INSERT INTO access_grants
+               (id,approval_instance_code,user_id,group_id,expires_at,reason,created_at,updated_at)
+               VALUES ('grant-1','approval-1','user-3','group-1',?1,'',0,0),
+                      ('grant-2','approval-2','user-4','group-1',?2,'',0,0)"#,
+        )
+        .bind(now + 86_400_000)
+        .bind(now - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let svc = service_with_server_routes(pool, vec!["172.31.9.0/24".to_string()]);
+        svc.register("user-2", &reg_named("PK-GW", "Gateway"))
+            .await
+            .unwrap();
+        let gateway = svc
+            .peer_repo
+            .find_active_by_user("user-2")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.update_peer_routes(&gateway.id, &["10.242.101.0/24".to_string()])
+            .await
+            .unwrap();
+
+        let manual = svc.register("user-1", &reg("PK-MANUAL")).await.unwrap();
+        assert!(manual
+            .allowed_routes
+            .contains(&"10.242.101.0/24".to_string()));
+        let manual_heartbeat = svc
+            .heartbeat_checked("user-1", &hb(Some("PK-MANUAL"), None), now)
+            .await
+            .unwrap();
+        assert!(manual_heartbeat.contains(&"10.242.101.0/24".to_string()));
+
+        let approved = svc.register("user-3", &reg("PK-APPROVED")).await.unwrap();
+        assert!(approved
+            .allowed_routes
+            .contains(&"10.242.101.0/24".to_string()));
+        let approved_heartbeat = svc
+            .heartbeat_checked("user-3", &hb(Some("PK-APPROVED"), None), now)
+            .await
+            .unwrap();
+        assert!(approved_heartbeat.contains(&"10.242.101.0/24".to_string()));
+
+        let unapproved = svc.register("user-4", &reg("PK-UNAPPROVED")).await.unwrap();
+        assert_eq!(unapproved.allowed_routes, vec!["10.8.0.0/24".to_string()]);
+
+        let legacy = svc.register("user-5", &reg("PK-LEGACY")).await.unwrap();
+        assert!(legacy.allowed_routes.contains(&"172.31.9.0/24".to_string()));
+        assert!(!legacy
+            .allowed_routes
+            .contains(&"10.242.101.0/24".to_string()));
+    }
+
+    #[tokio::test]
+    async fn gateway_reregister_keeps_group_overlapping_site_but_excludes_own_route() {
         let pool = setup_pool().await;
         let groups = SqliteUserGroupRepository::new(pool.clone());
         groups
-            .insert("group-1", "production", "192.168.40.0/24")
+            .insert("group-1", "production", "10.242.101.0/24")
+            .await
+            .unwrap();
+        groups
+            .set_groups("user-1", &["group-1".to_string()])
             .await
             .unwrap();
         let svc = service(pool);
-        svc.register("user-1", &reg("PK1")).await.unwrap();
-        let peer = svc
+        svc.register("user-1", &reg_named("PK-GW-1", "Gateway"))
+            .await
+            .unwrap();
+        let gateway = svc
             .peer_repo
             .find_active_by_user("user-1")
             .await
             .unwrap()
             .unwrap();
+        svc.update_peer_routes(&gateway.id, &["10.242.101.0/24".to_string()])
+            .await
+            .unwrap();
 
-        let error = svc
-            .update_peer_routes(&peer.id, &["192.168.40.128/25".to_string()])
+        let reregistered = svc
+            .register("user-1", &reg_named("PK-GW-2", "Gateway"))
             .await
-            .unwrap_err();
-        assert!(matches!(error, AppError::Validation(_)));
-        assert!(svc
+            .unwrap();
+        assert!(!reregistered
+            .allowed_routes
+            .contains(&"10.242.101.0/24".to_string()));
+        let heartbeat = svc
+            .heartbeat_checked("user-1", &hb(Some("PK-GW-2"), None), 1_000)
+            .await
+            .unwrap();
+        assert!(!heartbeat.contains(&"10.242.101.0/24".to_string()));
+        assert_eq!(
+            svc.peer_repo
+                .find_by_id(&gateway.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .routed_subnets,
+            "10.242.101.0/24"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_excludes_own_site_from_subnet_and_supernet_group_routes() {
+        let pool = setup_pool().await;
+        let groups = SqliteUserGroupRepository::new(pool.clone());
+        groups
+            .insert("group-1", "production", "10.242.101.128/25,10.242.0.0/16")
+            .await
+            .unwrap();
+        groups
+            .set_groups("user-1", &["group-1".to_string()])
+            .await
+            .unwrap();
+        let svc = service(pool);
+        svc.register("user-1", &reg_named("PK-GW-1", "Gateway"))
+            .await
+            .unwrap();
+        let gateway = svc
             .peer_repo
-            .find_by_id(&peer.id)
+            .find_active_by_user("user-1")
             .await
             .unwrap()
-            .unwrap()
-            .routed_subnets
-            .is_empty());
+            .unwrap();
+        svc.update_peer_routes(&gateway.id, &["10.242.101.0/24".to_string()])
+            .await
+            .unwrap();
+
+        let reregistered = svc
+            .register("user-1", &reg_named("PK-GW-2", "Gateway"))
+            .await
+            .unwrap();
+        assert!(!reregistered
+            .allowed_routes
+            .contains(&"10.242.101.128/25".to_string()));
+        assert!(!reregistered
+            .allowed_routes
+            .contains(&"10.242.101.0/24".to_string()));
+        assert!(reregistered
+            .allowed_routes
+            .contains(&"10.242.100.0/24".to_string()));
+
+        let heartbeat = svc
+            .heartbeat_checked("user-1", &hb(Some("PK-GW-2"), None), 1_000)
+            .await
+            .unwrap();
+        assert_eq!(heartbeat, reregistered.allowed_routes);
     }
 
     #[tokio::test]

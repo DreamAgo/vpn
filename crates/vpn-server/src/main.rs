@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
             SqliteUserGroupRepository::new(pool.clone()),
             user_repo.clone(),
         )
-        .with_route_policy(subnet, peer_repo.clone()),
+        .with_route_policy(subnet),
     );
     // 网段目录服务:集中维护命名网段,供各处下拉选择。
     let subnet_service = Arc::new(SubnetService::new(SqliteSubnetRepository::new(

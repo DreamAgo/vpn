@@ -49,103 +49,8 @@ impl NetworkAclService {
         let _guard = self.refresh_lock.lock().await;
         let now = Utc::now().timestamp_millis();
         let server_routes = self.peer_service.server_routes().await;
-        let peers: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT p.vpn_ip, p.routed_subnets
-                 FROM peers p JOIN users u ON u.id=p.user_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
-
-        let mut leases = Vec::new();
-        let mut site_sources = Vec::new();
-        for (_, routed) in &peers {
-            for cidr in routed.split(',').filter(|value| !value.is_empty()) {
-                if let Ok(net) = cidr.parse::<Ipv4Net>() {
-                    if net.prefix_len() != 0 && net != self.vpn_subnet {
-                        site_sources.push(net);
-                    }
-                }
-            }
-        }
-        // 启用审批时也审计迁移前的历史数据，不能只依赖新写入路径的校验。
-        let groups: Vec<(String, String)> = sqlx::query_as("SELECT name, routes FROM user_groups")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db)?;
-        validate_group_site_separation(&groups, &site_sources)?;
-
-        let manual: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT p.vpn_ip, g.routes FROM peers p
-                 JOIN users u ON u.id=p.user_id
-                 JOIN user_group_members m ON m.user_id=p.user_id
-                 JOIN user_groups g ON g.id=m.group_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
-        let grants: Vec<(String, String, i64)> = sqlx::query_as(
-            r#"SELECT p.vpn_ip, g.routes, a.expires_at FROM peers p
-                 JOIN users u ON u.id=p.user_id
-                 JOIN access_grants a ON a.user_id=p.user_id
-                 JOIN user_groups g ON g.id=a.group_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'
-                  AND a.expires_at>?1"#,
-        )
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
-        let legacy: Vec<(String,)> = sqlx::query_as(
-            r#"SELECT p.vpn_ip FROM peers p JOIN users u ON u.id=p.user_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'
-                  AND u.access_mode='legacy'
-                  AND NOT EXISTS (SELECT 1 FROM user_group_members m WHERE m.user_id=u.id)
-                  AND NOT EXISTS (SELECT 1 FROM access_grants a
-                                   WHERE a.user_id=u.id AND a.expires_at>?1)"#,
-        )
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
-
-        for (vpn_ip, routes) in manual {
-            let source: Ipv4Addr = vpn_ip
-                .parse()
-                .map_err(|_| AppError::Validation("数据库中的 peer VPN IP 非法".into()))?;
-            append_routes(
-                &mut leases,
-                source,
-                &routes,
-                ACL_LEASE_CAP_MS,
-                self.vpn_subnet,
-            );
-        }
-        for (vpn_ip, routes, expires_at) in grants {
-            let source: Ipv4Addr = vpn_ip
-                .parse()
-                .map_err(|_| AppError::Validation("数据库中的 peer VPN IP 非法".into()))?;
-            let remaining_ms = expires_at.saturating_sub(now);
-            let timeout = (remaining_ms as u64).clamp(1, ACL_LEASE_CAP_MS);
-            append_routes(&mut leases, source, &routes, timeout, self.vpn_subnet);
-        }
-        // 历史账号维持“未分组回退全局路由”；受审批管控账号绝不回退。
-        for (vpn_ip,) in legacy {
-            let source: Ipv4Addr = vpn_ip
-                .parse()
-                .map_err(|_| AppError::Validation("数据库中的 peer VPN IP 非法".into()))?;
-            for route in &server_routes {
-                append_routes(
-                    &mut leases,
-                    source,
-                    route,
-                    ACL_LEASE_CAP_MS,
-                    self.vpn_subnet,
-                );
-            }
-        }
+        let (mut leases, site_sources) =
+            build_acl_snapshot(&self.pool, &server_routes, self.vpn_subnet, now).await?;
         // 查询快照本身会消耗时间；在真正下发前扣除耗时，避免授权越过数据库中的
         // 独占 expires_at。过期元素直接丢弃。
         let elapsed_ms = Utc::now().timestamp_millis().saturating_sub(now) as u64;
@@ -169,6 +74,93 @@ impl NetworkAclService {
             }
         });
     }
+}
+
+async fn build_acl_snapshot(
+    pool: &SqlitePool,
+    server_routes: &[String],
+    vpn_subnet: Ipv4Net,
+    now: i64,
+) -> Result<(Vec<AclLease>, Vec<Ipv4Net>)> {
+    let peers: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT p.vpn_ip, p.routed_subnets
+                 FROM peers p JOIN users u ON u.id=p.user_id
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+
+    let mut leases = Vec::new();
+    let mut site_sources = Vec::new();
+    for (_, routed) in &peers {
+        for cidr in routed.split(',').filter(|value| !value.is_empty()) {
+            if let Ok(net) = cidr.parse::<Ipv4Net>() {
+                if net.prefix_len() != 0 && net != vpn_subnet {
+                    site_sources.push(net);
+                }
+            }
+        }
+    }
+    let manual: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT p.vpn_ip, g.routes FROM peers p
+                 JOIN users u ON u.id=p.user_id
+                 JOIN user_group_members m ON m.user_id=p.user_id
+                 JOIN user_groups g ON g.id=m.group_id
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    let grants: Vec<(String, String, i64)> = sqlx::query_as(
+        r#"SELECT p.vpn_ip, g.routes, a.expires_at FROM peers p
+                 JOIN users u ON u.id=p.user_id
+                 JOIN access_grants a ON a.user_id=p.user_id
+                 JOIN user_groups g ON g.id=a.group_id
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'
+                  AND a.expires_at>?1"#,
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    let legacy: Vec<(String,)> = sqlx::query_as(
+        r#"SELECT p.vpn_ip FROM peers p JOIN users u ON u.id=p.user_id
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'
+                  AND u.access_mode='legacy'
+                  AND NOT EXISTS (SELECT 1 FROM user_group_members m WHERE m.user_id=u.id)
+                  AND NOT EXISTS (SELECT 1 FROM access_grants a
+                                   WHERE a.user_id=u.id AND a.expires_at>?1)"#,
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+
+    for (vpn_ip, routes) in manual {
+        let source: Ipv4Addr = vpn_ip
+            .parse()
+            .map_err(|_| AppError::Validation("数据库中的 peer VPN IP 非法".into()))?;
+        append_routes(&mut leases, source, &routes, ACL_LEASE_CAP_MS, vpn_subnet);
+    }
+    for (vpn_ip, routes, expires_at) in grants {
+        let source: Ipv4Addr = vpn_ip
+            .parse()
+            .map_err(|_| AppError::Validation("数据库中的 peer VPN IP 非法".into()))?;
+        let remaining_ms = expires_at.saturating_sub(now);
+        let timeout = (remaining_ms as u64).clamp(1, ACL_LEASE_CAP_MS);
+        append_routes(&mut leases, source, &routes, timeout, vpn_subnet);
+    }
+    // 历史账号维持“未分组回退全局路由”；受审批管控账号绝不回退。
+    for (vpn_ip,) in legacy {
+        let source: Ipv4Addr = vpn_ip
+            .parse()
+            .map_err(|_| AppError::Validation("数据库中的 peer VPN IP 非法".into()))?;
+        for route in server_routes {
+            append_routes(&mut leases, source, route, ACL_LEASE_CAP_MS, vpn_subnet);
+        }
+    }
+    Ok((leases, site_sources))
 }
 
 fn append_routes(
@@ -199,29 +191,6 @@ fn append_routes(
     }
 }
 
-fn overlaps(left: Ipv4Net, right: Ipv4Net) -> bool {
-    left.contains(&right.network()) || right.contains(&left.network())
-}
-
-fn validate_group_site_separation(
-    groups: &[(String, String)],
-    site_sources: &[Ipv4Net],
-) -> Result<()> {
-    for (name, routes) in groups {
-        for route in routes
-            .split(',')
-            .filter_map(|route| route.parse::<Ipv4Net>().ok())
-        {
-            if site_sources.iter().any(|site| overlaps(route, *site)) {
-                return Err(AppError::Validation(format!(
-                    "用户组 {name} 的授权网段 {route} 与站点源网段重叠"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn db(error: sqlx::Error) -> AppError {
     AppError::Database(Box::new(error))
 }
@@ -229,6 +198,22 @@ fn db(error: sqlx::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    async fn setup_pool() -> SqlitePool {
+        let options = SqliteConnectOptions::from_str(
+            "sqlite:file:network_acl_snapshot?mode=memory&cache=private",
+        )
+        .unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        pool
+    }
 
     #[test]
     fn route_snapshot_rejects_default_and_vpn_subnet() {
@@ -245,11 +230,116 @@ mod tests {
     }
 
     #[test]
-    fn startup_audit_rejects_historical_group_site_overlap() {
-        let groups = vec![("production".into(), "192.168.20.0/24".into())];
-        assert!(
-            validate_group_site_separation(&groups, &["192.168.20.128/25".parse().unwrap()])
-                .is_err()
+    fn site_route_is_a_valid_bounded_acl_destination() {
+        let mut leases = Vec::new();
+        append_routes(
+            &mut leases,
+            "10.8.0.3".parse().unwrap(),
+            "10.242.101.0/24",
+            ACL_LEASE_CAP_MS,
+            "10.8.0.0/24".parse().unwrap(),
         );
+
+        assert_eq!(
+            leases,
+            vec![AclLease {
+                source: "10.8.0.3".parse().unwrap(),
+                destination: "10.242.101.0/24".parse().unwrap(),
+                timeout_ms: ACL_LEASE_CAP_MS,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn database_authorization_snapshot_only_leases_authorized_vpn_ips() {
+        let pool = setup_pool().await;
+        let now = 1_000_000_i64;
+        for (id, ip, mode, routed_subnets) in [
+            ("manual", "10.8.0.2", "approval_required", ""),
+            ("approved", "10.8.0.3", "approval_required", ""),
+            ("unapproved", "10.8.0.4", "approval_required", ""),
+            ("legacy", "10.8.0.5", "legacy", ""),
+            (
+                "gateway",
+                "10.8.0.6",
+                "approval_required",
+                "10.242.101.0/24",
+            ),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id,username,email,password_hash,role,status,must_change_password,created_at,updated_at,access_mode)
+                   VALUES (?1,?1,?2,'h','user','active',0,0,0,?3)"#,
+            )
+            .bind(id)
+            .bind(format!("{id}@example.test"))
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"INSERT INTO peers
+                   (id,user_id,device_name,wg_public_key,vpn_ip,status,created_at,updated_at,routed_subnets)
+                   VALUES (?1,?1,'test',?2,?3,'online',0,0,?4)"#,
+            )
+            .bind(id)
+            .bind(format!("pk-{id}"))
+            .bind(ip)
+            .bind(routed_subnets)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            r#"INSERT INTO user_groups (id,name,routes,created_at,updated_at)
+               VALUES ('site-group','site','10.242.0.0/16',0,0)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_group_members (user_id,group_id) VALUES ('manual','site-group')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO access_grants
+               (id,approval_instance_code,user_id,group_id,expires_at,reason,created_at,updated_at)
+               VALUES ('grant','approval','approved','site-group',?1,'',0,0)"#,
+        )
+        .bind(now + 60_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let site: Ipv4Net = "10.242.101.0/24".parse().unwrap();
+        let authorized_destination: Ipv4Net = "10.242.0.0/16".parse().unwrap();
+        let (leases, site_sources) = build_acl_snapshot(
+            &pool,
+            &["172.31.9.0/24".to_string()],
+            "10.8.0.0/24".parse().unwrap(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(site_sources.contains(&site));
+        for source in ["10.8.0.2", "10.8.0.3"] {
+            assert!(leases.iter().any(|lease| {
+                lease.source == source.parse::<Ipv4Addr>().unwrap()
+                    && lease.destination == authorized_destination
+            }));
+        }
+        for source in ["10.8.0.4", "10.8.0.5", "10.8.0.6"] {
+            assert!(!leases.iter().any(|lease| {
+                lease.source == source.parse::<Ipv4Addr>().unwrap()
+                    && lease.destination == authorized_destination
+            }));
+        }
+        assert!(leases.iter().any(|lease| {
+            lease.source == "10.8.0.5".parse::<Ipv4Addr>().unwrap()
+                && lease.destination == "172.31.9.0/24".parse::<Ipv4Net>().unwrap()
+        }));
     }
 }

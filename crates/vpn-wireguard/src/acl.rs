@@ -270,4 +270,28 @@ mod tests {
         assert!(script.contains("add table inet yilian_vpn_acl"));
         assert!(script.contains("counter drop"));
     }
+
+    #[test]
+    fn same_site_cidr_is_allowed_in_opposite_directions_without_weakening_drop() {
+        let site: Ipv4Net = "10.242.101.0/24".parse().unwrap();
+        let script = render_nft_batch(
+            "wg0",
+            "10.8.0.0/24".parse().unwrap(),
+            &[AclLease {
+                source: "10.8.0.3".parse().unwrap(),
+                destination: site,
+                timeout_ms: 75_000,
+            }],
+            &[site],
+            false,
+        );
+
+        assert!(
+            script.contains("iifname \"wg0\" ip saddr 10.242.101.0/24 ip daddr 10.8.0.0/24 accept")
+        );
+        assert!(script.contains("10.8.0.3 timeout 75000ms"));
+        assert!(!script.contains("10.8.0.4"));
+        assert!(script.contains("ip daddr 10.242.101.0/24 accept"));
+        assert!(script.ends_with("iifname \"wg0\" counter drop\n"));
+    }
 }
