@@ -5874,15 +5874,16 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpn-api-types"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
 name = "vpn-cli"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5904,13 +5905,15 @@ dependencies = [
  "tun",
  "vpn-api-types",
  "vpn-core",
+ "vpn-obfs",
  "vpn-platform",
  "vpn-wireguard",
+ "zeroize",
 ]
 
 [[package]]
 name = "vpn-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5922,7 +5925,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-desktop"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "dirs 6.0.0",
  "libc",
@@ -5945,8 +5948,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vpn-obfs"
+version = "0.1.13"
+dependencies = [
+ "aes",
+ "chacha20poly1305",
+ "hkdf",
+ "rand 0.8.6",
+ "sha2",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "vpn-platform"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5962,7 +5978,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-wireguard"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7174,6 +7190,7 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

@@ -66,7 +66,8 @@ context:
 - `cargo fmt --all -- --check` -- 格式检查通过。
 - `cargo test -p vpn-cli -p vpn-obfs` -- padding、boringtun 往返及混淆回归通过。
 - `cargo clippy -p vpn-cli -p vpn-obfs --all-targets -- -D warnings` -- 无警告。
-- 真机执行 `ping -c 3 10.9.0.1` 并在服务端 `wgtest0` 抓包 -- 双向 ICMP 可见，流量计数递增。
+- 2026-08-25 真机执行 `ping -c 3 10.9.0.1` -- 3/3 响应、0% 丢包、平均 21.1 ms。
+- 服务端 `wgtest0` 抓包 -- 3 个请求和 3 个回复，客户端状态累计 `↓252 B / ↑556 B`，无 padding/编码/UDP 发送错误。
 
 ## Suggested Review Order
 
