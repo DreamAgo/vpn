@@ -536,25 +536,71 @@ pub async fn supervise_connection_tasks(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     stop_requested: Arc<AtomicBool>,
     shared: SharedState,
-) {
+) -> CliResult<()> {
     tokio::select! {
         result = &mut forward => {
             let requested = stop_requested.load(Ordering::Acquire);
+            let cleanup_result = data_plane_cleanup_result("数据面", &result);
             report_connection_task("数据面", result, requested, &shared).await;
             let _ = shutdown_tx.send(true);
-            await_connection_peer("心跳", &mut heartbeat).await;
+            let _ = await_connection_peer("心跳", &mut heartbeat).await;
+            cleanup_result
         }
         result = &mut heartbeat => {
             let requested = stop_requested.load(Ordering::Acquire);
             report_connection_task("心跳", result, requested, &shared).await;
             let _ = shutdown_tx.send(true);
-            await_connection_peer("数据面", &mut forward).await;
+            // 心跳故障会更新连接状态，但只有数据面的退出结果能证明
+            // TUN/路由是否已完成清理，因此 supervisor 向上层返回该结果。
+            let result = forward.await;
+            let cleanup_result = data_plane_cleanup_result("数据面", &result);
+            log_connection_peer("数据面", &result);
+            cleanup_result
         }
     }
 }
 
-async fn await_connection_peer(task: &str, handle: &mut tokio::task::JoinHandle<CliResult<()>>) {
-    match handle.await {
+fn data_plane_cleanup_result(
+    task: &str,
+    result: &Result<CliResult<()>, tokio::task::JoinError>,
+) -> CliResult<()> {
+    match result {
+        Ok(Err(error)) if error.is_cleanup_failure() => Err(CliError::Cleanup(format!(
+            "{task}: {}",
+            error.safe_diagnostic()
+        ))),
+        // panic 可能跳过整个清理段，无法证明路由已删除。
+        Err(error) => Err(CliError::Cleanup(format!(
+            "{task}任务异常: {}",
+            crate::error::redact_sensitive(&error.to_string())
+        ))),
+        // 普通运行故障不等于清理失败；forward_loop 只在执行完
+        // 路由清理后才会返回这类错误。
+        Ok(_) => Ok(()),
+    }
+}
+
+async fn await_connection_peer(
+    task: &str,
+    handle: &mut tokio::task::JoinHandle<CliResult<()>>,
+) -> CliResult<()> {
+    let result = handle.await;
+    log_connection_peer(task, &result);
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let diagnostic = error.safe_diagnostic();
+            Err(CliError::Other(format!("{task}任务清理失败: {diagnostic}")))
+        }
+        Err(error) => {
+            let error = crate::error::redact_sensitive(&error.to_string());
+            Err(CliError::Other(format!("{task}任务清理异常: {error}")))
+        }
+    }
+}
+
+fn log_connection_peer(task: &str, result: &Result<CliResult<()>, tokio::task::JoinError>) {
+    match result {
         Ok(Ok(())) => tracing::info!(task, "关联 VPN 任务已停止"),
         Ok(Err(error)) => {
             tracing::warn!(task, error = %error.safe_diagnostic(), "关联 VPN 任务返回错误")
@@ -574,13 +620,16 @@ async fn report_connection_task(
 ) {
     if stop_requested {
         match result {
-            Ok(Ok(())) => tracing::info!(task, "VPN 后台任务按请求退出"),
+            Ok(Ok(())) => {
+                tracing::info!(task, "VPN 后台任务按请求退出");
+            }
             Ok(Err(error)) => {
-                tracing::warn!(task, error = %error.safe_diagnostic(), "VPN 后台任务关停时返回错误")
+                let diagnostic = error.safe_diagnostic();
+                tracing::warn!(task, error = %diagnostic, "VPN 后台任务关停时返回错误");
             }
             Err(error) => {
                 let error = crate::error::redact_sensitive(&error.to_string());
-                tracing::warn!(task, %error, "VPN 后台任务关停时 panic")
+                tracing::warn!(task, %error, "VPN 后台任务关停时 panic");
             }
         }
         return;
@@ -646,11 +695,23 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
     // 每条活跃连接持有一个心跳任务关停信号；重连/断开时替换或清空。
     let mut active_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
     // supervisor 持有转发与心跳任务；重连前必须等它完成路由清理。
-    let mut active_supervisor: Option<tokio::task::JoinHandle<()>> = None;
+    let mut active_supervisor: Option<tokio::task::JoinHandle<CliResult<()>>> = None;
     let mut active_stop_requested: Option<Arc<AtomicBool>> = None;
+    // 一旦无法证明旧数据面已删除路由，本 daemon 进程内永久
+    // fail-closed。重启 daemon 是当前唯一安全的人工恢复边界。
+    let mut cleanup_failure: Option<String> = None;
     'control: while let Some(msg) = ctrl_rx.recv().await {
         match msg {
             ControlMsg::Connect => {
+                if let Some(error) = cleanup_failure.as_ref() {
+                    state
+                        .set_error(
+                            format!("旧 VPN 数据面清理未确认，已阻止重连: {error}"),
+                            now_unix(),
+                        )
+                        .await;
+                    continue 'control;
+                }
                 state.set_state(ConnState::Connecting, now_unix()).await;
                 match connect_once(&api, &keypair, &config.device_name).await {
                     Ok(params) => {
@@ -666,9 +727,21 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         }
                         if let Some(mut old) = active_supervisor.take() {
                             match tokio::time::timeout(Duration::from_secs(5), &mut old).await {
-                                Ok(Ok(())) => {}
+                                Ok(Ok(Ok(()))) => {}
+                                Ok(Ok(Err(error))) => {
+                                    let diagnostic = error.safe_diagnostic();
+                                    cleanup_failure = Some(diagnostic.clone());
+                                    state
+                                        .set_error(
+                                            format!("旧 VPN 数据面清理失败: {diagnostic}"),
+                                            now_unix(),
+                                        )
+                                        .await;
+                                    continue 'control;
+                                }
                                 Ok(Err(error)) => {
                                     let error = crate::error::redact_sensitive(&error.to_string());
+                                    cleanup_failure = Some(error.clone());
                                     state
                                         .set_error(format!("旧 VPN 任务异常: {error}"), now_unix())
                                         .await;
@@ -753,9 +826,18 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                 }
                 if let Some(mut old) = active_supervisor.take() {
                     match tokio::time::timeout(Duration::from_secs(5), &mut old).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => {
+                            let diagnostic = error.safe_diagnostic();
+                            cleanup_failure = Some(diagnostic.clone());
+                            state
+                                .set_error(format!("VPN 数据面清理失败: {diagnostic}"), now_unix())
+                                .await;
+                            continue 'control;
+                        }
                         Ok(Err(error)) => {
                             let error = crate::error::redact_sensitive(&error.to_string());
+                            cleanup_failure = Some(error.clone());
                             state
                                 .set_error(format!("VPN 后台任务异常: {error}"), now_unix())
                                 .await;
@@ -787,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_reports_unexpected_completion() {
         let shared = SharedState::new();
-        report_connection_task("数据面", Ok(Ok(())), false, &shared).await;
+        let _ = report_connection_task("数据面", Ok(Ok(())), false, &shared).await;
         let status = shared.snapshot().await;
         assert_eq!(status.state, ConnState::Error);
         assert_eq!(status.last_error.as_deref(), Some("数据面任务意外提前退出"));
@@ -796,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_ignores_requested_completion() {
         let shared = SharedState::new();
-        report_connection_task("数据面", Ok(Ok(())), true, &shared).await;
+        let _ = report_connection_task("数据面", Ok(Ok(())), true, &shared).await;
         let status = shared.snapshot().await;
         assert_eq!(status.state, ConnState::Disconnected);
         assert!(status.last_error.is_none());
@@ -806,10 +888,23 @@ mod tests {
     async fn supervisor_redacts_panic_payload() {
         let shared = SharedState::new();
         let result = tokio::spawn(async { panic!("token=synthetic-secret") }).await;
-        report_connection_task("心跳", result.map(|_| Ok(())), false, &shared).await;
+        let _ = report_connection_task("心跳", result.map(|_| Ok(())), false, &shared).await;
         let message = shared.snapshot().await.last_error.unwrap();
         assert!(message.contains("[REDACTED sensitive diagnostic]"));
         assert!(!message.contains("synthetic-secret"));
+    }
+
+    #[test]
+    fn ordinary_forward_failure_confirms_cleanup() {
+        let result = Ok(Err(CliError::Other("TUN I/O 中断".to_string())));
+        assert!(data_plane_cleanup_result("数据面", &result).is_ok());
+    }
+
+    #[test]
+    fn route_cleanup_failure_is_fail_closed() {
+        let result = Ok(Err(CliError::Cleanup("剩余 1 条路由".to_string())));
+        let error = data_plane_cleanup_result("数据面", &result).unwrap_err();
+        assert!(error.is_cleanup_failure());
     }
 
     #[test]

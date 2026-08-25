@@ -129,6 +129,38 @@ pub fn recent_logs() -> Result<LogSnapshot, String> {
     read_recent_logs_from(&dir, LOG_SNAPSHOT_MAX_LINES, LOG_SNAPSHOT_MAX_BYTES)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn merge_helper_logs(
+    helper: vpn_cli::ipc::HelperLogSnapshot,
+    desktop: LogSnapshot,
+) -> LogSnapshot {
+    let mut lines = Vec::new();
+    if !helper.content.is_empty() {
+        lines.push("===== privileged helper =====".to_string());
+        lines.extend(helper.content.lines().map(str::to_string));
+    }
+    if !desktop.content.is_empty() {
+        lines.push("===== desktop GUI =====".to_string());
+        lines.extend(desktop.content.lines().map(str::to_string));
+    }
+    let mut truncated = helper.truncated || desktop.truncated;
+    if lines.len() > LOG_SNAPSHOT_MAX_LINES {
+        truncated = true;
+        lines.drain(..lines.len() - LOG_SNAPSHOT_MAX_LINES);
+    }
+    let mut content = lines.join("\n");
+    while content.len() > LOG_SNAPSHOT_MAX_BYTES && !lines.is_empty() {
+        truncated = true;
+        lines.remove(0);
+        content = lines.join("\n");
+    }
+    LogSnapshot {
+        content,
+        line_count: lines.len(),
+        truncated,
+    }
+}
+
 fn read_recent_logs_from(
     dir: &Path,
     max_lines: usize,
@@ -585,5 +617,24 @@ mod tests {
         let snapshot = read_recent_logs_from(&dir, 500, 1024).unwrap();
         assert_eq!(snapshot.content, "ok �");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn helper_and_desktop_snapshots_are_merged() {
+        let helper = vpn_cli::ipc::HelperLogSnapshot {
+            content: "helper ready".to_string(),
+            line_count: 1,
+            truncated: false,
+        };
+        let desktop = LogSnapshot {
+            content: "desktop ready".to_string(),
+            line_count: 1,
+            truncated: false,
+        };
+        let merged = merge_helper_logs(helper, desktop);
+        assert!(merged.content.contains("privileged helper"));
+        assert!(merged.content.contains("helper ready"));
+        assert!(merged.content.contains("desktop ready"));
     }
 }

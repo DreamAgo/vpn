@@ -40,6 +40,10 @@ pub enum CliError {
     #[error("无法与后台 daemon 通信: {0}（daemon 可能未运行）")]
     Ipc(String),
 
+    /// 数据面已退出，但 TUN/路由清理未能全部确认成功。
+    #[error("数据面清理失败: {0}")]
+    Cleanup(String),
+
     /// 输入 / 配置错误。
     #[error("{0}")]
     Invalid(String),
@@ -72,6 +76,11 @@ impl CliError {
                 ..
             }
         )
+    }
+
+    /// 是否需要上层 fail-closed，阻止新隧道覆盖可能残留的路由。
+    pub fn is_cleanup_failure(&self) -> bool {
+        matches!(self, CliError::Cleanup(_))
     }
 
     /// 适合持久化日志的错误文本：敏感标记出现时整段遮蔽，并限制长度。

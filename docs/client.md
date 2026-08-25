@@ -63,7 +63,8 @@ vpn-cli daemon install
 创建 TUN 设备需要管理员权限：
 
 - Linux：`CAP_NET_ADMIN` 或 root。
-- macOS：管理员权限创建 `utun`。
+- macOS CLI：管理员权限创建 `utun`。macOS 桌面端首次连接时授权安装常驻 root
+  helper，日常打开不再要求管理员密码；helper 摘要随客户端升级变化时再授权一次。
 - Windows：管理员 + WinTun 驱动。
 
 > 真实隧道转发与各平台系统集成的当前状态见 [REAL-HARDWARE-CHECKLIST.md](REAL-HARDWARE-CHECKLIST.md)。Web 后台「接入指南」页也提供 `vpn.conf` 下载，可临时用官方 WireGuard 客户端导入。

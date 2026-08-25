@@ -1,29 +1,27 @@
 # VPN Client — Desktop GUI (Tauri 2)
 
-A cross-platform menu-bar (tray) VPN client. **单进程架构**:GUI 直接把 `vpn-cli`
-当库调用,在**本进程内**完成整条用户态 WireGuard 隧道(boringtun + TUN + 路由 +
-心跳)。**不需要**单独启动 daemon,也没有 IPC / unix socket。
+A cross-platform menu-bar (tray) VPN client. Windows/Linux 由 GUI 进程直接调用
+`vpn-cli`；macOS 使用普通用户 GUI + launchd 常驻的最小 root helper，避免每次
+打开应用都要求管理员密码。
 
 ## Architecture
 
 ```
-┌────────────────────┐      Tauri commands       ┌──────────────────────────┐
-│  React popover UI   │ ────────────────────────▶ │  src-tauri (Rust)        │
-│  (desktop/src)      │ ◀──────────────────────── │  commands.rs → manager   │
-└────────────────────┘   get_status / connect /   └───────────┬──────────────┘
-                         disconnect / login / ...              │ 进程内库调用 vpn-cli:
-                                                               │  daemon::connect_once
-                                                               │  daemon::bring_up_tunnel  ← 用户态 boringtun 隧道
-                                                               │  daemon::run_heartbeat
-                                                               │  daemon::SharedState (状态)
-                                                               ▼
-                                              本进程直接开 TUN + 加路由 + 转发(需 root/管理员)
+┌────────────────────┐   Tauri commands   ┌──────────────────────────┐
+│  React popover UI   │ ─────────────────▶ │ 普通用户 GUI             │
+└────────────────────┘                    └────────────┬─────────────┘
+                                                      │ macOS: owner-only UDS
+                                                      ▼
+                                         ┌──────────────────────────┐
+                                         │ launchd root helper      │
+                                         │ TUN + 路由 + boringtun   │
+                                         └──────────────────────────┘
 ```
 
-`manager.rs` 里的 `VpnManager`(放进 Tauri 托管状态,以 `Arc` 共享)持有:本机
+`manager.rs` 里的 `VpnManager` 持有本机
 WireGuard 密钥对、`SharedState`(连接状态)、当前连接的关停信号。`connect()` 跑
 `connect_once`(注册)→ `bring_up_tunnel`(开 TUN + boringtun 转发循环)→ spawn
-`run_heartbeat`;`disconnect()` 发关停信号(转发任务自行删路由/关设备)。
+`run_heartbeat`;macOS 由 helper 持有该对象，其他平台由 GUI 持有。
 
 Commands(`#[tauri::command]`):
 - `get_status() -> StatusResponse` — 读本进程状态,不会失败。
@@ -31,40 +29,50 @@ Commands(`#[tauri::command]`):
 - `login(server, username, password) / logout() -> Result<(), String>`
 - `is_logged_in() -> bool`, `saved_server() -> Option<String>`, `hide_window()`
 
-## ⚠️ 必须以特权运行
+## 权限模型
 
-开 TUN 设备需要 root/管理员,**单进程方案下整个 App 都要特权运行**:
-- **macOS**(release):双击图标即弹系统管理员密码框自提权(`maybe_elevate` 经 osascript +
-  `launchctl asuser` 以 root 重启自己);取消提权则以非特权模式继续运行(连接会报权限错)。
-  dev 构建不自提权,从终端 `sudo cargo tauri dev` 才能真正连接。
+开 TUN 设备需要 root/管理员：
+- **macOS**：GUI 始终为普通用户。首次连接及 helper 二进制摘要变化时授权一次，
+  安装 `/Library/PrivilegedHelperTools/com.xeflow.yilian.helper` LaunchDaemon；日常启动
+  不再弹密码。helper socket 为当前控制台用户专用并校验 peer UID，切换用户会先断开隧道。
+  安装过程在 root 侧生成固定 plist、校验复制后 SHA-256，并对升级失败统一回滚。
 - **Windows**(release):由 `requireAdministrator` 应用清单(build.rs 注入)在启动时弹 UAC 自提权;
   需随包分发 `wintun.dll`(见下方「Windows 构建」)。
 - **Linux**:暂未实现自提权,需 `sudo` 运行(并确保有 `/dev/net/tun`)。
 
-未以特权运行时,点 Connect 会在面板里报错(TUN 打开失败),不会崩溃。
+macOS 取消首次授权时 GUI 仍可用；不会缓存管理员密码、修改 sudoers 或以 root
+运行 WebView。helper 日志在 root-only 轮转目录中，仅经认证 IPC 脱敏返回日志面板。
 
 ## Prerequisites
 
 - Node + npm、Rust 1.90+、`tauri-cli` v2(`cargo install tauri-cli --version "^2"`)。
 - 先**登录**:在 App 的登录表单填服务端地址 / 用户名 / 密码(凭证存到文件后端
-  `~/.config/vpn-cli/creds.enc`)。注意:GUI 以 root 跑时凭证落在 **root 的 home**,
-  与普通用户 `vpn-cli login` 的位置不同。
+  `~/.config/vpn-cli/creds.enc`)。从旧 root-GUI 版本升级可能需重新登录一次，此后
+  凭据始终属于当前用户。
 
 ## Develop / Run
 
 ```sh
 cd desktop
 npm install                       # 首次
-# 开发(需特权才能真正连接;不特权也能看 UI):
-sudo cargo tauri dev              # 从你的终端 sudo,窗口才显示
-# 或构建后以特权运行:
+# 开发：GUI 无需 sudo；首次连接时安装 helper
+cargo tauri dev
 cargo tauri build
-sudo "src-tauri/target/release/bundle/macos/VPN Client.app/Contents/MacOS/vpn-desktop"
 ```
 
-App 在菜单栏(无 Dock 图标,`ActivationPolicy::Accessory`)。左键托盘图标切换面板,
-失焦自动隐藏;右键托盘 = Open Panel / Connect / Disconnect / Quit。首次启动会直接
-弹出面板便于发现 UI。
+macOS 卸载 helper：
+
+```sh
+sudo launchctl bootout system/com.xeflow.yilian.helper
+sudo rm -f /Library/LaunchDaemons/com.xeflow.yilian.helper.plist \
+  /Library/PrivilegedHelperTools/com.xeflow.yilian.helper \
+  /var/run/com.xeflow.yilian.helper.sock \
+  /var/run/com.xeflow.yilian.helper.install.lock \
+  /var/db/com.xeflow.yilian.helper.blocked-tokens
+sudo rm -rf /var/log/com.xeflow.yilian.helper
+```
+
+App 同时提供 Dock 与菜单栏图标。左键托盘图标切换面板，右键菜单可连接、断开或退出。
 
 ## Build
 

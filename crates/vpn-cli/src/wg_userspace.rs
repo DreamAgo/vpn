@@ -756,11 +756,11 @@ async fn forward_loop(
             cleanup_failures,
             "用户态 WireGuard 已退出，但部分路由清理失败"
         );
-        if outcome.is_ok() {
-            return Err(CliError::Other(format!(
-                "VPN 路由清理失败: {cleanup_failures} 条"
-            )));
-        }
+        // 清理结果比运行期错误更关键：上层需要据此决定是否
+        // fail-closed 阻止重连。即使运行期也出过错，仍要返回专用清理错误。
+        return Err(CliError::Cleanup(format!(
+            "VPN 路由清理失败: {cleanup_failures} 条"
+        )));
     }
     outcome
 }

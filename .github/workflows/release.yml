@@ -335,6 +335,22 @@ jobs:
             npx tauri build --target ${{ matrix.target }} --bundles dmg
           fi
 
+      - name: Verify macOS privileged helper entrypoint
+        shell: bash
+        run: |
+          binary='desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/易链.app/Contents/MacOS/vpn-desktop'
+          test -x "$binary"
+          build_hash=$(shasum -a 256 "$binary" | awk '{print $1}')
+          test ${#build_hash} -eq 64
+          reported_hash=$($binary --print-build-hash)
+          test "$reported_hash" = "$build_hash"
+          set +e
+          output=$($binary --privileged-helper 2>&1)
+          status=$?
+          set -e
+          test $status -ne 0
+          test "$output" = "vpn-desktop helper: 特权 helper 必须由 root 运行"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

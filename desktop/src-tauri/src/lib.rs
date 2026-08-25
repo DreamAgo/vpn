@@ -6,6 +6,8 @@
 //! Disconnect / Quit。所有 VPN 工作进程内完成（库调用 `vpn-cli`），见 `manager.rs`。
 
 mod commands;
+#[cfg(target_os = "macos")]
+mod macos_helper;
 mod manager;
 mod observability;
 
@@ -73,82 +75,84 @@ fn sync_tray_state(app: tauri::AppHandle, state: String) {
 
 /// 从托盘菜单触发连接(进程内库调用,fire-and-forget;结果反映在状态轮询里)。
 fn spawn_connect(app: &tauri::AppHandle) {
-    let mgr = app.state::<Arc<VpnManager>>().inner().clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = mgr.connect().await {
-            let error = vpn_cli::error::redact_sensitive(&error);
-            tracing::warn!(%error, "托盘连接操作失败");
-        }
-    });
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = macos_helper::connect().await {
+                tracing::warn!(error = %vpn_cli::error::redact_sensitive(&error), "托盘连接操作失败");
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mgr = app.state::<Arc<VpnManager>>().inner().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = mgr.connect().await {
+                let error = vpn_cli::error::redact_sensitive(&error);
+                tracing::warn!(%error, "托盘连接操作失败");
+            }
+        });
+    }
 }
 
 /// 从托盘菜单触发断开。
 fn spawn_disconnect(app: &tauri::AppHandle) {
-    let mgr = app.state::<Arc<VpnManager>>().inner().clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = mgr.disconnect().await {
-            let error = vpn_cli::error::redact_sensitive(&error);
-            tracing::warn!(%error, "托盘断开操作失败");
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = macos_helper::disconnect().await {
+                tracing::warn!(error = %vpn_cli::error::redact_sensitive(&error), "托盘断开操作失败");
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mgr = app.state::<Arc<VpnManager>>().inner().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = mgr.disconnect().await {
+                let error = vpn_cli::error::redact_sensitive(&error);
+                tracing::warn!(%error, "托盘断开操作失败");
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_macos_helper_if_requested() -> Option<i32> {
+    if macos_helper::print_build_hash_requested() {
+        return Some(match macos_helper::print_build_hash() {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("vpn-desktop: 无法计算构建摘要: {error}");
+                1
+            }
+        });
+    }
+    if !macos_helper::helper_mode_requested() {
+        return None;
+    }
+    Some(match macos_helper::run_helper_from_args() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("vpn-desktop helper: {error}");
+            1
         }
-    });
+    })
 }
 
-/// macOS release 构建:若当前不是 root,弹系统管理员密码框、以 root 重启自己,
-/// 然后退出本(非 root)实例 —— 这样**双击图标即可获得 root**(开 TUN 所需),
-/// 无需终端 `sudo`。
-///
-/// 仅在 release 生效;dev(debug)构建跳过,方便纯 UI 调试(此时 Connect 因无
-/// root 会在面板报错而非崩溃)。设环境变量 `VPN_DESKTOP_NO_ELEVATE=1` 也可跳过。
-#[cfg(all(target_os = "macos", not(debug_assertions)))]
-fn maybe_elevate() {
-    // SAFETY: geteuid 无副作用、始终安全。
-    if unsafe { libc::geteuid() } == 0 {
-        return; // 已是 root,继续启动。
-    }
-    if std::env::var_os("VPN_DESKTOP_NO_ELEVATE").is_some() {
-        return;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    // 当前(非 root)实例的真实用户 uid —— 用它把提权后的 root 实例拉回该用户的 GUI 会话。
-    // SAFETY: getuid 无副作用、始终安全。
-    let uid = unsafe { libc::getuid() };
-    let exe = exe
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    // 经 osascript 弹管理员密码框,以 root 启动自己。**关键**:用 `launchctl asuser <uid>`
-    // 在该用户的 GUI(Aqua)会话上下文里启动——否则经 osascript 提权的 root 进程会脱离用户的
-    // WindowServer 会话,菜单栏/程序坞图标都不显示、编辑菜单 Cmd+V 也失效。asuser 只改 Mach
-    // bootstrap 会话、不降权(仍是 root,可开 TUN)。尾部 & 让脚本立即返回。
-    let script = format!(
-        "do shell script \"/bin/launchctl asuser {uid} \\\"{exe}\\\" >/dev/null 2>&1 &\" with administrator privileges"
-    );
-    let elevated = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if elevated {
-        // root 实例已拉起,本(非 root)实例退出,避免双实例窗口。
-        std::process::exit(0);
-    }
-    // 提权被取消或失败(如用户点了「取消」、osascript 出错):**不退出**。保留当前非 root
-    // 实例继续运行,让用户至少看到界面;后续 Connect 会在面板内报权限错误,而不是
-    // 整个应用静默消失、零反馈(原先无条件 exit(0) 会导致取消提权后应用「打不开」)。
-    eprintln!("[vpn-desktop] 管理员提权未完成,以非特权模式继续运行;连接将因缺少权限而失败");
+#[cfg(not(target_os = "macos"))]
+pub fn run_macos_helper_if_requested() -> Option<i32> {
+    None
 }
-
-/// 其它平台 / dev 构建:不在此处运行时自提权。
-/// - Windows:由 build.rs 注入的 `requireAdministrator` 清单在进程启动时弹 UAC 提权;
-/// - Linux:暂未实现自提权,需以 root 运行(或后续接 pkexec / 特权 helper,见 README)。
-#[cfg(not(all(target_os = "macos", not(debug_assertions))))]
-fn maybe_elevate() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos_helper::initialize_gui_build_hash() {
+        eprintln!("vpn-desktop: 无法固定 helper 构建摘要: {error}");
+    }
     // This must be the first network-related initialization in the desktop
     // process. Tauri's updater also uses rustls and otherwise may select ring
     // before vpn-cli can install the AWS-LC provider required on networks that
@@ -156,8 +160,6 @@ pub fn run() {
     vpn_cli::api::install_tls_crypto_provider()
         .expect("failed to initialize the required TLS crypto provider");
     let _diagnostics = observability::init();
-    // 必须在创建任何窗口/事件循环之前完成提权(否则会出现两个实例的窗口)。
-    maybe_elevate();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())

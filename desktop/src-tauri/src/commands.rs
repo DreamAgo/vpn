@@ -63,18 +63,36 @@ fn repo() -> Result<CredentialRepo, String> {
 /// 当前连接状态(前端每 2.5s 轮询)。读本进程内状态,不会失败。
 #[tauri::command]
 pub async fn get_status(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<StatusResponse, ()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mgr;
+        Ok(crate::macos_helper::status().await)
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(mgr.status().await)
 }
 
 /// 建立连接(注册 + 建用户态隧道 + 心跳)。需以特权运行(开 TUN)。
 #[tauri::command]
 pub async fn connect(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mgr;
+        crate::macos_helper::connect().await
+    }
+    #[cfg(not(target_os = "macos"))]
     mgr.connect().await
 }
 
 /// 断开连接。
 #[tauri::command]
 pub async fn disconnect(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mgr;
+        crate::macos_helper::disconnect().await
+    }
+    #[cfg(not(target_os = "macos"))]
     mgr.disconnect().await
 }
 
@@ -231,6 +249,12 @@ pub async fn change_password(current_password: String, new_password: String) -> 
 #[tauri::command]
 pub async fn logout(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<(), String> {
     // 注销前先断开,避免残留隧道。
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mgr;
+        crate::macos_helper::disconnect_before_logout().await?;
+    }
+    #[cfg(not(target_os = "macos"))]
     let _ = mgr.disconnect().await;
     let repo = repo()?;
     run_logout(&repo)
@@ -274,9 +298,25 @@ pub fn diagnostics_info() -> DiagnosticsInfo {
 /// 返回固定日志目录中有界且二次脱敏的近期日志。
 #[tauri::command]
 pub async fn read_recent_logs() -> Result<LogSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(observability::recent_logs)
+    let desktop = tauri::async_runtime::spawn_blocking(observability::recent_logs)
         .await
-        .map_err(|error| format!("读取日志任务失败: {error}"))?
+        .map_err(|error| format!("读取日志任务失败: {error}"))??;
+    #[cfg(target_os = "macos")]
+    {
+        let helper = crate::macos_helper::logs().await.unwrap_or_else(|error| {
+            vpn_cli::ipc::HelperLogSnapshot {
+                content: format!(
+                    "helper 日志不可用: {}",
+                    vpn_cli::error::redact_sensitive(&error)
+                ),
+                line_count: 1,
+                truncated: false,
+            }
+        });
+        Ok(observability::merge_helper_logs(helper, desktop))
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(desktop)
 }
 
 #[cfg(test)]

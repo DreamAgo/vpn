@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, CliResult};
 
+/// 特权 helper 单条 IPC 消息上限。
+pub const MAX_HELPER_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// daemon 对外暴露的连接状态机（Story 4.14）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +69,67 @@ pub enum IpcResponse {
     Status(StatusResponse),
     /// 命令失败。
     Error { message: String },
+}
+
+/// 普通用户桌面 GUI -> root 隧道 helper。账户密码永不进入协议；refresh token
+/// 仅在连接/注销事务中短暂传递，helper 不持久化原文。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum HelperRequest {
+    Connect {
+        server_url: String,
+        refresh_token: String,
+        device_name: String,
+    },
+    Disconnect,
+    /// 原子禁止当前登录令牌再次连接并断开隧道。
+    PrepareLogout {
+        refresh_token: String,
+    },
+    GetStatus,
+    GetVersion,
+    GetLogs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelperLogSnapshot {
+    pub content: String,
+    pub line_count: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HelperResponse {
+    Ok,
+    Status(StatusResponse),
+    Version { version: String, build_hash: String },
+    Logs(HelperLogSnapshot),
+    Error { message: String },
+}
+
+pub fn encode_helper_line<T: Serialize>(message: &T) -> CliResult<String> {
+    let line = encode_line(message)?;
+    if line.len() > MAX_HELPER_MESSAGE_BYTES {
+        return Err(CliError::Ipc("helper IPC 消息超过长度限制".to_string()));
+    }
+    Ok(line)
+}
+
+pub fn decode_helper_request(line: &str) -> CliResult<HelperRequest> {
+    decode_helper_message(line, "请求")
+}
+
+pub fn decode_helper_response(line: &str) -> CliResult<HelperResponse> {
+    decode_helper_message(line, "响应")
+}
+
+fn decode_helper_message<T: serde::de::DeserializeOwned>(line: &str, kind: &str) -> CliResult<T> {
+    if line.len() > MAX_HELPER_MESSAGE_BYTES {
+        return Err(CliError::Ipc("helper IPC 消息超过长度限制".to_string()));
+    }
+    serde_json::from_str(line.trim_end())
+        .map_err(|error| CliError::Ipc(format!("helper {kind}解码失败: {error}")))
 }
 
 /// 状态快照。
@@ -337,5 +401,38 @@ mod tests {
         assert_eq!(s.state, ConnState::Disconnected);
         assert_eq!(s.bytes_rx, 0);
         assert!(s.vpn_ip.is_none());
+    }
+
+    #[test]
+    fn helper_protocol_roundtrip_and_limit() {
+        let request = HelperRequest::Connect {
+            server_url: "https://vpn.example.com".to_string(),
+            refresh_token: "refresh-secret".to_string(),
+            device_name: "MacBook".to_string(),
+        };
+        let line = encode_helper_line(&request).unwrap();
+        assert_eq!(decode_helper_request(&line).unwrap(), request);
+
+        let logout = HelperRequest::PrepareLogout {
+            refresh_token: "refresh-secret".to_string(),
+        };
+        let line = encode_helper_line(&logout).unwrap();
+        assert_eq!(decode_helper_request(&line).unwrap(), logout);
+
+        let response = HelperResponse::Version {
+            version: "1.2.3".to_string(),
+            build_hash: "abc".to_string(),
+        };
+        let line = encode_helper_line(&response).unwrap();
+        assert_eq!(decode_helper_response(&line).unwrap(), response);
+
+        let oversized = "x".repeat(MAX_HELPER_MESSAGE_BYTES + 1);
+        assert!(decode_helper_request(&oversized).is_err());
+        assert!(encode_helper_line(&HelperRequest::Connect {
+            server_url: "https://vpn.example.com".to_string(),
+            refresh_token: oversized,
+            device_name: "MacBook".to_string(),
+        })
+        .is_err());
     }
 }
