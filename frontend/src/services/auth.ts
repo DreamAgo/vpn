@@ -14,7 +14,7 @@ import type {
   LogoutRequest,
   NotificationEventQuery,
   NotificationEventView,
-  NetworkSettings,
+  NetworkSettingsView,
   RefreshResponse,
   SetupStatusResponse,
   SystemInfo,
@@ -66,13 +66,13 @@ export const systemApi = {
     return res.data;
   },
 
-  async getNetworkSettings(): Promise<NetworkSettings> {
-    const res = await http.get<NetworkSettings>('/admin/network/settings');
+  async getNetworkSettings(): Promise<NetworkSettingsView> {
+    const res = await http.get<NetworkSettingsView>('/admin/network/settings');
     return res.data;
   },
 
-  async updateNetworkSettings(req: UpdateNetworkSettingsRequest): Promise<NetworkSettings> {
-    const res = await http.put<NetworkSettings>('/admin/network/settings', req);
+  async updateNetworkSettings(req: UpdateNetworkSettingsRequest): Promise<NetworkSettingsView> {
+    const res = await http.put<NetworkSettingsView>('/admin/network/settings', req);
     return res.data;
   },
 

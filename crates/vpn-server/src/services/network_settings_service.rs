@@ -1,25 +1,41 @@
-//! 持久化网络参数：数据库优先，环境变量只在整组配置不存在时初始化一次。
+//! 版本化数据面配置：环境变量仅初始化，数据库中的 desired 配置优先。
 
-use std::sync::Arc;
-
+use crate::{
+    config::{DataPlaneSettingsSeed, NetworkSettingsSeed},
+    repositories::{SqlitePeerRepository, SqliteSystemConfigRepository},
+    services::peer_service::{normalize_subnets, route_policy_lock, KEY_SERVER_ROUTES},
+};
 use serde::{Deserialize, Serialize};
+use std::{
+    net::Ipv4Addr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+use base64::Engine;
 use tokio::sync::RwLock;
-use vpn_api_types::system::{
-    obfs_transport_safe_mtu, NetworkMtuMode, NetworkSettings, DEFAULT_TUN_MTU, MAX_TUN_MTU,
-    MIN_TUN_MTU,
+use vpn_api_types::{
+    peer::ObfsMode,
+    system::{
+        DataPlaneSettings, NetworkMtuMode, NetworkSettings, NetworkSettingsView,
+        ObfsNetworkSettings, VpnBaseSettings, DEFAULT_TUN_MTU, MAX_TUN_MTU, MIN_TUN_MTU,
+    },
 };
 use vpn_core::{AppError, Result};
 
-use crate::{
-    config::{NetworkSettingsSeed, ObfsConfig},
-    repositories::SqliteSystemConfigRepository,
-};
-
 pub const KEY_NETWORK_SETTINGS: &str = "network_settings_v1";
-const NETWORK_SETTINGS_VERSION: u8 = 1;
+pub const KEY_DATA_PLANE_SETTINGS: &str = "network_settings_v2";
+const VERSION: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PersistedNetworkSettings {
+struct PersistedV2 {
+    version: u8,
+    settings: DataPlaneSettings,
+}
+#[derive(Debug, Deserialize)]
+struct PersistedV1 {
     version: u8,
     mode: NetworkMtuMode,
     default_mtu: u16,
@@ -27,181 +43,343 @@ struct PersistedNetworkSettings {
     max_mtu: u16,
 }
 
-impl From<NetworkSettings> for PersistedNetworkSettings {
-    fn from(value: NetworkSettings) -> Self {
-        Self {
-            version: NETWORK_SETTINGS_VERSION,
-            mode: value.mode,
-            default_mtu: value.default_mtu,
-            min_mtu: value.min_mtu,
-            max_mtu: value.max_mtu,
-        }
-    }
-}
-
-impl TryFrom<PersistedNetworkSettings> for NetworkSettings {
-    type Error = AppError;
-
-    fn try_from(value: PersistedNetworkSettings) -> Result<Self> {
-        if value.version != NETWORK_SETTINGS_VERSION {
-            return Err(AppError::Config(format!(
-                "{KEY_NETWORK_SETTINGS} 版本不支持：{}",
-                value.version
-            )));
-        }
-        let settings = Self {
-            mode: value.mode,
-            default_mtu: value.default_mtu,
-            min_mtu: value.min_mtu,
-            max_mtu: value.max_mtu,
-        };
-        settings
-            .validate()
-            .map_err(|error| AppError::Config(format!("{KEY_NETWORK_SETTINGS} 损坏：{error}")))?;
-        Ok(settings)
-    }
-}
-
 #[derive(Clone)]
 pub struct NetworkSettingsService {
     repo: SqliteSystemConfigRepository,
-    settings: Arc<RwLock<NetworkSettings>>,
-    obfs_constraint: Option<ObfsMtuConstraint>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ObfsMtuConstraint {
-    mode: vpn_api_types::peer::ObfsMode,
-    path_mtu: u16,
-    safe_mtu: u16,
-}
-
-impl From<&ObfsConfig> for ObfsMtuConstraint {
-    fn from(config: &ObfsConfig) -> Self {
-        Self {
-            mode: config.mode,
-            path_mtu: config.path_mtu,
-            safe_mtu: obfs_transport_safe_mtu(config.mode, config.path_mtu),
-        }
-    }
+    peer_repo: SqlitePeerRepository,
+    desired: Arc<RwLock<DataPlaneSettings>>,
+    applied: DataPlaneSettings,
+    mtu: Arc<RwLock<NetworkSettings>>,
+    psk_configured: bool,
+    https_enabled: bool,
+    approval_enabled: bool,
+    registration_blocked: Arc<AtomicBool>,
 }
 
 impl NetworkSettingsService {
     pub async fn load_or_seed(
         repo: SqliteSystemConfigRepository,
-        seed: &NetworkSettingsSeed,
-        obfs: Option<&ObfsConfig>,
+        peer_repo: SqlitePeerRepository,
+        seed: &DataPlaneSettingsSeed,
+        mtu_seed: &NetworkSettingsSeed,
+        https_enabled: bool,
+        approval_enabled: bool,
     ) -> Result<Self> {
-        let obfs_constraint = obfs.map(ObfsMtuConstraint::from);
-        let raw = match repo.get(KEY_NETWORK_SETTINGS).await? {
+        let psk_configured = seed
+            .obfs_psk
+            .as_deref()
+            .is_some_and(|value| valid_psk(value.as_str()));
+        let raw = match repo.get(KEY_DATA_PLANE_SETTINGS).await? {
             Some(raw) => raw,
             None => {
-                let settings = parse_seed(seed)?;
-                validate_obfs_constraint(&settings, obfs_constraint).map_err(AppError::Config)?;
+                let mtu = match repo.get(KEY_NETWORK_SETTINGS).await? {
+                    Some(raw) => deserialize_v1(&raw)?,
+                    None => parse_mtu_seed(mtu_seed)?,
+                };
+                let settings = parse_seed(seed, mtu)?;
+                validate_prerequisites(&settings, https_enabled, psk_configured, approval_enabled)
+                    .map_err(AppError::Config)?;
                 let raw = serialize(&settings)?;
-                repo.set_if_absent(KEY_NETWORK_SETTINGS, &raw).await?;
-                repo.get(KEY_NETWORK_SETTINGS).await?.ok_or_else(|| {
-                    AppError::Config(format!("{KEY_NETWORK_SETTINGS} 初始化后读取失败"))
+                repo.set_if_absent(KEY_DATA_PLANE_SETTINGS, &raw).await?;
+                repo.get(KEY_DATA_PLANE_SETTINGS).await?.ok_or_else(|| {
+                    AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS} 初始化后读取失败"))
                 })?
             }
         };
         let settings = deserialize(&raw)?;
-        validate_obfs_constraint(&settings, obfs_constraint).map_err(AppError::Config)?;
+        validate_prerequisites(&settings, https_enabled, psk_configured, approval_enabled)
+            .map_err(AppError::Config)?;
+        validate_peer_ips(&peer_repo, &settings.vpn.vpn_subnet).await?;
+        load_or_seed_server_routes(&repo, seed.server_routes.as_deref()).await?;
         Ok(Self {
             repo,
-            settings: Arc::new(RwLock::new(settings)),
-            obfs_constraint,
+            peer_repo,
+            desired: Arc::new(RwLock::new(settings.clone())),
+            applied: settings.clone(),
+            mtu: Arc::new(RwLock::new(settings.mtu.clone())),
+            psk_configured,
+            https_enabled,
+            approval_enabled,
+            registration_blocked: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub async fn settings(&self) -> NetworkSettings {
-        self.settings.read().await.clone()
+    pub async fn desired(&self) -> DataPlaneSettings {
+        self.desired.read().await.clone()
     }
-
+    pub fn applied(&self) -> &DataPlaneSettings {
+        &self.applied
+    }
     pub fn shared_settings(&self) -> Arc<RwLock<NetworkSettings>> {
-        self.settings.clone()
+        self.mtu.clone()
+    }
+    pub fn registration_gate(&self) -> Arc<AtomicBool> {
+        self.registration_blocked.clone()
     }
 
-    /// 校验成功后先持久化整组 JSON，再更新运行时快照。
-    pub async fn update(&self, settings: NetworkSettings) -> Result<NetworkSettings> {
-        settings.validate().map_err(AppError::Validation)?;
-        validate_obfs_constraint(&settings, self.obfs_constraint).map_err(AppError::Validation)?;
-        let mut current = self.settings.write().await;
+    pub async fn view(&self, server_routes: Vec<String>) -> NetworkSettingsView {
+        let desired = self.desired().await;
+        let mut applied = self.applied.clone();
+        // MTU 对新连接/重连即时生效，不属于待重启字段；返回当前实际下发值。
+        applied.mtu = self.mtu.read().await.clone();
+        NetworkSettingsView {
+            restart_required: restart_fields(&self.applied) != restart_fields(&desired),
+            applied,
+            desired,
+            server_routes,
+            psk_configured: self.psk_configured,
+        }
+    }
+
+    pub async fn server_routes(&self) -> Result<Vec<String>> {
+        let raw = self
+            .repo
+            .get(KEY_SERVER_ROUTES)
+            .await?
+            .ok_or_else(|| AppError::Config(format!("{KEY_SERVER_ROUTES} 未初始化")))?;
+        normalize_subnets(&split_routes(&raw))
+            .map_err(|error| AppError::Config(format!("{KEY_SERVER_ROUTES} 损坏：{error}")))
+    }
+
+    pub async fn update(
+        &self,
+        desired: DataPlaneSettings,
+        server_routes: &[String],
+    ) -> Result<Vec<String>> {
+        let lock = route_policy_lock();
+        let _guard = lock.lock().await;
+        self.update_locked(desired, server_routes).await
+    }
+
+    pub(crate) async fn update_locked(
+        &self,
+        desired: DataPlaneSettings,
+        server_routes: &[String],
+    ) -> Result<Vec<String>> {
+        desired.validate().map_err(AppError::Validation)?;
+        validate_prerequisites(
+            &desired,
+            self.https_enabled,
+            self.psk_configured,
+            self.approval_enabled,
+        )
+        .map_err(AppError::Validation)?;
+        // MTU 会立即下发给重连客户端；待重启的混淆参数尚未生效时，也必须满足当前
+        // applied transport 的安全上限。
+        let mut applied_with_new_mtu = self.applied.clone();
+        applied_with_new_mtu.mtu = desired.mtu.clone();
+        applied_with_new_mtu
+            .validate()
+            .map_err(AppError::Validation)?;
+        let routes = normalize_subnets(server_routes)?;
+        // 串行化完整校验、事务提交和内存快照切换，避免并发保存导致 DB/内存倒序。
+        let mut current = self.desired.write().await;
+        if desired.vpn.vpn_subnet != current.vpn.vpn_subnet && self.peer_repo.count_all().await? > 0
+        {
+            return Err(AppError::Validation(
+                "已有 Peer（包括已删除记录），必须彻底清理节点后才能修改 vpn_subnet".into(),
+            ));
+        }
+        let raw = serialize(&desired)?;
         self.repo
-            .set(KEY_NETWORK_SETTINGS, &serialize(&settings)?)
+            .set_pair(
+                (KEY_DATA_PLANE_SETTINGS, &raw),
+                (KEY_SERVER_ROUTES, &routes.join(",")),
+            )
             .await?;
-        *current = settings.clone();
-        Ok(settings)
+        *self.mtu.write().await = desired.mtu.clone();
+        self.registration_blocked.store(
+            desired.vpn.vpn_subnet != self.applied.vpn.vpn_subnet,
+            Ordering::Release,
+        );
+        *current = desired;
+        Ok(routes)
     }
 }
 
-fn serialize(settings: &NetworkSettings) -> Result<String> {
-    serde_json::to_string(&PersistedNetworkSettings::from(settings.clone()))
-        .map_err(|error| AppError::Internal(Box::new(error)))
+fn restart_fields(settings: &DataPlaneSettings) -> (&VpnBaseSettings, &ObfsNetworkSettings) {
+    (&settings.vpn, &settings.obfs)
 }
-
-fn deserialize(raw: &str) -> Result<NetworkSettings> {
-    let persisted: PersistedNetworkSettings = serde_json::from_str(raw)
+fn serialize(settings: &DataPlaneSettings) -> Result<String> {
+    serde_json::to_string(&PersistedV2 {
+        version: VERSION,
+        settings: settings.clone(),
+    })
+    .map_err(|error| AppError::Internal(Box::new(error)))
+}
+fn deserialize(raw: &str) -> Result<DataPlaneSettings> {
+    let persisted: PersistedV2 = serde_json::from_str(raw).map_err(|error| {
+        AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS} JSON 损坏：{error}"))
+    })?;
+    if persisted.version != VERSION {
+        return Err(AppError::Config(format!(
+            "{KEY_DATA_PLANE_SETTINGS} 版本不支持：{}",
+            persisted.version
+        )));
+    }
+    persisted
+        .settings
+        .validate()
+        .map_err(|error| AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS} 损坏：{error}")))?;
+    Ok(persisted.settings)
+}
+fn deserialize_v1(raw: &str) -> Result<NetworkSettings> {
+    let value: PersistedV1 = serde_json::from_str(raw)
         .map_err(|error| AppError::Config(format!("{KEY_NETWORK_SETTINGS} JSON 损坏：{error}")))?;
-    persisted.try_into()
+    if value.version != 1 {
+        return Err(AppError::Config(format!(
+            "{KEY_NETWORK_SETTINGS} 版本不支持：{}",
+            value.version
+        )));
+    }
+    let mtu = NetworkSettings {
+        mode: value.mode,
+        default_mtu: value.default_mtu,
+        min_mtu: value.min_mtu,
+        max_mtu: value.max_mtu,
+    };
+    mtu.validate()
+        .map_err(|error| AppError::Config(format!("{KEY_NETWORK_SETTINGS} 损坏：{error}")))?;
+    Ok(mtu)
 }
 
-fn parse_seed(seed: &NetworkSettingsSeed) -> Result<NetworkSettings> {
+fn parse_seed(seed: &DataPlaneSettingsSeed, mtu: NetworkSettings) -> Result<DataPlaneSettings> {
+    let enabled = match seed.obfs_enabled.as_deref().unwrap_or("false") {
+        "1" | "true" | "TRUE" | "yes" | "YES" => true,
+        "0" | "false" | "FALSE" | "no" | "NO" => false,
+        value => return Err(AppError::Config(format!("VPN_OBFS_ENABLED 非法：{value}"))),
+    };
+    let mode = match seed.obfs_mode.as_deref().unwrap_or("low-overhead-v1") {
+        "low-overhead-v1" => ObfsMode::LowOverheadV1,
+        "paranoid-v1" => ObfsMode::ParanoidV1,
+        value => return Err(AppError::Config(format!("VPN_OBFS_MODE 不支持：{value}"))),
+    };
+    let settings = DataPlaneSettings {
+        vpn: VpnBaseSettings {
+            vpn_subnet: seed
+                .vpn_subnet
+                .clone()
+                .unwrap_or_else(|| "10.8.0.0/24".into()),
+            vpn_listen_port: parse_u16("VPN_LISTEN_PORT", seed.vpn_listen_port.as_deref(), 51820)?,
+            vpn_endpoint: seed
+                .vpn_endpoint
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:51820".into()),
+            wg_backend: seed.wg_backend.clone().unwrap_or_else(|| "noop".into()),
+            wg_interface: seed.wg_interface.clone().unwrap_or_else(|| "wg0".into()),
+        },
+        obfs: ObfsNetworkSettings {
+            enabled,
+            mode,
+            bind_addr: seed
+                .obfs_bind_addr
+                .clone()
+                .unwrap_or_else(|| "0.0.0.0:47358".into()),
+            public_endpoint: seed
+                .obfs_endpoint
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:47358".into()),
+            path_mtu: parse_u16("VPN_OBFS_PATH_MTU", seed.obfs_path_mtu.as_deref(), 1500)?,
+        },
+        mtu,
+    };
+    settings.validate().map_err(AppError::Config)?;
+    Ok(settings)
+}
+
+fn parse_mtu_seed(seed: &NetworkSettingsSeed) -> Result<NetworkSettings> {
     let mode = match seed.mode.as_deref().unwrap_or("fixed") {
         "fixed" => NetworkMtuMode::Fixed,
         "auto" => NetworkMtuMode::Auto,
-        value => {
-            return Err(AppError::Config(format!(
-                "VPN_TUN_MTU_MODE 必须是 fixed 或 auto，当前为 {value}"
-            )))
-        }
+        value => return Err(AppError::Config(format!("VPN_TUN_MTU_MODE 非法：{value}"))),
     };
-    let settings = NetworkSettings {
+    let mtu = NetworkSettings {
         mode,
-        default_mtu: parse_seed_mtu(
+        default_mtu: parse_u16(
             "VPN_TUN_MTU_DEFAULT",
             seed.default_mtu.as_deref(),
             DEFAULT_TUN_MTU,
         )?,
-        min_mtu: parse_seed_mtu("VPN_TUN_MTU_MIN", seed.min_mtu.as_deref(), MIN_TUN_MTU)?,
-        max_mtu: parse_seed_mtu("VPN_TUN_MTU_MAX", seed.max_mtu.as_deref(), MAX_TUN_MTU)?,
+        min_mtu: parse_u16("VPN_TUN_MTU_MIN", seed.min_mtu.as_deref(), MIN_TUN_MTU)?,
+        max_mtu: parse_u16("VPN_TUN_MTU_MAX", seed.max_mtu.as_deref(), MAX_TUN_MTU)?,
     };
-    settings.validate().map_err(|_| {
-        AppError::Config(format!(
-            "VPN_TUN_MTU_* 首次初始化配置非法：VPN_TUN_MTU_MIN={}、VPN_TUN_MTU_DEFAULT={}、VPN_TUN_MTU_MAX={}，违反 1280 <= VPN_TUN_MTU_MIN <= VPN_TUN_MTU_DEFAULT <= VPN_TUN_MTU_MAX <= 1420",
-            settings.min_mtu, settings.default_mtu, settings.max_mtu
-        ))
-    })?;
-    Ok(settings)
+    mtu.validate().map_err(|_| AppError::Config(format!(
+        "VPN_TUN_MTU_* 首次初始化配置非法：VPN_TUN_MTU_MIN={}、VPN_TUN_MTU_DEFAULT={}、VPN_TUN_MTU_MAX={}，违反 1280 <= VPN_TUN_MTU_MIN <= VPN_TUN_MTU_DEFAULT <= VPN_TUN_MTU_MAX <= 1420",
+        mtu.min_mtu, mtu.default_mtu, mtu.max_mtu)))?;
+    Ok(mtu)
 }
-
-fn validate_obfs_constraint(
-    settings: &NetworkSettings,
-    constraint: Option<ObfsMtuConstraint>,
+fn parse_u16(name: &str, raw: Option<&str>, default: u16) -> Result<u16> {
+    raw.map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| AppError::Config(format!("{name} 必须是整数，当前为 {value}")))
+    })
+}
+fn validate_prerequisites(
+    settings: &DataPlaneSettings,
+    https_enabled: bool,
+    psk_configured: bool,
+    approval_enabled: bool,
 ) -> std::result::Result<(), String> {
-    let Some(constraint) = constraint else {
-        return Ok(());
-    };
-    let (field, value) = match settings.mode {
-        NetworkMtuMode::Fixed => ("default_mtu", settings.default_mtu),
-        NetworkMtuMode::Auto => ("min_mtu", settings.min_mtu),
-    };
-    if value <= constraint.safe_mtu {
-        return Ok(());
+    settings.validate()?;
+    if settings.obfs.enabled && !https_enabled {
+        return Err("启用 UDP 混淆时必须启用 HTTPS，禁止通过 HTTP 下发 PSK".into());
     }
-    Err(format!(
-        "当前混淆传输 mode={:?}、path_mtu={} 的安全内层 MTU 上限为 {}，{}={} 超过该上限",
-        constraint.mode, constraint.path_mtu, constraint.safe_mtu, field, value
-    ))
+    if settings.obfs.enabled && !psk_configured {
+        return Err("启用 UDP 混淆时必须通过 VPN_OBFS_PSK 配置秘密".into());
+    }
+    if approval_enabled && settings.vpn.wg_backend != "kernel" {
+        return Err("启用飞书审批网络授权时 wg_backend 必须为 kernel".into());
+    }
+    Ok(())
 }
 
-fn parse_seed_mtu(name: &str, raw: Option<&str>, default: u16) -> Result<u16> {
-    match raw {
-        Some(value) => value
-            .parse::<u16>()
-            .map_err(|_| AppError::Config(format!("{name} 必须是整数，当前为 {value}"))),
-        None => Ok(default),
+async fn load_or_seed_server_routes(
+    repo: &SqliteSystemConfigRepository,
+    seed: Option<&str>,
+) -> Result<Vec<String>> {
+    match repo.get(KEY_SERVER_ROUTES).await? {
+        Some(raw) => normalize_subnets(&split_routes(&raw))
+            .map_err(|error| AppError::Config(format!("{KEY_SERVER_ROUTES} 损坏：{error}"))),
+        None => {
+            let routes = normalize_subnets(&split_routes(seed.unwrap_or_default()))
+                .map_err(|error| AppError::Config(format!("VPN_SERVER_ROUTES 非法：{error}")))?;
+            repo.set_if_absent(KEY_SERVER_ROUTES, &routes.join(","))
+                .await?;
+            let stored = repo
+                .get(KEY_SERVER_ROUTES)
+                .await?
+                .ok_or_else(|| AppError::Config(format!("{KEY_SERVER_ROUTES} 初始化后读取失败")))?;
+            normalize_subnets(&split_routes(&stored))
+                .map_err(|error| AppError::Config(format!("{KEY_SERVER_ROUTES} 损坏：{error}")))
+        }
     }
+}
+
+fn split_routes(raw: &str) -> Vec<String> {
+    raw.split(',').map(str::to_owned).collect()
+}
+
+fn valid_psk(value: &str) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .is_ok_and(|decoded| decoded.len() == 32)
+}
+async fn validate_peer_ips(repo: &SqlitePeerRepository, subnet: &str) -> Result<()> {
+    let subnet: ipnet::Ipv4Net = subnet
+        .parse()
+        .map_err(|_| AppError::Config("vpn_subnet 非法".into()))?;
+    for raw in repo.list_all_vpn_ips().await? {
+        let ip: Ipv4Addr = raw
+            .parse()
+            .map_err(|_| AppError::Config(format!("peers 表包含非法 vpn_ip={raw}，拒绝启动")))?;
+        if !subnet.contains(&ip) {
+            return Err(AppError::Config(format!(
+                "Peer IP {ip} 不在当前 vpn_subnet {subnet} 内，拒绝启动"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -209,11 +387,9 @@ mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
-    use zeroize::Zeroizing;
-
-    async fn repo() -> SqliteSystemConfigRepository {
+    async fn repos() -> (SqliteSystemConfigRepository, SqlitePeerRepository) {
         let url = format!(
-            "sqlite:file:network_settings_test_{}?mode=memory&cache=private",
+            "sqlite:file:network_v2_{}?mode=memory&cache=private",
             uuid::Uuid::new_v4()
         );
         let pool = SqlitePoolOptions::new()
@@ -222,149 +398,182 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-        SqliteSystemConfigRepository::new(pool)
+        (
+            SqliteSystemConfigRepository::new(pool.clone()),
+            SqlitePeerRepository::new(pool),
+        )
     }
-
-    fn obfs(mode: vpn_api_types::peer::ObfsMode, path_mtu: u16) -> ObfsConfig {
-        ObfsConfig {
-            bind_addr: "0.0.0.0:47358".into(),
-            public_endpoint: "vpn.example.com:47358".into(),
-            mode,
-            path_mtu,
-            psk: Zeroizing::new([7; 32]),
-            max_sessions: 16,
-            new_sessions_per_ip_per_minute: 20,
-            session_idle_secs: 180,
+    fn seed() -> DataPlaneSettingsSeed {
+        DataPlaneSettingsSeed {
+            vpn_subnet: Some("10.8.0.0/24".into()),
+            vpn_listen_port: Some("51820".into()),
+            vpn_endpoint: Some("vpn.example.com:51820".into()),
+            wg_backend: Some("kernel".into()),
+            wg_interface: Some("wg0".into()),
+            obfs_enabled: Some("false".into()),
+            obfs_mode: Some("low-overhead-v1".into()),
+            obfs_bind_addr: Some("0.0.0.0:47358".into()),
+            obfs_endpoint: Some("vpn.example.com:47358".into()),
+            obfs_path_mtu: Some("1500".into()),
+            server_routes: Some(String::new()),
+            obfs_psk: None,
         }
     }
-
-    #[tokio::test]
-    async fn environment_seed_is_written_once_and_db_wins_afterward() {
-        let repo = repo().await;
-        let first = NetworkSettingsSeed {
-            mode: Some("auto".into()),
-            default_mtu: Some("1340".into()),
-            min_mtu: Some("1280".into()),
-            max_mtu: Some("1400".into()),
-        };
-        let service = NetworkSettingsService::load_or_seed(repo.clone(), &first, None)
-            .await
-            .unwrap();
-        assert_eq!(service.settings().await.default_mtu, 1340);
-
-        let changed_environment = NetworkSettingsSeed {
-            mode: Some("not-valid".into()),
-            default_mtu: Some("not-a-number".into()),
-            ..NetworkSettingsSeed::default()
-        };
-        let restarted = NetworkSettingsService::load_or_seed(repo, &changed_environment, None)
-            .await
-            .unwrap();
-        assert_eq!(restarted.settings().await, service.settings().await);
+    async fn insert_deleted_peer(repo: &SqliteSystemConfigRepository, vpn_ip: &str) {
+        sqlx::query("INSERT INTO users (id, username, email, password_hash, role, status, created_at, updated_at) VALUES ('u', 'u', 'u@example.com', 'x', 'user', 'active', 1, 1)")
+            .execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO peers (id, user_id, device_name, wg_public_key, vpn_ip, status, created_at, updated_at) VALUES ('p', 'u', 'd', 'key', ?1, 'deleted', 1, 1)")
+            .bind(vpn_ip).execute(repo.pool()).await.unwrap();
     }
-
     #[tokio::test]
-    async fn invalid_seed_fails_without_writing_partial_configuration() {
-        let repo = repo().await;
-        let seed = NetworkSettingsSeed {
-            min_mtu: Some("1400".into()),
-            default_mtu: Some("1360".into()),
-            ..NetworkSettingsSeed::default()
-        };
-        let error = NetworkSettingsService::load_or_seed(repo.clone(), &seed, None)
-            .await
-            .err()
-            .expect("非法 seed 应拒绝启动");
-        let message = error.to_string();
-        assert!(message.contains("VPN_TUN_MTU_MIN=1400"));
-        assert!(message.contains("VPN_TUN_MTU_DEFAULT=1360"));
-        assert!(message.contains("VPN_TUN_MTU_MAX=1420"));
-        assert!(message
-            .contains("1280 <= VPN_TUN_MTU_MIN <= VPN_TUN_MTU_DEFAULT <= VPN_TUN_MTU_MAX <= 1420"));
-        assert!(repo.get(KEY_NETWORK_SETTINGS).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn corrupt_stored_configuration_never_falls_back_to_environment() {
-        let repo = repo().await;
-        repo.set(KEY_NETWORK_SETTINGS, "{bad json").await.unwrap();
-        assert!(
-            NetworkSettingsService::load_or_seed(repo, &NetworkSettingsSeed::default(), None)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_update_keeps_previous_value() {
-        let repo = repo().await;
-        let service =
-            NetworkSettingsService::load_or_seed(repo, &NetworkSettingsSeed::default(), None)
-                .await
-                .unwrap();
-        let before = service.settings().await;
-        let invalid = NetworkSettings {
-            min_mtu: 1400,
-            default_mtu: 1360,
-            ..before.clone()
-        };
-        assert!(service.update(invalid).await.is_err());
-        assert_eq!(service.settings().await, before);
-    }
-
-    #[tokio::test]
-    async fn fixed_seed_rejects_default_above_obfs_safe_mtu() {
-        let repo = repo().await;
-        let seed = NetworkSettingsSeed {
-            default_mtu: Some("1400".into()),
-            max_mtu: Some("1420".into()),
-            ..NetworkSettingsSeed::default()
-        };
-        let obfs = obfs(vpn_api_types::peer::ObfsMode::ParanoidV1, 1500);
-        let error = NetworkSettingsService::load_or_seed(repo.clone(), &seed, Some(&obfs))
-            .await
-            .err()
-            .expect("fixed default 超过安全上限应拒绝启动");
-        assert!(error.to_string().contains("default_mtu=1400"));
-        assert!(error.to_string().contains("安全内层 MTU 上限为 1392"));
-        assert!(repo.get(KEY_NETWORK_SETTINGS).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn obfs_path_below_global_minimum_is_rejected_at_startup() {
-        let repo = repo().await;
-        let obfs = obfs(vpn_api_types::peer::ObfsMode::LowOverheadV1, 1200);
-        let error = NetworkSettingsService::load_or_seed(
-            repo,
-            &NetworkSettingsSeed::default(),
-            Some(&obfs),
-        )
-        .await
-        .err()
-        .expect("低于全局最小 MTU 的路径应拒绝启动");
-        assert!(error.to_string().contains("安全内层 MTU 上限为 1136"));
-    }
-
-    #[tokio::test]
-    async fn auto_update_rejects_min_above_obfs_safe_mtu_without_changing_value() {
-        let repo = repo().await;
-        let obfs = obfs(vpn_api_types::peer::ObfsMode::ParanoidV1, 1500);
-        let service = NetworkSettingsService::load_or_seed(
-            repo,
-            &NetworkSettingsSeed::default(),
-            Some(&obfs),
+    async fn migrates_v1_mtu_and_v2_db_ignores_later_bad_environment() {
+        let (repo, peers) = repos().await;
+        repo.set(
+            KEY_NETWORK_SETTINGS,
+            r#"{"version":1,"mode":"auto","default_mtu":1340,"min_mtu":1280,"max_mtu":1400}"#,
         )
         .await
         .unwrap();
-        let before = service.settings().await;
-        let invalid = NetworkSettings {
-            mode: NetworkMtuMode::Auto,
-            min_mtu: 1400,
-            default_mtu: 1400,
-            max_mtu: 1420,
-        };
-        let error = service.update(invalid).await.unwrap_err();
-        assert!(error.to_string().contains("min_mtu=1400"));
-        assert_eq!(service.settings().await, before);
+        let mut initial_seed = seed();
+        initial_seed.server_routes = Some("192.168.10.0/24".into());
+        let service = NetworkSettingsService::load_or_seed(
+            repo.clone(),
+            peers.clone(),
+            &initial_seed,
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(service.desired().await.mtu.default_mtu, 1340);
+        assert_eq!(
+            service.server_routes().await.unwrap(),
+            vec!["192.168.10.0/24"]
+        );
+        let mut bad = seed();
+        bad.vpn_subnet = Some("bad".into());
+        bad.obfs_mode = Some("bad".into());
+        bad.server_routes = Some("bad-route".into());
+        let restarted = NetworkSettingsService::load_or_seed(
+            repo,
+            peers,
+            &bad,
+            &NetworkSettingsSeed {
+                mode: Some("bad".into()),
+                ..Default::default()
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted.desired().await, service.desired().await);
+        assert_eq!(
+            restarted.server_routes().await.unwrap(),
+            vec!["192.168.10.0/24"]
+        );
+    }
+    #[tokio::test]
+    async fn wide_lan_route_and_empty_peer_subnet_change_are_allowed() {
+        let (repo, peers) = repos().await;
+        let service = NetworkSettingsService::load_or_seed(
+            repo,
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut desired = service.desired().await;
+        desired.vpn.vpn_subnet = "10.9.0.0/24".into();
+        let routes = service
+            .update(desired, &["10.0.0.0/8".into()])
+            .await
+            .unwrap();
+        assert_eq!(routes, vec!["10.0.0.0/8"]);
+        assert!(service.view(routes).await.restart_required);
+        assert!(service.registration_gate().load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn approval_mode_rejects_non_kernel_desired_backend() {
+        let (repo, peers) = repos().await;
+        let service = NetworkSettingsService::load_or_seed(
+            repo,
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let mut desired = service.desired().await;
+        desired.vpn.wg_backend = "auto".into();
+        assert!(service.update(desired, &[]).await.is_err());
+    }
+    #[tokio::test]
+    async fn corrupt_v2_refuses_startup() {
+        let (repo, peers) = repos().await;
+        repo.set(KEY_DATA_PLANE_SETTINGS, "{bad").await.unwrap();
+        assert!(NetworkSettingsService::load_or_seed(
+            repo,
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn deleted_peer_blocks_subnet_change_and_outside_ip_blocks_restart() {
+        let (repo, peers) = repos().await;
+        let service = NetworkSettingsService::load_or_seed(
+            repo.clone(),
+            peers.clone(),
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        insert_deleted_peer(&repo, "10.8.0.2").await;
+        let mut desired = service.desired().await;
+        desired.vpn.vpn_subnet = "10.9.0.0/24".into();
+        assert!(service
+            .update(desired, &[])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("彻底清理"));
+
+        let raw = serialize(&DataPlaneSettings {
+            vpn: VpnBaseSettings {
+                vpn_subnet: "10.9.0.0/24".into(),
+                ..service.desired().await.vpn
+            },
+            ..service.desired().await
+        })
+        .unwrap();
+        repo.set(KEY_DATA_PLANE_SETTINGS, &raw).await.unwrap();
+        let error = NetworkSettingsService::load_or_seed(
+            repo,
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("不在当前 vpn_subnet"));
     }
 }

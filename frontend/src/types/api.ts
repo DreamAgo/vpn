@@ -88,7 +88,38 @@ export interface NetworkSettings {
   maxMtu: number;
 }
 
-export type UpdateNetworkSettingsRequest = NetworkSettings;
+export type ObfsMode = 'low-overhead-v1' | 'paranoid-v1';
+
+export interface DataPlaneSettings {
+  vpn: {
+    vpnSubnet: string;
+    vpnListenPort: number;
+    vpnEndpoint: string;
+    wgBackend: 'noop' | 'kernel' | 'userspace' | 'auto';
+    wgInterface: string;
+  };
+  obfs: {
+    enabled: boolean;
+    mode: ObfsMode;
+    bindAddr: string;
+    publicEndpoint: string;
+    pathMtu: number;
+  };
+  mtu: NetworkSettings;
+}
+
+export interface NetworkSettingsView {
+  applied: DataPlaneSettings;
+  desired: DataPlaneSettings;
+  serverRoutes: string[];
+  restartRequired: boolean;
+  pskConfigured: boolean;
+}
+
+export interface UpdateNetworkSettingsRequest {
+  desired: DataPlaneSettings;
+  serverRoutes: string[];
+}
 
 export interface EmailNotificationSettings {
   enabled: boolean;

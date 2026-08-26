@@ -12,9 +12,12 @@ use tower::ServiceExt;
 
 use vpn_server::{
     build_router,
-    config::NetworkSettingsSeed,
+    config::{DataPlaneSettingsSeed, NetworkSettingsSeed},
     ratelimit::LoginAttempts,
-    repositories::{SqliteSessionRepository, SqliteSystemConfigRepository, SqliteUserRepository},
+    repositories::{
+        SqlitePeerRepository, SqliteSessionRepository, SqliteSystemConfigRepository,
+        SqliteUserRepository,
+    },
     services::{Argon2Hasher, AuthService, JwtTokenIssuer, NetworkSettingsService, UserService},
     AppState,
 };
@@ -73,9 +76,25 @@ async fn setup() -> (axum::Router, tempfile::TempDir, String) {
     let user_service = Arc::new(UserService::new(user_repo, session_repo, hasher));
     let network_settings_service = Arc::new(
         NetworkSettingsService::load_or_seed(
-            SqliteSystemConfigRepository::new(pool),
+            SqliteSystemConfigRepository::new(pool.clone()),
+            SqlitePeerRepository::new(pool),
+            &DataPlaneSettingsSeed {
+                vpn_subnet: Some("10.8.0.0/24".into()),
+                vpn_listen_port: Some("51820".into()),
+                vpn_endpoint: Some("vpn.example.com:51820".into()),
+                wg_backend: Some("kernel".into()),
+                wg_interface: Some("wg0".into()),
+                obfs_enabled: Some("false".into()),
+                obfs_mode: Some("low-overhead-v1".into()),
+                obfs_bind_addr: Some("0.0.0.0:47358".into()),
+                obfs_endpoint: Some("vpn.example.com:47358".into()),
+                obfs_path_mtu: Some("1500".into()),
+                server_routes: Some(String::new()),
+                obfs_psk: None,
+            },
             &NetworkSettingsSeed::default(),
-            None,
+            false,
+            false,
         )
         .await
         .unwrap(),
@@ -117,24 +136,40 @@ async fn admin_can_update_but_invalid_request_keeps_previous_value() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(initial["data"]["default_mtu"], json!(1360));
+    assert_eq!(
+        initial["data"]["desired"]["mtu"]["default_mtu"],
+        json!(1360)
+    );
+
+    let mut desired = initial["data"]["desired"].clone();
+    desired["mtu"] =
+        json!({ "mode": "auto", "default_mtu": 1340, "min_mtu": 1280, "max_mtu": 1400 });
 
     let (status, updated) = request(
         &app,
         "PUT",
         "/api/v1/admin/network/settings",
-        Some(json!({ "mode": "auto", "default_mtu": 1340, "min_mtu": 1280, "max_mtu": 1400 })),
+        Some(json!({ "desired": desired, "server_routes": [] })),
         Some(&admin_token),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(updated["data"]["mode"], json!("auto"));
+    assert_eq!(updated["data"]["desired"]["mtu"]["mode"], json!("auto"));
+    assert_eq!(
+        updated["data"]["applied"]["mtu"]["default_mtu"],
+        json!(1340)
+    );
+    assert_eq!(updated["data"]["restart_required"], json!(false));
+
+    let mut invalid_desired = updated["data"]["desired"].clone();
+    invalid_desired["mtu"] =
+        json!({ "mode": "fixed", "default_mtu": 1300, "min_mtu": 1400, "max_mtu": 1420 });
 
     let (status, _) = request(
         &app,
         "PUT",
         "/api/v1/admin/network/settings",
-        Some(json!({ "mode": "fixed", "default_mtu": 1300, "min_mtu": 1400, "max_mtu": 1420 })),
+        Some(json!({ "desired": invalid_desired, "server_routes": [] })),
         Some(&admin_token),
     )
     .await;
@@ -143,7 +178,7 @@ async fn admin_can_update_but_invalid_request_keeps_previous_value() {
         &app,
         "PUT",
         "/api/v1/admin/network/settings",
-        Some(json!({ "mode": "bogus", "default_mtu": 1360, "min_mtu": 1280, "max_mtu": 1420 })),
+        Some(json!({ "desired": { "mtu": { "mode": "bogus" } }, "server_routes": [] })),
         Some(&admin_token),
     )
     .await;
@@ -182,9 +217,7 @@ async fn non_admin_cannot_read_or_modify_network_settings() {
     let user_token = logged_in["data"]["access_token"].as_str().unwrap();
 
     for method in ["GET", "PUT"] {
-        let body = (method == "PUT").then(
-            || json!({ "mode": "fixed", "default_mtu": 1360, "min_mtu": 1280, "max_mtu": 1420 }),
-        );
+        let body = (method == "PUT").then(|| json!({ "desired": {}, "server_routes": [] }));
         let (status, _) = request(
             &app,
             method,

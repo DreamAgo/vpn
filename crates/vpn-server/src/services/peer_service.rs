@@ -6,7 +6,10 @@
 //! - `Arc<dyn WireGuardControl>`（本轮注入 Noop，真实后端留待真机集成）
 
 use std::net::Ipv4Addr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
 use base64::Engine;
 use ipnet::Ipv4Net;
@@ -183,6 +186,7 @@ pub struct PeerService {
     peer_route_lock: Arc<Mutex<()>>,
     obfs_transport: Option<ObfsTransportSecret>,
     network_settings: Arc<RwLock<NetworkSettings>>,
+    registration_blocked: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -234,12 +238,19 @@ impl PeerService {
             peer_route_lock: route_policy_lock(),
             obfs_transport: None,
             network_settings: Arc::new(RwLock::new(NetworkSettings::default())),
+            registration_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// 共享管理员可更新的网络参数快照；仅影响之后的注册/重连响应。
     pub fn with_network_settings(mut self, settings: Arc<RwLock<NetworkSettings>>) -> Self {
         self.network_settings = settings;
+        self
+    }
+
+    /// 子网已保存为待重启配置时禁止继续按旧地址池创建/恢复节点。
+    pub fn with_registration_gate(mut self, gate: Arc<AtomicBool>) -> Self {
+        self.registration_blocked = gate;
         self
     }
 
@@ -267,6 +278,7 @@ impl PeerService {
     /// 由 [`compute_allowed_routes`](Self::compute_allowed_routes) 实时计算）；
     /// 已连接的客户端需重连后才会拿到新网段。
     pub async fn set_server_routes(&self, subnets: &[String]) -> Result<Vec<String>> {
+        let _guard = self.peer_route_lock.lock().await;
         let normalized = normalize_subnets(subnets)?;
         self.config_repo
             .set(KEY_SERVER_ROUTES, &normalized.join(","))
@@ -274,6 +286,11 @@ impl PeerService {
         *self.server_routes.write().await = normalized.clone();
         tracing::info!(routes = ?normalized, "服务端 LAN 网段已更新");
         Ok(normalized)
+    }
+
+    /// 数据库已由网络设置服务原子提交后，仅切换热更新内存快照。
+    pub async fn apply_server_routes(&self, routes: Vec<String>) {
+        *self.server_routes.write().await = routes;
     }
 
     /// 服务端 WireGuard 公钥（system info 展示）。
@@ -327,6 +344,11 @@ impl PeerService {
             ));
         }
         let _route_guard = self.peer_route_lock.lock().await;
+        if self.registration_blocked.load(Ordering::Acquire) {
+            return Err(AppError::Validation(
+                "VPN 虚拟子网已修改并等待服务端重启，重启完成前暂停节点注册".to_string(),
+            ));
+        }
         let peers = self.peer_repo.list_active_by_user(user_id).await?;
         // 终端匹配：公钥优先（同一运行内重连），其次设备名（重启后换了密钥对）。
         let matched = peers
@@ -1381,6 +1403,23 @@ mod tests {
             reconnected.network_settings.as_ref().unwrap().default_mtu,
             1360
         );
+    }
+
+    #[tokio::test]
+    async fn pending_subnet_change_blocks_registration_until_restart() {
+        let gate = Arc::new(AtomicBool::new(true));
+        let svc = service(setup_pool().await).with_registration_gate(gate);
+        let error = svc
+            .register("user-1", &reg("PK-BLOCKED"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("等待服务端重启"));
+        assert!(svc
+            .peer_repo
+            .list_active_by_user("user-1")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

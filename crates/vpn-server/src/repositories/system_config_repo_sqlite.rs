@@ -65,6 +65,33 @@ impl SqliteSystemConfigRepository {
         .map_err(|e| AppError::Database(Box::new(e)))?;
         Ok(result.rows_affected() == 1)
     }
+
+    /// 在同一事务中写入两个配置项，供整组网络配置与热更新路由原子保存。
+    pub async fn set_pair(&self, first: (&str, &str), second: (&str, &str)) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        for (key, value) in [first, second] {
+            sqlx::query(
+                r#"INSERT INTO system_config (key, value, updated_at)
+                   VALUES (?1, ?2, ?3)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"#,
+            )
+            .bind(key)
+            .bind(value)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

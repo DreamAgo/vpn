@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::peer::ObfsMode;
+use std::net::Ipv4Addr;
 
 pub const DEFAULT_TUN_MTU: u16 = 1360;
 pub const MIN_TUN_MTU: u16 = 1280;
@@ -37,6 +38,44 @@ pub struct NetworkSettings {
     pub max_mtu: u16,
 }
 
+/// 需要重启服务端才能生效的 WireGuard 基础配置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpnBaseSettings {
+    pub vpn_subnet: String,
+    pub vpn_listen_port: u16,
+    pub vpn_endpoint: String,
+    pub wg_backend: String,
+    pub wg_interface: String,
+}
+
+/// 可公开给管理员的混淆配置（不包含 PSK）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObfsNetworkSettings {
+    pub enabled: bool,
+    pub mode: ObfsMode,
+    pub bind_addr: String,
+    pub public_endpoint: String,
+    pub path_mtu: u16,
+}
+
+/// 数据库持久化的数据面配置；秘密始终不进入此结构。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataPlaneSettings {
+    pub vpn: VpnBaseSettings,
+    pub obfs: ObfsNetworkSettings,
+    pub mtu: NetworkSettings,
+}
+
+/// 管理页读取模型。LAN 路由为热更新值，因此无需区分 applied/desired。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkSettingsView {
+    pub applied: DataPlaneSettings,
+    pub desired: DataPlaneSettings,
+    pub server_routes: Vec<String>,
+    pub restart_required: bool,
+    pub psk_configured: bool,
+}
+
 impl Default for NetworkSettings {
     fn default() -> Self {
         Self {
@@ -67,21 +106,110 @@ impl NetworkSettings {
 /// 更新网络参数请求（PUT /api/v1/admin/network/settings）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateNetworkSettingsRequest {
-    pub mode: NetworkMtuMode,
-    pub default_mtu: u16,
-    pub min_mtu: u16,
-    pub max_mtu: u16,
+    pub desired: DataPlaneSettings,
+    pub server_routes: Vec<String>,
 }
 
-impl From<UpdateNetworkSettingsRequest> for NetworkSettings {
-    fn from(value: UpdateNetworkSettingsRequest) -> Self {
-        Self {
-            mode: value.mode,
-            default_mtu: value.default_mtu,
-            min_mtu: value.min_mtu,
-            max_mtu: value.max_mtu,
+impl VpnBaseSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        let subnet: ipnet::Ipv4Net = self
+            .vpn_subnet
+            .parse()
+            .map_err(|_| "vpn_subnet 必须是合法 IPv4 CIDR".to_string())?;
+        if subnet.prefix_len() > 30 {
+            return Err("vpn_subnet 必须至少容纳服务端和一个客户端".to_string());
         }
+        validate_endpoint("vpn_endpoint", &self.vpn_endpoint)?;
+        if self.vpn_listen_port == 0 {
+            return Err("vpn_listen_port 必须大于 0".to_string());
+        }
+        if !matches!(
+            self.wg_backend.as_str(),
+            "noop" | "kernel" | "userspace" | "auto"
+        ) {
+            return Err("wg_backend 必须是 noop、kernel、userspace 或 auto".to_string());
+        }
+        if self.wg_interface.trim().is_empty()
+            || self.wg_interface.len() > 15
+            || !self.wg_interface.chars().any(|c| c.is_ascii_alphanumeric())
+            || !self
+                .wg_interface
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            return Err("wg_interface 必须是 1..=15 位字母、数字、_、- 或 .".to_string());
+        }
+        Ok(())
     }
+}
+
+impl ObfsNetworkSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        let bind: std::net::SocketAddr = self
+            .bind_addr
+            .parse()
+            .map_err(|_| "obfs.bind_addr 必须是 IPv4 socket 地址".to_string())?;
+        if !bind.is_ipv4() {
+            return Err("obfs.bind_addr 当前仅支持 IPv4".to_string());
+        }
+        if bind.port() == 0 {
+            return Err("obfs.bind_addr 端口必须大于 0".to_string());
+        }
+        validate_endpoint("obfs.public_endpoint", &self.public_endpoint)?;
+        if !(576..=9000).contains(&self.path_mtu) {
+            return Err("obfs.path_mtu 必须在 576..=9000".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl DataPlaneSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        self.vpn.validate()?;
+        self.obfs.validate()?;
+        self.mtu.validate()?;
+        if self.obfs.enabled && self.vpn.wg_backend == "noop" {
+            return Err("启用 UDP 混淆时 wg_backend 不能为 noop".to_string());
+        }
+        let safe = obfs_transport_safe_mtu(self.obfs.mode, self.obfs.path_mtu);
+        if self.obfs.enabled {
+            let (field, value) = match self.mtu.mode {
+                NetworkMtuMode::Fixed => ("default_mtu", self.mtu.default_mtu),
+                NetworkMtuMode::Auto => ("min_mtu", self.mtu.min_mtu),
+            };
+            if value > safe {
+                return Err(format!(
+                    "obfs.path_mtu 的安全内层 MTU 上限为 {safe}，{field}={value} 超过上限"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_endpoint(name: &str, endpoint: &str) -> Result<(), String> {
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{name} 必须是 host:port"))?;
+    let valid_host = host.parse::<Ipv4Addr>().is_ok() || valid_hostname(host);
+    if !valid_host || port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+        return Err(format!("{name} 必须是有效的 IPv4/域名 host:port"));
+    }
+    Ok(())
+}
+
+fn valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,5 +328,31 @@ mod tests {
         assert_eq!(obfs_transport_safe_mtu(ObfsMode::ParanoidV1, 1500), 1392);
         assert_eq!(obfs_transport_safe_mtu(ObfsMode::LowOverheadV1, 1500), 1440);
         assert_eq!(obfs_transport_safe_mtu(ObfsMode::LowOverheadV1, 1200), 1136);
+    }
+
+    #[test]
+    fn endpoint_and_interface_validation_rejects_runtime_failures() {
+        let mut vpn = VpnBaseSettings {
+            vpn_subnet: "10.8.0.0/24".into(),
+            vpn_listen_port: 51820,
+            vpn_endpoint: "vpn.example.com:51820".into(),
+            wg_backend: "kernel".into(),
+            wg_interface: "wg0".into(),
+        };
+        assert!(vpn.validate().is_ok());
+        vpn.vpn_endpoint = "http://vpn.example.com:51820".into();
+        assert!(vpn.validate().is_err());
+        vpn.vpn_endpoint = "vpn.example.com:51820".into();
+        vpn.wg_interface = "..".into();
+        assert!(vpn.validate().is_err());
+
+        let obfs = ObfsNetworkSettings {
+            enabled: true,
+            mode: ObfsMode::LowOverheadV1,
+            bind_addr: "0.0.0.0:0".into(),
+            public_endpoint: "vpn.example.com:47358".into(),
+            path_mtu: 1500,
+        };
+        assert!(obfs.validate().is_err());
     }
 }

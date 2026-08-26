@@ -104,6 +104,23 @@ impl SqlitePeerRepository {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
+    /// 包含 deleted 在内的全部 Peer IP；用于禁止有历史节点时切换地址池并做启动校验。
+    pub async fn list_all_vpn_ips(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT vpn_ip FROM peers")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
+    pub async fn count_all(&self) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM peers")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))?;
+        Ok(count)
+    }
+
     /// 列出活跃 peer 的 (wg_public_key, vpn_ip, routed_subnets)，用于启动时向内核接口恢复配置。
     pub async fn list_active_peer_keys(&self) -> Result<Vec<(String, String, String)>> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(

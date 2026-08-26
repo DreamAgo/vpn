@@ -1,10 +1,9 @@
 //! 服务端配置：环境变量 + 默认值。
 
-use std::env;
-use std::net::SocketAddr;
-
 use base64::Engine;
+use std::env;
 use vpn_api_types::peer::ObfsMode;
+use vpn_api_types::system::ObfsNetworkSettings;
 use zeroize::Zeroizing;
 
 /// UDP 混淆监听配置。PSK 的 Debug 输出始终脱敏。
@@ -38,11 +37,8 @@ impl std::fmt::Debug for ObfsConfig {
     }
 }
 
-/// 服务端启动配置。
-///
-/// 来源优先级：
-/// 1. 环境变量（最高）
-/// 2. 编译期默认值
+/// 服务端 bootstrap 与一次性种子配置。
+/// 数据库连接前置项继续来自环境变量；非敏感数据面字段只保留在 seed 中。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// 监听地址。默认 `0.0.0.0:8080`（开发用，无 HTTPS）。
@@ -55,28 +51,12 @@ pub struct ServerConfig {
     pub domain: Option<String>,
     /// 数据目录（用于密钥、ACME 证书缓存）。
     pub data_dir: String,
-    /// VPN 虚拟子网（CIDR）。默认 `10.8.0.0/24`。
-    pub vpn_subnet: String,
-    /// WireGuard 监听 UDP 端口。默认 `51820`。
-    pub vpn_listen_port: u16,
-    /// 服务端 WireGuard endpoint（host:port），客户端据此连接。
-    ///
-    /// 若未显式设置 `VPN_ENDPOINT`，则用 `VPN_DOMAIN:vpn_listen_port`（若有域名），
-    /// 否则回退占位 `127.0.0.1:vpn_listen_port`（开发用）。
-    pub vpn_endpoint: String,
-    /// 可选的 Rust 原生 UDP 混淆传输。
-    pub obfs: Option<ObfsConfig>,
     /// 审计日志保留天数（Story 5.3 清理任务）。默认 180。
     pub audit_retention_days: u32,
-    /// WireGuard 后端："noop"（默认，仅记账，无需特权）或 "kernel"（Linux 内核 WireGuard，需 root/CAP_NET_ADMIN + wg 工具）。
-    pub wg_backend: String,
-    /// WireGuard 接口名。默认 `wg0`。
-    pub wg_interface: String,
-    /// 服务端自身网关的网段（CIDR 列表，如所在 Docker 网络），
-    /// 会作为 allowed_routes 下发给客户端，使其经隧道访问这些网段。默认空。
-    pub server_routes: Vec<String>,
     /// 隧道 MTU 环境变量原始值。仅在数据库尚无整组配置时解析并作为一次性种子。
     pub network_settings_seed: NetworkSettingsSeed,
+    /// 非敏感数据面配置的一次性原始种子；只有 v2 数据不存在时才解析。
+    pub data_plane_seed: DataPlaneSettingsSeed,
     /// 事件通知配置（SMTP 邮件）。
     pub notifications: NotificationConfig,
     /// 飞书 OAuth。三项同时存在时启用。
@@ -93,6 +73,42 @@ pub struct NetworkSettingsSeed {
     pub default_mtu: Option<String>,
     pub min_mtu: Option<String>,
     pub max_mtu: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct DataPlaneSettingsSeed {
+    pub vpn_subnet: Option<String>,
+    pub vpn_listen_port: Option<String>,
+    pub vpn_endpoint: Option<String>,
+    pub wg_backend: Option<String>,
+    pub wg_interface: Option<String>,
+    pub obfs_enabled: Option<String>,
+    pub obfs_mode: Option<String>,
+    pub obfs_bind_addr: Option<String>,
+    pub obfs_endpoint: Option<String>,
+    pub obfs_path_mtu: Option<String>,
+    pub server_routes: Option<String>,
+    pub obfs_psk: Option<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for DataPlaneSettingsSeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DataPlaneSettingsSeed")
+            .field("vpn_subnet", &self.vpn_subnet)
+            .field("vpn_listen_port", &self.vpn_listen_port)
+            .field("vpn_endpoint", &self.vpn_endpoint)
+            .field("wg_backend", &self.wg_backend)
+            .field("wg_interface", &self.wg_interface)
+            .field("obfs_enabled", &self.obfs_enabled)
+            .field("obfs_mode", &self.obfs_mode)
+            .field("obfs_bind_addr", &self.obfs_bind_addr)
+            .field("obfs_endpoint", &self.obfs_endpoint)
+            .field("obfs_path_mtu", &self.obfs_path_mtu)
+            .field("server_routes", &self.server_routes)
+            .field("obfs_psk_configured", &self.obfs_psk.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -187,6 +203,40 @@ pub struct NotificationConfig {
 }
 
 impl ServerConfig {
+    /// 将数据库中的非秘密混淆配置与秘密环境变量组合为运行时配置。
+    pub fn obfs_config(
+        &self,
+        settings: &ObfsNetworkSettings,
+    ) -> anyhow::Result<Option<ObfsConfig>> {
+        if !settings.enabled {
+            return Ok(None);
+        }
+        let encoded = self
+            .data_plane_seed
+            .obfs_psk
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("启用 UDP 混淆时必须设置 VPN_OBFS_PSK"))?;
+        let decoded = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .map_err(|_| anyhow::anyhow!("VPN_OBFS_PSK 必须是 32 字节标准 Base64"))?,
+        );
+        let psk: [u8; 32] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("VPN_OBFS_PSK 解码后必须恰好为 32 字节"))?;
+        Ok(Some(ObfsConfig {
+            bind_addr: settings.bind_addr.clone(),
+            public_endpoint: settings.public_endpoint.clone(),
+            mode: settings.mode,
+            path_mtu: settings.path_mtu,
+            psk: Zeroizing::new(psk),
+            max_sessions: 4096,
+            new_sessions_per_ip_per_minute: 20,
+            session_idle_secs: 180,
+        }))
+    }
+
     /// 从环境变量加载配置。
     ///
     /// # Errors
@@ -205,7 +255,6 @@ impl ServerConfig {
             anyhow::bail!("启用 HTTPS (VPN_HTTPS=true) 需要 VPN_DOMAIN 环境变量");
         }
 
-        let vpn_subnet = env::var("VPN_SUBNET").unwrap_or_else(|_| "10.8.0.0/24".to_string());
         let vpn_listen_port = env::var("VPN_LISTEN_PORT")
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
@@ -214,92 +263,36 @@ impl ServerConfig {
             let host = domain.clone().unwrap_or_else(|| "127.0.0.1".to_string());
             format!("{host}:{vpn_listen_port}")
         });
-        let obfs = if env_bool("VPN_OBFS_ENABLED", false) {
-            if !enable_https {
-                anyhow::bail!("启用 UDP 混淆时必须启用 HTTPS，禁止通过 HTTP 下发 PSK");
-            }
-            let encoded = Zeroizing::new(
-                env::var("VPN_OBFS_PSK")
-                    .map_err(|_| anyhow::anyhow!("启用 UDP 混淆时必须设置 VPN_OBFS_PSK"))?,
-            );
-            let decoded = Zeroizing::new(
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded.trim())
-                    .map_err(|_| anyhow::anyhow!("VPN_OBFS_PSK 必须是 32 字节标准 Base64"))?,
-            );
-            let psk: [u8; 32] = decoded
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("VPN_OBFS_PSK 解码后必须恰好为 32 字节"))?;
-            let mode = match env::var("VPN_OBFS_MODE")
-                .unwrap_or_else(|_| "low-overhead-v1".to_string())
-                .as_str()
-            {
-                "low-overhead-v1" => ObfsMode::LowOverheadV1,
-                "paranoid-v1" => ObfsMode::ParanoidV1,
-                other => anyhow::bail!("VPN_OBFS_MODE 不支持: {other}"),
-            };
-            let bind_addr =
-                env::var("VPN_OBFS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:47358".to_string());
-            let parsed_bind: SocketAddr = bind_addr
-                .parse()
-                .map_err(|_| anyhow::anyhow!("VPN_OBFS_BIND_ADDR 必须是 IPv4 socket 地址"))?;
-            if !parsed_bind.is_ipv4() {
-                anyhow::bail!("VPN_OBFS_BIND_ADDR 当前仅支持 IPv4");
-            }
-            let public_endpoint = env::var("VPN_OBFS_ENDPOINT").unwrap_or_else(|_| {
-                let host = domain.as_deref().unwrap_or("127.0.0.1");
-                format!("{host}:47358")
-            });
-            validate_ipv4_endpoint(&public_endpoint)?;
-            let path_mtu = match env::var("VPN_OBFS_PATH_MTU") {
-                Ok(value) => value
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("VPN_OBFS_PATH_MTU 必须是整数"))?,
-                Err(env::VarError::NotPresent) => 1500,
-                Err(error) => return Err(error.into()),
-            };
-            if !(576..=9000).contains(&path_mtu) {
-                anyhow::bail!("VPN_OBFS_PATH_MTU 必须在 576..=9000");
-            }
-            Some(ObfsConfig {
-                bind_addr,
-                public_endpoint,
-                mode,
-                path_mtu,
-                psk: Zeroizing::new(psk),
-                max_sessions: 4096,
-                new_sessions_per_ip_per_minute: 20,
-                session_idle_secs: 180,
-            })
-        } else {
-            None
-        };
-
         let audit_retention_days = env::var("VPN_AUDIT_RETENTION_DAYS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(180);
 
-        let wg_backend = env::var("VPN_WG_BACKEND").unwrap_or_else(|_| "noop".to_string());
-        if obfs.is_some() && wg_backend == "noop" {
-            anyhow::bail!("启用 UDP 混淆时必须配置真实 WireGuard 后端，不能使用 noop");
-        }
-        let wg_interface = env::var("VPN_WG_INTERFACE").unwrap_or_else(|_| "wg0".to_string());
-        let server_routes = env::var("VPN_SERVER_ROUTES")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
         let network_settings_seed = NetworkSettingsSeed {
             mode: env::var("VPN_TUN_MTU_MODE").ok(),
             default_mtu: env::var("VPN_TUN_MTU_DEFAULT").ok(),
             min_mtu: env::var("VPN_TUN_MTU_MIN").ok(),
             max_mtu: env::var("VPN_TUN_MTU_MAX").ok(),
+        };
+        let data_plane_seed = DataPlaneSettingsSeed {
+            vpn_subnet: Some(env::var("VPN_SUBNET").unwrap_or_else(|_| "10.8.0.0/24".into())),
+            vpn_listen_port: Some(env::var("VPN_LISTEN_PORT").unwrap_or_else(|_| "51820".into())),
+            vpn_endpoint: Some(vpn_endpoint.clone()),
+            wg_backend: Some(env::var("VPN_WG_BACKEND").unwrap_or_else(|_| "noop".into())),
+            wg_interface: Some(env::var("VPN_WG_INTERFACE").unwrap_or_else(|_| "wg0".into())),
+            obfs_enabled: Some(env::var("VPN_OBFS_ENABLED").unwrap_or_else(|_| "false".into())),
+            obfs_mode: Some(env::var("VPN_OBFS_MODE").unwrap_or_else(|_| "low-overhead-v1".into())),
+            obfs_bind_addr: Some(
+                env::var("VPN_OBFS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:47358".into()),
+            ),
+            obfs_endpoint: Some(
+                env::var("VPN_OBFS_ENDPOINT").unwrap_or_else(|_| {
+                    format!("{}:47358", domain.as_deref().unwrap_or("127.0.0.1"))
+                }),
+            ),
+            obfs_path_mtu: Some(env::var("VPN_OBFS_PATH_MTU").unwrap_or_else(|_| "1500".into())),
+            server_routes: Some(env::var("VPN_SERVER_ROUTES").unwrap_or_default()),
+            obfs_psk: env::var("VPN_OBFS_PSK").ok().map(Zeroizing::new),
         };
         let notifications = NotificationConfig {
             email_enabled: env_bool("VPN_NOTIFY_EMAIL_ENABLED", false),
@@ -357,9 +350,6 @@ impl ServerConfig {
         if approval_fields.iter().any(|set| *set) && !feishu_approval.enabled() {
             anyhow::bail!("飞书审批配置必须六项同时设置");
         }
-        if feishu_approval.enabled() && wg_backend != "kernel" {
-            anyhow::bail!("飞书审批网络授权首期仅支持 VPN_WG_BACKEND=kernel");
-        }
         if feishu_approval.enabled() && !feishu.enabled() {
             anyhow::bail!(
                 "飞书审批需要同时配置 VPN_FEISHU_APP_ID、VPN_FEISHU_APP_SECRET 与 VPN_FEISHU_REDIRECT_URI"
@@ -391,15 +381,9 @@ impl ServerConfig {
             enable_https,
             domain,
             data_dir,
-            vpn_subnet,
-            vpn_listen_port,
-            vpn_endpoint,
-            obfs,
             audit_retention_days,
-            wg_backend,
-            wg_interface,
-            server_routes,
             network_settings_seed,
+            data_plane_seed,
             notifications,
             feishu,
             feishu_approval_options,
@@ -417,19 +401,6 @@ fn optional_non_blank(value: Option<String>) -> Option<String> {
 fn validate_approval_options_token(token: Option<&str>) -> anyhow::Result<()> {
     if token.is_some_and(|token| token.len() < 32) {
         anyhow::bail!("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN 至少需要 32 个字符");
-    }
-    Ok(())
-}
-
-fn validate_ipv4_endpoint(endpoint: &str) -> anyhow::Result<()> {
-    let (host, port) = endpoint
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("VPN_OBFS_ENDPOINT 必须是 host:port"))?;
-    if host.is_empty()
-        || host.contains(':')
-        || port.parse::<u16>().ok().filter(|p| *p > 0).is_none()
-    {
-        anyhow::bail!("VPN_OBFS_ENDPOINT 必须是有效的 IPv4/域名 host:port");
     }
     Ok(())
 }
@@ -471,12 +442,21 @@ mod tests {
         let cfg = ServerConfig::from_env().unwrap();
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");
         assert!(!cfg.enable_https);
-        assert_eq!(cfg.vpn_subnet, "10.8.0.0/24");
-        assert_eq!(cfg.vpn_listen_port, 51820);
-        assert_eq!(cfg.vpn_endpoint, "127.0.0.1:51820");
+        assert_eq!(
+            cfg.data_plane_seed.vpn_subnet.as_deref(),
+            Some("10.8.0.0/24")
+        );
+        assert_eq!(
+            cfg.data_plane_seed.vpn_listen_port.as_deref(),
+            Some("51820")
+        );
+        assert_eq!(
+            cfg.data_plane_seed.vpn_endpoint.as_deref(),
+            Some("127.0.0.1:51820")
+        );
         assert_eq!(cfg.audit_retention_days, 180);
-        assert_eq!(cfg.wg_backend, "noop");
-        assert_eq!(cfg.wg_interface, "wg0");
+        assert_eq!(cfg.data_plane_seed.wg_backend.as_deref(), Some("noop"));
+        assert_eq!(cfg.data_plane_seed.wg_interface.as_deref(), Some("wg0"));
         assert!(cfg.feishu_approval_options.token.is_none());
     }
 

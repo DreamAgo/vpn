@@ -4,15 +4,18 @@ use axum::extract::{rejection::JsonRejection, Query};
 use axum::{extract::State, Json};
 use vpn_api_types::{
     system::{
-        EmailNotificationSettings, NetworkSettings, NotificationEventQuery, NotificationEventView,
-        SystemInfo, TestEmailNotificationRequest, UpdateEmailNotificationSettingsRequest,
-        UpdateNetworkSettingsRequest, UpdateServerRoutesRequest,
+        EmailNotificationSettings, NetworkSettingsView, NotificationEventQuery,
+        NotificationEventView, SystemInfo, TestEmailNotificationRequest,
+        UpdateEmailNotificationSettingsRequest, UpdateNetworkSettingsRequest,
+        UpdateServerRoutesRequest,
     },
     ApiResponse,
 };
 use vpn_core::AppError;
 
-use crate::{auth::RequireAdmin, error::ApiError, state::AppState};
+use crate::{
+    auth::RequireAdmin, error::ApiError, services::peer_service::route_policy_lock, state::AppState,
+};
 
 #[tracing::instrument(skip(state))]
 pub async fn system_info(
@@ -47,8 +50,11 @@ pub async fn system_info(
 pub async fn network_settings(
     State(state): State<AppState>,
     RequireAdmin(_): RequireAdmin,
-) -> Result<Json<ApiResponse<NetworkSettings>>, ApiError> {
-    let settings = state.network_settings_service()?.settings().await;
+) -> Result<Json<ApiResponse<NetworkSettingsView>>, ApiError> {
+    let lock = route_policy_lock();
+    let _guard = lock.lock().await;
+    let service = state.network_settings_service()?;
+    let settings = service.view(service.server_routes().await?).await;
     Ok(Json(ApiResponse::success(
         settings,
         "n/a".to_string(),
@@ -62,13 +68,20 @@ pub async fn update_network_settings(
     State(state): State<AppState>,
     RequireAdmin(_): RequireAdmin,
     body: Result<Json<UpdateNetworkSettingsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<NetworkSettings>>, ApiError> {
+) -> Result<Json<ApiResponse<NetworkSettingsView>>, ApiError> {
     let Json(body) =
         body.map_err(|error| AppError::Validation(format!("网络参数请求格式非法：{error}")))?;
-    let settings = state
-        .network_settings_service()?
-        .update(body.into())
+    let service = state.network_settings_service()?;
+    let lock = route_policy_lock();
+    let _guard = lock.lock().await;
+    let routes = service
+        .update_locked(body.desired, &body.server_routes)
         .await?;
+    if let Some(peer_service) = &state.peer_service {
+        peer_service.apply_server_routes(routes.clone()).await;
+    }
+    state.refresh_network_acl().await?;
+    let settings = service.view(routes).await;
     Ok(Json(ApiResponse::success(
         settings,
         "n/a".to_string(),

@@ -61,7 +61,7 @@ sudo VPN_HTTPS=true VPN_DOMAIN=vpn.example.com \
 2. 重启服务——启动时自动执行数据库 migration、加载已有 WireGuard 服务端密钥、从 `peers` 表恢复节点。
 3. 数据卷保持不变即可平滑升级。
 
-升级到支持网络设置的版本后，服务端会在数据库无 `network_settings_v1` 时，把 `VPN_TUN_MTU_MODE/DEFAULT/MIN/MAX` 作为一次性初始值写入。之后请在管理后台“网络设置”页面调整；修改环境变量不会覆盖已保存值。页面保存的策略在客户端下一次连接或重连时生效，不会中断当前在线节点。
+升级后服务端会把旧 `network_settings_v1` MTU 迁移到聚合的 `network_settings_v2`，并仅在 v2 不存在时用数据面环境变量初始化基础 VPN、混淆和 MTU。之后请在管理后台“网络设置”页面调整；非秘密环境变量不会覆盖已保存值。基础 VPN/混淆修改需由管理员自行重启，LAN 路由热更新，MTU 在客户端下一次连接或重连时生效。混淆 PSK 仍只由 `VPN_OBFS_PSK` 提供。
 
 ## 健康检查
 
@@ -70,6 +70,6 @@ sudo VPN_HTTPS=true VPN_DOMAIN=vpn.example.com \
 ## 故障排查
 
 - 看日志：`docker compose logs -f` 或 `journalctl -u vpn-server`。
-- 客户端连不上：依次检查 UDP 47358 是否放行、`VPN_OBFS_ENDPOINT` 是否为客户端可达的公网地址、两端时钟偏差及节点在后台是否 `online`。
+- 客户端连不上：依次检查 UDP 47358 是否放行、“网络设置”中的混淆公网 Endpoint 是否为客户端可达地址、两端时钟偏差及节点在后台是否 `online`。v2 已初始化后修改 `VPN_OBFS_ENDPOINT` 不会覆盖后台保存值。
 - 证书申请失败：确认域名解析正确且 80 端口可达。
 - 真实隧道相关限制见 [REAL-HARDWARE-CHECKLIST.md](REAL-HARDWARE-CHECKLIST.md)。

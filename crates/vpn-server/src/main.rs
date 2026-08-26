@@ -57,11 +57,33 @@ async fn main() -> anyhow::Result<()> {
         .context("数据库 migration 失败")?;
     tracing::info!("数据库 migration 完成");
 
-    let subnet: ipnet::Ipv4Net = config
+    let peer_repo = SqlitePeerRepository::new(pool.clone());
+    let config_repo = SqliteSystemConfigRepository::new(pool.clone());
+    let config_service = Arc::new(ConfigService::new(config_repo.clone()));
+    let network_settings_service = Arc::new(
+        NetworkSettingsService::load_or_seed(
+            config_repo.clone(),
+            peer_repo.clone(),
+            &config.data_plane_seed,
+            &config.network_settings_seed,
+            config.enable_https,
+            config.feishu_approval.enabled(),
+        )
+        .await
+        .context("初始化网络参数失败")?,
+    );
+    let applied_network = network_settings_service.applied().clone();
+    let subnet: ipnet::Ipv4Net = applied_network
+        .vpn
         .vpn_subnet
         .parse()
-        .with_context(|| format!("VPN_SUBNET 非法 CIDR：{}", config.vpn_subnet))?;
-    let peer_repo = SqlitePeerRepository::new(pool.clone());
+        .with_context(|| format!("vpn_subnet 非法 CIDR：{}", applied_network.vpn.vpn_subnet))?;
+    let obfs = config
+        .obfs_config(&applied_network.obfs)
+        .context("装配 UDP 混淆配置失败")?;
+    if config.feishu_approval.enabled() && applied_network.vpn.wg_backend != "kernel" {
+        anyhow::bail!("飞书审批网络授权首期仅支持 wg_backend=kernel");
+    }
 
     // 初始化业务服务
     let user_repo = SqliteUserRepository::new(pool.clone());
@@ -137,21 +159,11 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Epic 4：装配 PeerService（load-or-generate 服务端 WG 密钥 + IpPool 回填 + Noop control）
-    let config_repo = SqliteSystemConfigRepository::new(pool.clone());
-    let config_service = Arc::new(ConfigService::new(config_repo.clone()));
-    let network_settings_service = Arc::new(
-        NetworkSettingsService::load_or_seed(
-            config_repo.clone(),
-            &config.network_settings_seed,
-            config.obfs.as_ref(),
-        )
-        .await
-        .context("初始化网络参数失败")?,
-    );
     const APPROVAL_ACL_MARKER: &str = "feishu_approval_acl_installed";
     if config.feishu_approval.enabled() {
         // WireGuard 接口恢复已有 peer 前先安装最小 drop ACL，关闭重启期间的数据面窗口。
-        let bootstrap_acl = vpn_wireguard::NftAclController::new(&config.wg_interface, subnet)?;
+        let bootstrap_acl =
+            vpn_wireguard::NftAclController::new(&applied_network.vpn.wg_interface, subnet)?;
         bootstrap_acl.verify_available().await?;
         // 先持久化清理义务，再触碰内核状态；即使后续安装或启动失败，下次关闭功能
         // 也不会把可能残留的 final-drop 误判为“无需清理”。
@@ -163,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // 标记表明本服务确实安装过 ACL；此时缺少 nft CLI 不能被当作“无需清理”。
         if config_repo.get(APPROVAL_ACL_MARKER).await?.as_deref() == Some("1") {
-            let cleanup_probe = vpn_wireguard::NftAclController::new(&config.wg_interface, subnet)?;
+            let cleanup_probe =
+                vpn_wireguard::NftAclController::new(&applied_network.vpn.wg_interface, subnet)?;
             cleanup_probe
                 .verify_available()
                 .await
@@ -179,26 +192,30 @@ async fn main() -> anyhow::Result<()> {
             peer_repo,
             &config_repo,
             subnet,
-            config.vpn_endpoint.clone(),
-            &config.wg_backend,
-            &config.wg_interface,
-            config.vpn_listen_port,
-            config.server_routes.clone(),
+            applied_network.vpn.vpn_endpoint.clone(),
+            &applied_network.vpn.wg_backend,
+            &applied_network.vpn.wg_interface,
+            applied_network.vpn.vpn_listen_port,
+            network_settings_service
+                .server_routes()
+                .await
+                .context("加载服务端 LAN 路由失败")?,
         )
         .await
         .context("装配 PeerService 失败")?
-        .with_obfs_transport(config.obfs.as_ref())
-        .with_network_settings(network_settings_service.shared_settings()),
+        .with_obfs_transport(obfs.as_ref())
+        .with_network_settings(network_settings_service.shared_settings())
+        .with_registration_gate(network_settings_service.registration_gate()),
     );
     tracing::info!(
         server_public_key = %peer_service.server_public_key_string(),
-        endpoint = %config.vpn_endpoint,
-        subnet = %config.vpn_subnet,
+        endpoint = %applied_network.vpn.vpn_endpoint,
+        subnet = %applied_network.vpn.vpn_subnet,
         "服务端 WireGuard 状态已就绪"
     );
-    let obfs_proxy = if let Some(obfs) = config.obfs.clone() {
+    let obfs_proxy = if let Some(obfs) = obfs.clone() {
         Some(
-            vpn_server::udp_obfs::UdpObfsServer::bind(obfs, config.vpn_listen_port)
+            vpn_server::udp_obfs::UdpObfsServer::bind(obfs, applied_network.vpn.vpn_listen_port)
                 .await
                 .context("初始化 UDP 混淆代理失败")?,
         )
@@ -209,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
         let service = Arc::new(NetworkAclService::new(
             pool.clone(),
             peer_service.clone(),
-            &config.wg_interface,
+            &applied_network.vpn.wg_interface,
             subnet,
         )?);
         service
