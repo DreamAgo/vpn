@@ -255,7 +255,7 @@ fn current_platform() -> Result<DnsPlatform> {
 
 #[cfg(unix)]
 fn interface_name(ifindex: u32) -> Result<String> {
-    let mut buffer = [0_i8; libc::IF_NAMESIZE];
+    let mut buffer = [0 as libc::c_char; libc::IF_NAMESIZE];
     let pointer = unsafe { libc::if_indextoname(ifindex, buffer.as_mut_ptr()) };
     if pointer.is_null() {
         return Err(std::io::Error::last_os_error().into());
