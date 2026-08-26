@@ -89,6 +89,15 @@ export interface NetworkSettings {
 }
 
 export type ObfsMode = 'low-overhead-v1' | 'paranoid-v1';
+export type ClientDnsMode = 'disabled' | 'global' | 'split';
+
+export interface DnsNetworkSettings {
+  mode: ClientDnsMode;
+  splitDomains: string[];
+  defaultUpstreams: string[];
+  forwardRules: Array<{ domain: string; upstreams: string[] }>;
+  staticRecords: Array<{ name: string; address: string; ttl: number }>;
+}
 
 export interface DataPlaneSettings {
   vpn: {
@@ -106,6 +115,7 @@ export interface DataPlaneSettings {
     pathMtu: number;
   };
   mtu: NetworkSettings;
+  dns: DnsNetworkSettings;
 }
 
 export interface NetworkSettingsView {

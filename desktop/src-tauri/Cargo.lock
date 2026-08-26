@@ -5874,8 +5874,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpn-api-types"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
+ "ipnet",
  "serde",
  "serde_json",
  "zeroize",
@@ -5883,7 +5884,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-cli"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5891,6 +5892,7 @@ dependencies = [
  "boringtun",
  "chrono",
  "clap",
+ "ipnet",
  "net-route",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -5913,7 +5915,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5925,7 +5927,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-desktop"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
@@ -5951,7 +5953,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-obfs"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes",
  "chacha20poly1305",
@@ -5964,23 +5966,25 @@ dependencies = [
 
 [[package]]
 name = "vpn-platform"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "dirs 6.0.0",
  "keyring",
+ "libc",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tun-rs",
+ "vpn-api-types",
  "xsalsa20poly1305",
 ]
 
 [[package]]
 name = "vpn-wireguard"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

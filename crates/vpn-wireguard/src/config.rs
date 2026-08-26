@@ -48,11 +48,16 @@ pub fn render_client_config(
     } else {
         allowed_ips.join(", ")
     };
+    let dns_line = if dns.is_empty() {
+        String::new()
+    } else {
+        format!("DNS = {dns}\n")
+    };
     format!(
         "[Interface]\n\
          PrivateKey = {client_private_key}\n\
          Address = {client_vpn_ip}/{subnet_prefix_len}\n\
-         DNS = {dns}\n\
+         {dns_line}\
          \n\
          [Peer]\n\
          PublicKey = {server_public_key}\n\

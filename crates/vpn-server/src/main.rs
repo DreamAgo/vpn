@@ -205,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
         .context("装配 PeerService 失败")?
         .with_obfs_transport(obfs.as_ref())
         .with_network_settings(network_settings_service.shared_settings())
+        .with_dns_settings(network_settings_service.shared_dns_settings())
         .with_registration_gate(network_settings_service.registration_gate()),
     );
     tracing::info!(
@@ -222,6 +223,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let dns_server = vpn_server::dns_service::DnsServer::new(
+        subnet,
+        network_settings_service.shared_dns_settings(),
+    )?;
+    tracing::info!(gateway = %dns_server.gateway(), "VPN DNS 仅绑定隧道网关地址");
     let network_acl_service = if config.feishu_approval.enabled() {
         let service = Arc::new(NetworkAclService::new(
             pool.clone(),
@@ -319,12 +325,19 @@ async fn main() -> anyhow::Result<()> {
             result = proxy.run() => {
                 result.context("UDP 混淆代理运行失败")?;
             }
+            result = dns_server.run() => {
+                result.context("VPN 内置 DNS 运行失败")?;
+            }
         }
     } else {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .context("HTTP 服务运行失败")?;
+        tokio::select! {
+            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+                result.context("HTTP 服务运行失败")?;
+            }
+            result = dns_server.run() => {
+                result.context("VPN 内置 DNS 运行失败")?;
+            }
+        }
     }
 
     tracing::info!("vpn-server stopped");

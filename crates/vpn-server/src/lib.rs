@@ -5,6 +5,7 @@
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod dns_service;
 pub mod error;
 pub mod handlers;
 pub mod middleware;

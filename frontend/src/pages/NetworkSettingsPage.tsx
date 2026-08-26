@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { Alert, App, Button, Card, Col, Form, Input, InputNumber, Radio, Row, Select, Space, Switch, Typography } from 'antd';
-import { SaveOutlined } from '@ant-design/icons';
+import { DeleteOutlined, PlusOutlined, SaveOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { systemApi } from '@/services/auth';
@@ -28,6 +28,7 @@ export function NetworkSettingsPage() {
   const [form] = Form.useForm<UpdateNetworkSettingsRequest>();
   const mode = Form.useWatch(['desired', 'mtu', 'mode'], form);
   const obfsEnabled = Form.useWatch(['desired', 'obfs', 'enabled'], form);
+  const dnsMode = Form.useWatch(['desired', 'dns', 'mode'], form);
   const editVersion = useRef(0);
   const hydratedVersion = useRef(0);
   const hydrated = useRef(false);
@@ -64,6 +65,8 @@ export function NetworkSettingsPage() {
     mutation.mutate({ request, version: editVersion.current });
   };
   const endpointRule = { pattern: /^[^:\s]+:\d+$/, message: '请输入 host:port' };
+  const dnsUpstreamRule = { pattern: /^(?:\d{1,3}\.){3}\d{1,3}:53$/, message: '请输入 IPv4:53，例如 223.5.5.5:53' };
+  const domainRule = { pattern: /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$/, message: '请输入完整域名，不支持通配符' };
   const restartChanges = data ? changedRestartFields(data.applied, data.desired) : [];
 
   return <div>
@@ -74,7 +77,7 @@ export function NetworkSettingsPage() {
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {isError && <Alert showIcon type="error" message="网络参数加载失败" description={error instanceof Error ? error.message : '请稍后重试'} action={<Button onClick={() => void refetch()}>重试</Button>} />}
       {data?.restartRequired && <Alert showIcon type="warning" message="存在待重启配置" description={`待生效：${restartChanges.join('、')}。服务不会自动重启或断开节点；若包含虚拟子网，重启前暂停节点注册。`} />}
-      <Alert showIcon type="info" message="生效方式" description="基础 VPN 与混淆配置重启后生效；LAN 路由立即热更新；MTU 对新连接或重连生效。环境变量只用于首次初始化。" />
+      <Alert showIcon type="info" message="生效方式" description="基础 VPN 与混淆配置重启后生效；LAN 路由和 DNS 转发规则立即热更新；客户端 DNS 在新连接或重连时应用。环境变量只用于首次初始化。" />
       <Form form={form} layout="vertical" disabled={!data || isError || mutation.isPending} onValuesChange={() => { editVersion.current += 1; }}>
         <Card title="基础 VPN" loading={isLoading}>
           <Row gutter={16}>
@@ -101,6 +104,48 @@ export function NetworkSettingsPage() {
         <Card title="LAN 路由" style={{ marginTop: 16 }}>
           <Form.Item name="serverRoutes" label="CIDR 列表" rules={[{ validator: (_, routes: string[] = []) => routes.every((route) => isValidCidr(route) && route !== '0.0.0.0/0') ? Promise.resolve() : Promise.reject(new Error('请输入合法 IPv4 CIDR，且不能使用 0.0.0.0/0')) }]}><Select mode="tags" tokenSeparators={[',']} placeholder="192.168.0.0/16" /></Form.Item>
           <Paragraph type="secondary">允许使用 10.0.0.0/8 等覆盖 VPN 子网的宽泛 LAN/组路由；禁止默认路由。</Paragraph>
+        </Card>
+
+        <Card title="内置 DNS" style={{ marginTop: 16 }}>
+          <Form.Item name={['desired','dns','mode']} label="客户端 DNS 策略" rules={[{ required: true }]}>
+            <Radio.Group optionType="button">
+              <Radio.Button value="disabled">关闭</Radio.Button>
+              <Radio.Button value="global">全局</Radio.Button>
+              <Radio.Button value="split">分流</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+          <Paragraph type="secondary">DNS 仅监听 VPN 网关的 UDP/TCP 53，不发布公网端口。客户端断开时恢复原 DNS。</Paragraph>
+          <Form.Item name={['desired','dns','defaultUpstreams']} label="默认上游" rules={dnsMode === 'disabled' ? [] : [{ required: true, message: '启用 DNS 时至少配置一个默认上游' }, { validator: (_, values: string[] = []) => values.every((value) => dnsUpstreamRule.pattern.test(value)) ? Promise.resolve() : Promise.reject(new Error(dnsUpstreamRule.message)) }]}>
+            <Select mode="tags" tokenSeparators={[',']} placeholder="223.5.5.5:53" />
+          </Form.Item>
+          {dnsMode === 'split' && <Form.Item name={['desired','dns','splitDomains']} label="客户端分流域名" rules={[{ required: true, message: '分流模式至少配置一个域名' }, { validator: (_, values: string[] = []) => values.every((value) => domainRule.pattern.test(value)) ? Promise.resolve() : Promise.reject(new Error(domainRule.message)) }]}>
+            <Select mode="tags" tokenSeparators={[',']} placeholder="corp.example.com" />
+          </Form.Item>}
+
+          <Title level={5}>按域名选择上游</Title>
+          <Form.List name={['desired','dns','forwardRules']}>
+            {(fields, { add, remove }) => <Space direction="vertical" style={{ width: '100%' }}>
+              {fields.map(({ key, name: fieldName }) => <Row gutter={12} key={key} align="top">
+                <Col xs={24} md={9}><Form.Item name={[fieldName,'domain']} rules={[{ required: true }, domainRule]}><Input placeholder="internal.example.com" /></Form.Item></Col>
+                <Col xs={21} md={13}><Form.Item name={[fieldName,'upstreams']} rules={[{ required: true }, { validator: (_, values: string[] = []) => values.every((value) => dnsUpstreamRule.pattern.test(value)) ? Promise.resolve() : Promise.reject(new Error(dnsUpstreamRule.message)) }]}><Select mode="tags" tokenSeparators={[',']} placeholder="10.0.0.53:53" /></Form.Item></Col>
+                <Col xs={3} md={2}><Button danger type="text" aria-label="删除转发规则" icon={<DeleteOutlined />} onClick={() => remove(fieldName)} /></Col>
+              </Row>)}
+              <Button icon={<PlusOutlined />} onClick={() => add({ domain: '', upstreams: [] })}>添加转发规则</Button>
+            </Space>}
+          </Form.List>
+
+          <Title level={5} style={{ marginTop: 24 }}>静态 A 记录</Title>
+          <Form.List name={['desired','dns','staticRecords']}>
+            {(fields, { add, remove }) => <Space direction="vertical" style={{ width: '100%' }}>
+              {fields.map(({ key, name: fieldName }) => <Row gutter={12} key={key} align="top">
+                <Col xs={24} md={9}><Form.Item name={[fieldName,'name']} rules={[{ required: true }, domainRule]}><Input placeholder="service.internal.example.com" /></Form.Item></Col>
+                <Col xs={14} md={8}><Form.Item name={[fieldName,'address']} rules={[{ required: true }, { pattern: /^(?:\d{1,3}\.){3}\d{1,3}$/, message: '请输入 IPv4 地址' }]}><Input placeholder="10.0.0.10" /></Form.Item></Col>
+                <Col xs={7} md={5}><Form.Item name={[fieldName,'ttl']} rules={[{ required: true }]}><InputNumber min={30} max={86400} precision={0} style={{ width: '100%' }} placeholder="300" /></Form.Item></Col>
+                <Col xs={3} md={2}><Button danger type="text" aria-label="删除静态记录" icon={<DeleteOutlined />} onClick={() => remove(fieldName)} /></Col>
+              </Row>)}
+              <Button icon={<PlusOutlined />} onClick={() => add({ name: '', address: '', ttl: 300 })}>添加静态 A 记录</Button>
+            </Space>}
+          </Form.List>
         </Card>
 
         <Card title="隧道 MTU" style={{ marginTop: 16 }}>

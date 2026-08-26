@@ -26,7 +26,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::Instrument;
 use tun::AbstractDevice;
-use vpn_api_types::peer::ObfsMode;
+use vpn_api_types::peer::{ClientDnsSettings, ObfsMode};
 use vpn_api_types::system::{obfs_transport_safe_mtu, NetworkMtuMode, NetworkSettings};
 use vpn_obfs::{Codec, Direction, Mode, ReplayCache};
 use zeroize::Zeroizing;
@@ -242,6 +242,7 @@ impl UserspaceTunnel {
         server_endpoint: &str,
         transport: Option<&TunnelTransport>,
         network_settings: &NetworkSettings,
+        dns_settings: Option<&ClientDnsSettings>,
         vpn_ip: Ipv4Addr,
         subnet_prefix: u8,
         allowed_routes: &[String],
@@ -467,6 +468,30 @@ impl UserspaceTunnel {
             "VPN 路由应用完成"
         );
 
+        // DNS 必须在连接被标记为 ready 前完成；失败时先撤销已添加路由，再返回错误。
+        let dns_session = if let Some(settings) = dns_settings {
+            tracing::info!(stage = "dns_apply", result = "started", ?settings.mode, "开始应用客户端 DNS");
+            match vpn_platform::apply_dns(ifindex, settings).await {
+                Ok(session) => session,
+                Err(error) => {
+                    for (_, route) in &added {
+                        let _ = handle.delete(route).await;
+                    }
+                    tracing::warn!(stage = "dns_apply", result = "failed", error = %error, "应用客户端 DNS 失败，连接已回滚");
+                    return Err(CliError::Other(format!("应用客户端 DNS 失败：{error}")));
+                }
+            }
+        } else {
+            if let Err(error) = vpn_platform::cleanup_stale_dns(ifindex).await {
+                for (_, route) in &added {
+                    let _ = handle.delete(route).await;
+                }
+                tracing::warn!(stage = "dns_cleanup", result = "failed", error = %error, "清理上次遗留的客户端 DNS 失败，连接已回滚");
+                return Err(CliError::Other(format!("清理遗留客户端 DNS 失败：{error}")));
+            }
+            None
+        };
+
         tracing::info!(
             stage = "data_plane_ready",
             result = if route_result == "succeeded" { "succeeded" } else { "degraded" },
@@ -491,6 +516,7 @@ impl UserspaceTunnel {
                 traffic,
                 routes_rx,
                 obfs,
+                dns_session,
                 usize::from(mtu) + usize::from(WG_OVERHEAD) + 64,
             )
             .instrument(tracing::Span::current()),
@@ -513,6 +539,7 @@ async fn forward_loop(
     traffic: Option<SharedState>,
     mut routes_rx: Option<watch::Receiver<Vec<String>>>,
     mut obfs: Option<ObfsRuntime>,
+    mut dns_session: Option<vpn_platform::DnsSession>,
     packet_buffer_size: usize,
 ) -> CliResult<()> {
     let loop_started = std::time::Instant::now();
@@ -743,8 +770,14 @@ async fn forward_loop(
         }
     }
 
-    // 清理：删除本任务加的路由（TUN 设备随 device drop 关闭）。
+    // 清理：先恢复 DNS，再删除本任务加的路由（TUN 设备随 device drop 关闭）。
     let mut cleanup_failures = 0;
+    if let Some(session) = dns_session.as_mut() {
+        if let Err(error) = session.restore().await {
+            cleanup_failures += 1;
+            tracing::warn!(stage = "dns_restore", result = "failed", error = %error, "恢复客户端 DNS 失败");
+        }
+    }
     for (cidr, route) in &added_routes {
         if let Err(error) = handle.delete(route).await {
             cleanup_failures += 1;
@@ -769,7 +802,7 @@ async fn forward_loop(
         // 清理结果比运行期错误更关键：上层需要据此决定是否
         // fail-closed 阻止重连。即使运行期也出过错，仍要返回专用清理错误。
         return Err(CliError::Cleanup(format!(
-            "VPN 路由清理失败: {cleanup_failures} 条"
+            "VPN 路由或 DNS 清理失败: {cleanup_failures} 项"
         )));
     }
     outcome

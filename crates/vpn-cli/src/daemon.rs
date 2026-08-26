@@ -176,6 +176,8 @@ pub struct TunnelParams {
     pub transport: Option<TunnelTransport>,
     /// 服务端下发的隧道 MTU 策略；旧服务端缺省时使用兼容默认值。
     pub network_settings: NetworkSettings,
+    /// 服务端下发的可选 DNS 策略。
+    pub dns: Option<vpn_api_types::peer::ClientDnsSettings>,
 }
 
 /// 已验证并以可清零内存保存的客户端混淆配置。
@@ -332,6 +334,31 @@ pub async fn connect_once(
     network_settings
         .validate()
         .map_err(|error| CliError::Invalid(format!("服务端下发的网络参数非法：{error}")))?;
+    if let Some(dns) = &resp.dns {
+        let subnet: ipnet::Ipv4Net = resp
+            .vpn_subnet
+            .parse()
+            .map_err(|_| CliError::Invalid("服务端下发的 VPN 子网非法".to_string()))?;
+        let server: std::net::Ipv4Addr = dns
+            .server
+            .parse()
+            .map_err(|_| CliError::Invalid("服务端下发的 DNS 地址非法".to_string()))?;
+        if subnet.hosts().next() != Some(server) {
+            return Err(CliError::Invalid(
+                "服务端下发的 DNS 地址不是 VPN 网关".to_string(),
+            ));
+        }
+        if dns.mode == vpn_api_types::system::ClientDnsMode::Split && dns.domains.is_empty() {
+            return Err(CliError::Invalid(
+                "服务端下发的分流 DNS 缺少域名".to_string(),
+            ));
+        }
+        for domain in &dns.domains {
+            vpn_api_types::system::normalize_dns_domain(domain).map_err(|error| {
+                CliError::Invalid(format!("服务端下发的 DNS 域名非法：{error}"))
+            })?;
+        }
+    }
 
     tracing::info!(
         stage = "control_plane",
@@ -349,6 +376,7 @@ pub async fn connect_once(
         allowed_routes: resp.allowed_routes.clone(),
         transport,
         network_settings,
+        dns: resp.dns,
     })
 }
 
@@ -387,6 +415,7 @@ pub async fn bring_up_tunnel(
         &params.server_endpoint,
         params.transport.as_ref(),
         &params.network_settings,
+        params.dns.as_ref(),
         vpn_ip,
         prefix,
         &allowed,
@@ -953,6 +982,7 @@ mod tests {
             allowed_routes: allowed,
             transport: None,
             network_settings: NetworkSettings::default(),
+            dns: None,
         }
     }
 

@@ -11,7 +11,7 @@
 | `VPN_HTTPS` | `false` | `true`/`1` 启用自动 HTTPS（ACME）。启用时**必须**设置 `VPN_DOMAIN`。 |
 | `VPN_DOMAIN` | （无） | 公网域名，用于 ACME 证书申请。`VPN_HTTPS=true` 时必填。 |
 | `VPN_DATA_DIR` | `./data` | 数据目录：JWT 私钥、ACME 证书缓存等。生产建议持久化卷。 |
-| `VPN_SUBNET` | `10.8.0.0/24` | VPN 虚拟子网（CIDR）。仅在数据库无 `network_settings_v2` 时作为一次性种子。`.1` 预留给服务端，`.2` 起分配给节点。 |
+| `VPN_SUBNET` | `10.8.0.0/24` | VPN 虚拟子网（CIDR）。仅在数据库无 `network_settings_v3` 时作为一次性种子。`.1` 预留给服务端（含内置 DNS），`.2` 起分配给节点。 |
 | `VPN_LISTEN_PORT` | `51820` | WireGuard UDP 监听端口。 |
 | `VPN_ENDPOINT` | `<VPN_DOMAIN 或 127.0.0.1>:<VPN_LISTEN_PORT>` | 客户端连接服务端用的 `host:port`。多数情况留空由域名推导即可。 |
 | `VPN_OBFS_ENABLED` | `false` | 启用并强制使用 `obfs-v1` UDP 混淆；要求 HTTPS。 |
@@ -20,12 +20,17 @@
 | `VPN_OBFS_BIND_ADDR` | `0.0.0.0:47358` | 混淆公网监听地址。 |
 | `VPN_OBFS_ENDPOINT` | `<VPN_DOMAIN>:47358` | 首次初始化时下发给客户端的混淆 endpoint；之后在“网络设置”修改。 |
 | `VPN_OBFS_PATH_MTU` | `1500` | 外层路径 MTU（576–9000）。 |
-| `VPN_TUN_MTU_MODE` | `fixed` | 首次初始化隧道 MTU 模式：`fixed` / `auto`。数据库已有 `network_settings_v2` 后忽略。 |
+| `VPN_TUN_MTU_MODE` | `fixed` | 首次初始化隧道 MTU 模式：`fixed` / `auto`。数据库已有 `network_settings_v3` 后忽略。 |
 | `VPN_TUN_MTU_DEFAULT` | `1360` | 首次初始化默认 MTU。 |
 | `VPN_TUN_MTU_MIN` | `1280` | 首次初始化自动模式下限。 |
 | `VPN_TUN_MTU_MAX` | `1420` | 首次初始化自动模式上限。 |
 | `VPN_WG_BACKEND` | `noop` | WireGuard 数据平面后端：`kernel` / `userspace` / `auto` / `noop`。**生产必须显式设置**（默认 `noop` 不建真实隧道）。详见下节。 |
 | `VPN_WG_INTERFACE` | `wg0` | 首次初始化 WireGuard 接口名；之后在“网络设置”修改并重启生效。 |
+| `VPN_DNS_MODE` | `disabled` | 首次初始化客户端 DNS 策略：`disabled` / `global` / `split`。 |
+| `VPN_DNS_DEFAULT_UPSTREAMS` | （空） | 首次初始化默认上游，逗号分隔 IPv4:53，如 `223.5.5.5:53,1.1.1.1:53`。 |
+| `VPN_DNS_SPLIT_DOMAINS` | （空） | 首次初始化客户端分流域名，逗号分隔。 |
+| `VPN_DNS_FORWARD_RULES` | `[]` | 首次初始化后缀转发规则 JSON 数组，如 `[{"domain":"corp.example.com","upstreams":["10.0.0.53:53"]}]`。 |
+| `VPN_DNS_STATIC_RECORDS` | `[]` | 首次初始化静态 A 记录 JSON 数组，如 `[{"name":"api.corp.example.com","address":"10.0.0.10","ttl":300}]`。 |
 | `VPN_AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期由后台任务自动清理。 |
 | `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` | （无） | 飞书审批“关联外部选项”请求校验 token。至少 32 个字符；应使用独立高熵随机值。 |
 | `VPN_FEISHU_APPROVAL_CODE` | （无） | 只接受该审批定义 Code 的网络授权审批。与下列五项全部配置时启用审批 webhook。 |
@@ -44,12 +49,14 @@
 - `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` 少于 32 个字符时启动失败。
 - 飞书审批配置只设置一部分时启动失败；启用审批时还必须完整配置飞书 App ID、App Secret 和 HTTPS Redirect URI，确保审批创建的账号可以通过飞书登录；Verification Token 少于 16 字符或 Encrypt Key 少于 16 字符时启动失败。
 - 启用飞书审批网络授权时会强制探测 `nft` 并在恢复 kernel peer 前安装 ACL；缺少 `nftables`、权限不足或规则失败时拒绝启动，不会退化为仅下发客户端路由。未启用审批的既有 kernel 部署保持原行为。
-- 数据库尚无 v2 网络参数时，服务会迁移已有 `network_settings_v1` MTU，并将 `VPN_SUBNET`、`VPN_LISTEN_PORT`、`VPN_ENDPOINT`、`VPN_WG_BACKEND`、`VPN_WG_INTERFACE`、`VPN_OBFS_*` 与 MTU 环境变量作为一次性种子。整组 JSON 落库后，非秘密环境变量变化不会覆盖后台配置；存量 JSON 损坏时拒绝启动，不会静默回退。`VPN_OBFS_PSK` 始终只从秘密环境变量读取，API 不返回其内容。
+- 数据库尚无 v3 网络参数时，服务会迁移已有 `network_settings_v2`（再向前兼容 v1 MTU），并将 `VPN_SUBNET`、`VPN_LISTEN_PORT`、`VPN_ENDPOINT`、`VPN_WG_BACKEND`、`VPN_WG_INTERFACE`、`VPN_OBFS_*`、`VPN_DNS_*` 与 MTU 环境变量作为一次性种子。整组 JSON 落库后，非秘密环境变量变化不会覆盖后台配置；存量 JSON 损坏时拒绝启动，不会静默回退。`VPN_OBFS_PSK` 始终只从秘密环境变量读取，API 不返回其内容。
 - 启用混淆传输时还会按 `VPN_OBFS_MODE` 与 `VPN_OBFS_PATH_MTU` 计算安全内层上限：`fixed` 的默认值、`auto` 的最小值不得超过该上限。路径连 1280 都无法承载时拒绝启动；后台保存同样返回明确校验错误，避免客户端重连后才失败。
 
 ## 网络参数
 
-管理员可在“网络设置”页面维护基础 VPN、UDP 混淆、LAN 路由和隧道 MTU。基础 VPN 与混淆字段保存为待重启值，服务不会自动重启或强制断线；LAN 路由立即热更新，MTU 对之后的新连接或重连生效。已有任何 Peer 记录（包括已删除记录）时禁止改变虚拟子网；空节点库保存新子网后会暂停节点注册，直至服务端重启并启用新地址池。启动时若 Peer IP 不属于保存的子网也会拒绝启动。`10.0.0.0/8` 等覆盖 VPN 子网的宽泛 LAN/组路由仍然允许。
+管理员可在“网络设置”页面维护基础 VPN、UDP 混淆、LAN 路由、内置 DNS 和隧道 MTU。基础 VPN 与混淆字段保存为待重启值，服务不会自动重启或强制断线；LAN 路由和 DNS 转发规则立即热更新，MTU 与客户端 DNS 对之后的新连接或重连生效。已有任何 Peer 记录（包括已删除记录）时禁止改变虚拟子网；空节点库保存新子网后会暂停节点注册，直至服务端重启并启用新地址池。启动时若 Peer IP 不属于保存的子网也会拒绝启动。`10.0.0.0/8` 等覆盖 VPN 子网的宽泛 LAN/组路由仍然允许。
+
+内置 DNS 只绑定 VPN 网关地址的 UDP/TCP 53，不应在 Docker `ports` 或主机防火墙中发布公网 53。它只接受 VPN 子网来源，静态 A 记录优先，分流规则按最长域名后缀选择上游，并支持上游故障切换、UDP 截断后的 TCP 回退和有界缓存。Linux 客户端需要 systemd-resolved 的 `resolvectl`；客户端不会修改 `/etc/resolv.conf`。
 
 ## WireGuard 数据平面后端（`VPN_WG_BACKEND`）
 
@@ -95,6 +102,7 @@ WireGuard 自 **Linux 5.6（2020-03）** 并入主线，之后的内核默认带
 | `VPN_BIND_ADDR` 端口（默认 8080） | TCP | HTTP API + Web 后台 |
 | 80 / 443 | TCP | 启用 HTTPS 时：80 用于 ACME HTTP-01 + 跳转，443 用于 Web/API |
 | `VPN_OBFS_BIND_ADDR`（默认 47358） | UDP | 唯一公网混淆数据平面；51820 仅容器内部使用 |
+| VPN 网关地址的 53 | UDP + TCP | 内置 DNS，仅隧道内访问，**不要发布到公网** |
 
 ## 最小生产配置示例
 

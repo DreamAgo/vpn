@@ -27,6 +27,7 @@ xsalsa20poly1305 = "0.9"
 sha2 = { workspace = true }
 dirs = "6"
 base64 = { workspace = true }
+vpn-api-types = { workspace = true }
 
 # === macOS：keyring 走 Keychain (apple-native，内部即 security-framework) ===
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -35,6 +36,9 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 # === Linux：keyring 走 libsecret (Secret Service)，crypto-rust 提供纯 Rust 加密 ===
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # === Windows：keyring 走 Windows Credential Manager ===
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -88,6 +88,11 @@ pub struct DataPlaneSettingsSeed {
     pub obfs_endpoint: Option<String>,
     pub obfs_path_mtu: Option<String>,
     pub server_routes: Option<String>,
+    pub dns_mode: Option<String>,
+    pub dns_default_upstreams: Option<String>,
+    pub dns_split_domains: Option<String>,
+    pub dns_forward_rules: Option<String>,
+    pub dns_static_records: Option<String>,
     pub obfs_psk: Option<Zeroizing<String>>,
 }
 
@@ -106,6 +111,17 @@ impl std::fmt::Debug for DataPlaneSettingsSeed {
             .field("obfs_endpoint", &self.obfs_endpoint)
             .field("obfs_path_mtu", &self.obfs_path_mtu)
             .field("server_routes", &self.server_routes)
+            .field("dns_mode", &self.dns_mode)
+            .field("dns_default_upstreams", &self.dns_default_upstreams)
+            .field("dns_split_domains", &self.dns_split_domains)
+            .field(
+                "dns_forward_rules_configured",
+                &self.dns_forward_rules.is_some(),
+            )
+            .field(
+                "dns_static_records_configured",
+                &self.dns_static_records.is_some(),
+            )
             .field("obfs_psk_configured", &self.obfs_psk.is_some())
             .finish()
     }
@@ -292,6 +308,11 @@ impl ServerConfig {
             ),
             obfs_path_mtu: Some(env::var("VPN_OBFS_PATH_MTU").unwrap_or_else(|_| "1500".into())),
             server_routes: Some(env::var("VPN_SERVER_ROUTES").unwrap_or_default()),
+            dns_mode: env::var("VPN_DNS_MODE").ok(),
+            dns_default_upstreams: env::var("VPN_DNS_DEFAULT_UPSTREAMS").ok(),
+            dns_split_domains: env::var("VPN_DNS_SPLIT_DOMAINS").ok(),
+            dns_forward_rules: env::var("VPN_DNS_FORWARD_RULES").ok(),
+            dns_static_records: env::var("VPN_DNS_STATIC_RECORDS").ok(),
             obfs_psk: env::var("VPN_OBFS_PSK").ok().map(Zeroizing::new),
         };
         let notifications = NotificationConfig {

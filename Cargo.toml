@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 license = "MIT"
 authors = ["Shangguanjunjie"]
@@ -95,6 +95,7 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 
 # === HTTP 客户端（vpn-cli 用） ===
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hickory-proto = "0.26.1"
 
 [profile.release]
 opt-level = 3

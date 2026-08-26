@@ -18,10 +18,12 @@
 
 pub mod credential;
 pub mod daemon;
+pub mod dns;
 pub mod error;
 pub mod tun;
 
 // === 主要类型 re-export ===
+pub use dns::{apply_dns, cleanup_stale_dns, DnsSession};
 pub use error::{PlatformError, Result};
 
 pub use tun::{open_tun, Cidr, TunDevice};

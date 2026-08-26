@@ -91,6 +91,7 @@ async fn setup() -> (axum::Router, tempfile::TempDir, String) {
                 obfs_path_mtu: Some("1500".into()),
                 server_routes: Some(String::new()),
                 obfs_psk: None,
+                ..Default::default()
             },
             &NetworkSettingsSeed::default(),
             false,

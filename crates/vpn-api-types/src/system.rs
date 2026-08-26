@@ -58,12 +58,53 @@ pub struct ObfsNetworkSettings {
     pub path_mtu: u16,
 }
 
+/// 客户端应如何把 DNS 查询交给 VPN 内置解析器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientDnsMode {
+    #[default]
+    Disabled,
+    Global,
+    Split,
+}
+
+/// 按域名后缀选择上游 DNS；最长后缀优先。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsForwardRule {
+    pub domain: String,
+    pub upstreams: Vec<String>,
+}
+
+/// 内置 DNS 返回的静态 IPv4 记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsStaticRecord {
+    pub name: String,
+    pub address: Ipv4Addr,
+    pub ttl: u32,
+}
+
+/// 服务端内置 DNS 与客户端 DNS 下发配置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DnsNetworkSettings {
+    pub mode: ClientDnsMode,
+    #[serde(default)]
+    pub split_domains: Vec<String>,
+    #[serde(default)]
+    pub default_upstreams: Vec<String>,
+    #[serde(default)]
+    pub forward_rules: Vec<DnsForwardRule>,
+    #[serde(default)]
+    pub static_records: Vec<DnsStaticRecord>,
+}
+
 /// 数据库持久化的数据面配置；秘密始终不进入此结构。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPlaneSettings {
     pub vpn: VpnBaseSettings,
     pub obfs: ObfsNetworkSettings,
     pub mtu: NetworkSettings,
+    #[serde(default)]
+    pub dns: DnsNetworkSettings,
 }
 
 /// 管理页读取模型。LAN 路由为热更新值，因此无需区分 applied/desired。
@@ -163,11 +204,79 @@ impl ObfsNetworkSettings {
     }
 }
 
+impl DnsNetworkSettings {
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.validate()?;
+        self.split_domains = self
+            .split_domains
+            .into_iter()
+            .map(|domain| normalize_dns_domain(&domain))
+            .collect::<Result<Vec<_>, _>>()?;
+        for rule in &mut self.forward_rules {
+            rule.domain = normalize_dns_domain(&rule.domain)?;
+        }
+        for record in &mut self.static_records {
+            record.name = normalize_dns_domain(&record.name)?;
+        }
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode != ClientDnsMode::Disabled && self.default_upstreams.is_empty() {
+            return Err("启用 DNS 时必须配置至少一个默认上游".to_string());
+        }
+        if self.mode == ClientDnsMode::Split && self.split_domains.is_empty() {
+            return Err("分流 DNS 模式必须配置至少一个分流域名".to_string());
+        }
+        if self.default_upstreams.len() > 8 {
+            return Err("默认 DNS 上游不能超过 8 个".to_string());
+        }
+        for upstream in &self.default_upstreams {
+            validate_dns_upstream(upstream)?;
+        }
+        if self.split_domains.len() > 64 {
+            return Err("分流域名不能超过 64 个".to_string());
+        }
+        validate_unique_domains("分流域名", self.split_domains.iter().map(String::as_str))?;
+        if self.forward_rules.len() > 64 {
+            return Err("DNS 转发规则不能超过 64 条".to_string());
+        }
+        validate_unique_domains(
+            "DNS 转发规则域名",
+            self.forward_rules.iter().map(|rule| rule.domain.as_str()),
+        )?;
+        for rule in &self.forward_rules {
+            if rule.upstreams.is_empty() || rule.upstreams.len() > 8 {
+                return Err(format!("域名 {} 的上游数量必须在 1..=8", rule.domain));
+            }
+            for upstream in &rule.upstreams {
+                validate_dns_upstream(upstream)?;
+            }
+        }
+        if self.static_records.len() > 256 {
+            return Err("DNS 静态记录不能超过 256 条".to_string());
+        }
+        validate_unique_domains(
+            "DNS 静态记录",
+            self.static_records
+                .iter()
+                .map(|record| record.name.as_str()),
+        )?;
+        for record in &self.static_records {
+            if !(30..=86_400).contains(&record.ttl) {
+                return Err(format!("静态记录 {} 的 TTL 必须在 30..=86400", record.name));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DataPlaneSettings {
     pub fn validate(&self) -> Result<(), String> {
         self.vpn.validate()?;
         self.obfs.validate()?;
         self.mtu.validate()?;
+        self.dns.validate()?;
         if self.obfs.enabled && self.vpn.wg_backend == "noop" {
             return Err("启用 UDP 混淆时 wg_backend 不能为 noop".to_string());
         }
@@ -185,6 +294,43 @@ impl DataPlaneSettings {
         }
         Ok(())
     }
+}
+
+fn validate_dns_upstream(upstream: &str) -> Result<(), String> {
+    let address: std::net::SocketAddr = upstream
+        .parse()
+        .map_err(|_| format!("DNS 上游必须是 IP:端口，当前为 {upstream}"))?;
+    if !address.is_ipv4() || address.port() != 53 {
+        return Err(format!("DNS 上游必须是 IPv4:53：{upstream}"));
+    }
+    Ok(())
+}
+
+fn validate_unique_domains<'a>(
+    field: &str,
+    domains: impl Iterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for domain in domains {
+        let normalized = normalize_dns_domain(domain)?;
+        if !seen.insert(normalized) {
+            return Err(format!("{field}存在重复域名：{domain}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn normalize_dns_domain(domain: &str) -> Result<String, String> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.len() > 253
+        || !domain.contains('.')
+        || domain.contains('*')
+        || !valid_hostname(&domain)
+    {
+        return Err(format!("DNS 域名必须是完整域名且不能包含通配符：{domain}"));
+    }
+    Ok(domain)
 }
 
 fn validate_endpoint(name: &str, endpoint: &str) -> Result<(), String> {
@@ -354,5 +500,34 @@ mod tests {
             path_mtu: 1500,
         };
         assert!(obfs.validate().is_err());
+    }
+
+    #[test]
+    fn dns_validation_normalizes_domains_and_rejects_unsafe_inputs() {
+        assert_eq!(
+            normalize_dns_domain("API.Corp.Example.COM.").unwrap(),
+            "api.corp.example.com"
+        );
+        assert!(normalize_dns_domain("*.example.com").is_err());
+        assert!(normalize_dns_domain("localhost").is_err());
+
+        let valid = DnsNetworkSettings {
+            mode: ClientDnsMode::Split,
+            split_domains: vec!["corp.example.com".into()],
+            default_upstreams: vec!["223.5.5.5:53".into()],
+            forward_rules: vec![DnsForwardRule {
+                domain: "internal.example.com".into(),
+                upstreams: vec!["10.0.0.53:53".into()],
+            }],
+            static_records: vec![DnsStaticRecord {
+                name: "service.internal.example.com".into(),
+                address: "10.0.0.10".parse().unwrap(),
+                ttl: 300,
+            }],
+        };
+        assert!(valid.validate().is_ok());
+        let mut invalid = valid;
+        invalid.default_upstreams = vec!["223.5.5.5:5353".into()];
+        assert!(invalid.validate().is_err());
     }
 }

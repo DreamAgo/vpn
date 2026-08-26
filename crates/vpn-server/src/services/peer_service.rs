@@ -16,9 +16,12 @@ use ipnet::Ipv4Net;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use vpn_api_types::peer::{
-    ObfsMode, ObfsTransport, PeerHeartbeatRequest, PeerRegisterRequest, PeerRegisterResponse,
+    ClientDnsSettings, ObfsMode, ObfsTransport, PeerHeartbeatRequest, PeerRegisterRequest,
+    PeerRegisterResponse,
 };
-use vpn_api_types::system::NetworkSettings;
+use vpn_api_types::system::{
+    normalize_dns_domain, ClientDnsMode, DnsNetworkSettings, NetworkSettings,
+};
 use vpn_core::{AppError, Result};
 use vpn_wireguard::{
     generate_keypair, public_key_from_private, render_client_config, IpPool,
@@ -186,6 +189,7 @@ pub struct PeerService {
     peer_route_lock: Arc<Mutex<()>>,
     obfs_transport: Option<ObfsTransportSecret>,
     network_settings: Arc<RwLock<NetworkSettings>>,
+    dns_settings: Arc<RwLock<DnsNetworkSettings>>,
     registration_blocked: Arc<AtomicBool>,
 }
 
@@ -238,6 +242,7 @@ impl PeerService {
             peer_route_lock: route_policy_lock(),
             obfs_transport: None,
             network_settings: Arc::new(RwLock::new(NetworkSettings::default())),
+            dns_settings: Arc::new(RwLock::new(DnsNetworkSettings::default())),
             registration_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -245,6 +250,11 @@ impl PeerService {
     /// 共享管理员可更新的网络参数快照；仅影响之后的注册/重连响应。
     pub fn with_network_settings(mut self, settings: Arc<RwLock<NetworkSettings>>) -> Self {
         self.network_settings = settings;
+        self
+    }
+
+    pub fn with_dns_settings(mut self, settings: Arc<RwLock<DnsNetworkSettings>>) -> Self {
+        self.dns_settings = settings;
         self
     }
 
@@ -518,6 +528,31 @@ impl PeerService {
                 let _ = self.control.remove_routes(&removed).await;
             }
         }
+        let dns_settings = self.dns_settings.read().await;
+        let dns = if dns_settings.mode == ClientDnsMode::Disabled {
+            None
+        } else {
+            Some(ClientDnsSettings {
+                server: self
+                    .subnet
+                    .hosts()
+                    .next()
+                    .ok_or_else(|| AppError::Config("VPN 子网没有可用的 DNS 网关地址".into()))?
+                    .to_string(),
+                mode: dns_settings.mode,
+                domains: if dns_settings.mode == ClientDnsMode::Split {
+                    dns_settings
+                        .split_domains
+                        .iter()
+                        .map(|domain| normalize_dns_domain(domain))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(AppError::Config)?
+                } else {
+                    Vec::new()
+                },
+            })
+        };
+        drop(dns_settings);
         Ok(PeerRegisterResponse {
             vpn_ip,
             server_public_key: self.server_public_key().to_string(),
@@ -529,6 +564,7 @@ impl PeerService {
                 .await?,
             transport: self.obfs_transport.as_ref().map(ObfsTransportSecret::dto),
             network_settings: Some(self.network_settings.read().await.clone()),
+            dns,
         })
     }
 
@@ -753,12 +789,15 @@ impl PeerService {
             .vpn_ip
             .parse()
             .map_err(|e| AppError::Internal(Box::new(e)))?;
-        let dns = self
-            .subnet
-            .hosts()
-            .next()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "10.8.0.1".to_string());
+        let dns = if self.dns_settings.read().await.mode == ClientDnsMode::Disabled {
+            String::new()
+        } else {
+            self.subnet
+                .hosts()
+                .next()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "10.8.0.1".to_string())
+        };
         // 分隧道：路由 VPN 子网 + 其他站点 LAN 网段（排除本机自报的）。
         let own = peer
             .routed_subnets

@@ -8,7 +8,16 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::system::NetworkSettings;
+use crate::system::{ClientDnsMode, NetworkSettings};
+
+/// 服务端下发给客户端的 DNS 配置；不包含内部上游和静态记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDnsSettings {
+    pub server: String,
+    pub mode: ClientDnsMode,
+    #[serde(default)]
+    pub domains: Vec<String>,
+}
 
 /// 注册节点请求（POST /api/v1/peers/register）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +95,9 @@ pub struct PeerRegisterResponse {
     /// 可选隧道 MTU 策略；旧服务端缺省时客户端使用兼容默认值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_settings: Option<NetworkSettings>,
+    /// 可选 DNS 策略；旧服务端或关闭 DNS 时缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<ClientDnsSettings>,
 }
 
 /// 心跳请求（POST /api/v1/peers/heartbeat），每 30s 一次。
@@ -252,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn register_response_without_network_settings_remains_compatible() {
+    fn register_response_without_optional_network_fields_remains_compatible() {
         let response: PeerRegisterResponse = serde_json::from_value(serde_json::json!({
             "vpn_ip": "10.8.0.2",
             "server_public_key": "pk",
@@ -261,5 +273,6 @@ mod tests {
         }))
         .unwrap();
         assert!(response.network_settings.is_none());
+        assert!(response.dns.is_none());
     }
 }

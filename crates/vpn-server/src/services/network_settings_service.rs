@@ -19,18 +19,20 @@ use tokio::sync::RwLock;
 use vpn_api_types::{
     peer::ObfsMode,
     system::{
-        DataPlaneSettings, NetworkMtuMode, NetworkSettings, NetworkSettingsView,
-        ObfsNetworkSettings, VpnBaseSettings, DEFAULT_TUN_MTU, MAX_TUN_MTU, MIN_TUN_MTU,
+        ClientDnsMode, DataPlaneSettings, DnsForwardRule, DnsNetworkSettings, DnsStaticRecord,
+        NetworkMtuMode, NetworkSettings, NetworkSettingsView, ObfsNetworkSettings, VpnBaseSettings,
+        DEFAULT_TUN_MTU, MAX_TUN_MTU, MIN_TUN_MTU,
     },
 };
 use vpn_core::{AppError, Result};
 
 pub const KEY_NETWORK_SETTINGS: &str = "network_settings_v1";
-pub const KEY_DATA_PLANE_SETTINGS: &str = "network_settings_v2";
-const VERSION: u8 = 2;
+const KEY_DATA_PLANE_SETTINGS_V2: &str = "network_settings_v2";
+pub const KEY_DATA_PLANE_SETTINGS: &str = "network_settings_v3";
+const VERSION: u8 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PersistedV2 {
+struct PersistedSettings {
     version: u8,
     settings: DataPlaneSettings,
 }
@@ -50,6 +52,7 @@ pub struct NetworkSettingsService {
     desired: Arc<RwLock<DataPlaneSettings>>,
     applied: DataPlaneSettings,
     mtu: Arc<RwLock<NetworkSettings>>,
+    dns: Arc<RwLock<DnsNetworkSettings>>,
     psk_configured: bool,
     https_enabled: bool,
     approval_enabled: bool,
@@ -72,11 +75,16 @@ impl NetworkSettingsService {
         let raw = match repo.get(KEY_DATA_PLANE_SETTINGS).await? {
             Some(raw) => raw,
             None => {
-                let mtu = match repo.get(KEY_NETWORK_SETTINGS).await? {
-                    Some(raw) => deserialize_v1(&raw)?,
-                    None => parse_mtu_seed(mtu_seed)?,
+                let settings = match repo.get(KEY_DATA_PLANE_SETTINGS_V2).await? {
+                    Some(raw) => deserialize_v2(&raw)?,
+                    None => {
+                        let mtu = match repo.get(KEY_NETWORK_SETTINGS).await? {
+                            Some(raw) => deserialize_v1(&raw)?,
+                            None => parse_mtu_seed(mtu_seed)?,
+                        };
+                        parse_seed(seed, mtu)?
+                    }
                 };
-                let settings = parse_seed(seed, mtu)?;
                 validate_prerequisites(&settings, https_enabled, psk_configured, approval_enabled)
                     .map_err(AppError::Config)?;
                 let raw = serialize(&settings)?;
@@ -97,6 +105,7 @@ impl NetworkSettingsService {
             desired: Arc::new(RwLock::new(settings.clone())),
             applied: settings.clone(),
             mtu: Arc::new(RwLock::new(settings.mtu.clone())),
+            dns: Arc::new(RwLock::new(settings.dns.clone())),
             psk_configured,
             https_enabled,
             approval_enabled,
@@ -113,6 +122,9 @@ impl NetworkSettingsService {
     pub fn shared_settings(&self) -> Arc<RwLock<NetworkSettings>> {
         self.mtu.clone()
     }
+    pub fn shared_dns_settings(&self) -> Arc<RwLock<DnsNetworkSettings>> {
+        self.dns.clone()
+    }
     pub fn registration_gate(&self) -> Arc<AtomicBool> {
         self.registration_blocked.clone()
     }
@@ -122,6 +134,7 @@ impl NetworkSettingsService {
         let mut applied = self.applied.clone();
         // MTU 对新连接/重连即时生效，不属于待重启字段；返回当前实际下发值。
         applied.mtu = self.mtu.read().await.clone();
+        applied.dns = self.dns.read().await.clone();
         NetworkSettingsView {
             restart_required: restart_fields(&self.applied) != restart_fields(&desired),
             applied,
@@ -153,9 +166,10 @@ impl NetworkSettingsService {
 
     pub(crate) async fn update_locked(
         &self,
-        desired: DataPlaneSettings,
+        mut desired: DataPlaneSettings,
         server_routes: &[String],
     ) -> Result<Vec<String>> {
+        desired.dns = desired.dns.normalized().map_err(AppError::Validation)?;
         desired.validate().map_err(AppError::Validation)?;
         validate_prerequisites(
             &desired,
@@ -168,9 +182,14 @@ impl NetworkSettingsService {
         // applied transport 的安全上限。
         let mut applied_with_new_mtu = self.applied.clone();
         applied_with_new_mtu.mtu = desired.mtu.clone();
-        applied_with_new_mtu
-            .validate()
-            .map_err(AppError::Validation)?;
+        applied_with_new_mtu.dns = desired.dns.clone();
+        validate_prerequisites(
+            &applied_with_new_mtu,
+            self.https_enabled,
+            self.psk_configured,
+            self.approval_enabled,
+        )
+        .map_err(AppError::Validation)?;
         let routes = normalize_subnets(server_routes)?;
         // 串行化完整校验、事务提交和内存快照切换，避免并发保存导致 DB/内存倒序。
         let mut current = self.desired.write().await;
@@ -188,6 +207,7 @@ impl NetworkSettingsService {
             )
             .await?;
         *self.mtu.write().await = desired.mtu.clone();
+        *self.dns.write().await = desired.dns.clone();
         self.registration_blocked.store(
             desired.vpn.vpn_subnet != self.applied.vpn.vpn_subnet,
             Ordering::Release,
@@ -201,14 +221,14 @@ fn restart_fields(settings: &DataPlaneSettings) -> (&VpnBaseSettings, &ObfsNetwo
     (&settings.vpn, &settings.obfs)
 }
 fn serialize(settings: &DataPlaneSettings) -> Result<String> {
-    serde_json::to_string(&PersistedV2 {
+    serde_json::to_string(&PersistedSettings {
         version: VERSION,
         settings: settings.clone(),
     })
     .map_err(|error| AppError::Internal(Box::new(error)))
 }
 fn deserialize(raw: &str) -> Result<DataPlaneSettings> {
-    let persisted: PersistedV2 = serde_json::from_str(raw).map_err(|error| {
+    let persisted: PersistedSettings = serde_json::from_str(raw).map_err(|error| {
         AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS} JSON 损坏：{error}"))
     })?;
     if persisted.version != VERSION {
@@ -221,7 +241,31 @@ fn deserialize(raw: &str) -> Result<DataPlaneSettings> {
         .settings
         .validate()
         .map_err(|error| AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS} 损坏：{error}")))?;
-    Ok(persisted.settings)
+    let mut settings = persisted.settings;
+    settings.dns = settings.dns.normalized().map_err(|error| {
+        AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS} DNS 损坏：{error}"))
+    })?;
+    Ok(settings)
+}
+fn deserialize_v2(raw: &str) -> Result<DataPlaneSettings> {
+    let persisted: PersistedSettings = serde_json::from_str(raw).map_err(|error| {
+        AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS_V2} JSON 损坏：{error}"))
+    })?;
+    if persisted.version != 2 {
+        return Err(AppError::Config(format!(
+            "{KEY_DATA_PLANE_SETTINGS_V2} 版本不支持：{}",
+            persisted.version
+        )));
+    }
+    persisted
+        .settings
+        .validate()
+        .map_err(|error| AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS_V2} 损坏：{error}")))?;
+    let mut settings = persisted.settings;
+    settings.dns = settings.dns.normalized().map_err(|error| {
+        AppError::Config(format!("{KEY_DATA_PLANE_SETTINGS_V2} DNS 损坏：{error}"))
+    })?;
+    Ok(settings)
 }
 fn deserialize_v1(raw: &str) -> Result<NetworkSettings> {
     let value: PersistedV1 = serde_json::from_str(raw)
@@ -282,9 +326,53 @@ fn parse_seed(seed: &DataPlaneSettingsSeed, mtu: NetworkSettings) -> Result<Data
             path_mtu: parse_u16("VPN_OBFS_PATH_MTU", seed.obfs_path_mtu.as_deref(), 1500)?,
         },
         mtu,
+        dns: parse_dns_seed(seed)?,
     };
     settings.validate().map_err(AppError::Config)?;
     Ok(settings)
+}
+
+fn parse_dns_seed(seed: &DataPlaneSettingsSeed) -> Result<DnsNetworkSettings> {
+    let mode = match seed.dns_mode.as_deref().unwrap_or("disabled") {
+        "disabled" => ClientDnsMode::Disabled,
+        "global" => ClientDnsMode::Global,
+        "split" => ClientDnsMode::Split,
+        value => return Err(AppError::Config(format!("VPN_DNS_MODE 非法：{value}"))),
+    };
+    let split_domains = split_csv(seed.dns_split_domains.as_deref());
+    let default_upstreams = split_csv(seed.dns_default_upstreams.as_deref());
+    let forward_rules: Vec<DnsForwardRule> =
+        parse_json_seed("VPN_DNS_FORWARD_RULES", seed.dns_forward_rules.as_deref())?;
+    let static_records: Vec<DnsStaticRecord> =
+        parse_json_seed("VPN_DNS_STATIC_RECORDS", seed.dns_static_records.as_deref())?;
+    let settings = DnsNetworkSettings {
+        mode,
+        split_domains,
+        default_upstreams,
+        forward_rules,
+        static_records,
+    };
+    settings.normalized().map_err(AppError::Config)
+}
+
+fn split_csv(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_json_seed<T: serde::de::DeserializeOwned>(
+    name: &str,
+    raw: Option<&str>,
+) -> Result<Vec<T>> {
+    match raw.filter(|value| !value.trim().is_empty()) {
+        Some(value) => serde_json::from_str(value)
+            .map_err(|error| AppError::Config(format!("{name} JSON 非法：{error}"))),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn parse_mtu_seed(seed: &NetworkSettingsSeed) -> Result<NetworkSettings> {
@@ -322,8 +410,34 @@ fn validate_prerequisites(
     approval_enabled: bool,
 ) -> std::result::Result<(), String> {
     settings.validate()?;
+    let subnet: ipnet::Ipv4Net = settings
+        .vpn
+        .vpn_subnet
+        .parse()
+        .map_err(|_| "vpn_subnet 非法".to_string())?;
+    let gateway = subnet
+        .hosts()
+        .next()
+        .ok_or_else(|| "VPN 子网没有可用网关地址".to_string())?;
+    for upstream in settings.dns.default_upstreams.iter().chain(
+        settings
+            .dns
+            .forward_rules
+            .iter()
+            .flat_map(|rule| rule.upstreams.iter()),
+    ) {
+        let address: std::net::SocketAddr = upstream
+            .parse()
+            .map_err(|_| format!("DNS 上游非法：{upstream}"))?;
+        if address.ip() == std::net::IpAddr::V4(gateway) {
+            return Err(format!("DNS 上游不能指回 VPN 网关自身：{upstream}"));
+        }
+    }
     if settings.obfs.enabled && !https_enabled {
         return Err("启用 UDP 混淆时必须启用 HTTPS，禁止通过 HTTP 下发 PSK".into());
+    }
+    if settings.dns.mode != ClientDnsMode::Disabled && settings.vpn.wg_backend == "noop" {
+        return Err("启用内置 DNS 时 wg_backend 不能为 noop".into());
     }
     if settings.obfs.enabled && !psk_configured {
         return Err("启用 UDP 混淆时必须通过 VPN_OBFS_PSK 配置秘密".into());
@@ -416,6 +530,11 @@ mod tests {
             obfs_endpoint: Some("vpn.example.com:47358".into()),
             obfs_path_mtu: Some("1500".into()),
             server_routes: Some(String::new()),
+            dns_mode: None,
+            dns_default_upstreams: None,
+            dns_split_domains: None,
+            dns_forward_rules: None,
+            dns_static_records: None,
             obfs_psk: None,
         }
     }
@@ -473,6 +592,56 @@ mod tests {
             restarted.server_routes().await.unwrap(),
             vec!["192.168.10.0/24"]
         );
+    }
+
+    #[tokio::test]
+    async fn migrates_v2_to_v3_with_dns_disabled() {
+        let (repo, peers) = repos().await;
+        repo.set(
+            KEY_DATA_PLANE_SETTINGS_V2,
+            r#"{"version":2,"settings":{"vpn":{"vpn_subnet":"10.8.0.0/24","vpn_listen_port":51820,"vpn_endpoint":"vpn.example.com:51820","wg_backend":"kernel","wg_interface":"wg0"},"obfs":{"enabled":false,"mode":"low-overhead-v1","bind_addr":"0.0.0.0:47358","public_endpoint":"vpn.example.com:47358","path_mtu":1500},"mtu":{"mode":"fixed","default_mtu":1360,"min_mtu":1280,"max_mtu":1420}}}"#,
+        )
+        .await
+        .unwrap();
+        let service = NetworkSettingsService::load_or_seed(
+            repo.clone(),
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(service.desired().await.dns.mode, ClientDnsMode::Disabled);
+        assert!(repo.get(KEY_DATA_PLANE_SETTINGS).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn dns_update_is_hot_and_updates_shared_snapshot() {
+        let (repo, peers) = repos().await;
+        let service = NetworkSettingsService::load_or_seed(
+            repo,
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut desired = service.desired().await;
+        desired.dns = DnsNetworkSettings {
+            mode: ClientDnsMode::Global,
+            default_upstreams: vec!["223.5.5.5:53".into()],
+            ..Default::default()
+        };
+        service.update(desired, &[]).await.unwrap();
+        assert_eq!(
+            service.shared_dns_settings().read().await.mode,
+            ClientDnsMode::Global
+        );
+        assert!(!service.view(vec![]).await.restart_required);
     }
     #[tokio::test]
     async fn wide_lan_route_and_empty_peer_subnet_change_are_allowed() {
