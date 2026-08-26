@@ -338,7 +338,9 @@ jobs:
       - name: Verify macOS privileged helper entrypoint
         shell: bash
         run: |
-          binary='desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/易链.app/Contents/MacOS/vpn-desktop'
+          # Tauri removes the temporary bundle/macos/*.app after creating the DMG.
+          # Verify the exact release executable that was copied into that bundle.
+          binary='desktop/src-tauri/target/${{ matrix.target }}/release/vpn-desktop'
           test -x "$binary"
           build_hash=$(shasum -a 256 "$binary" | awk '{print $1}')
           test ${#build_hash} -eq 64
