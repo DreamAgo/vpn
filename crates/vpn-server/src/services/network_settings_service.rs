@@ -335,11 +335,9 @@ fn parse_seed(seed: &DataPlaneSettingsSeed, mtu: NetworkSettings) -> Result<Data
 fn parse_dns_seed(seed: &DataPlaneSettingsSeed) -> Result<DnsNetworkSettings> {
     let mode = match seed.dns_mode.as_deref().unwrap_or("disabled") {
         "disabled" => ClientDnsMode::Disabled,
-        "global" => ClientDnsMode::Global,
-        "split" => ClientDnsMode::Split,
+        "global" | "split" => ClientDnsMode::Global,
         value => return Err(AppError::Config(format!("VPN_DNS_MODE 非法：{value}"))),
     };
-    let split_domains = split_csv(seed.dns_split_domains.as_deref());
     let default_upstreams = split_csv(seed.dns_default_upstreams.as_deref());
     let forward_rules: Vec<DnsForwardRule> =
         parse_json_seed("VPN_DNS_FORWARD_RULES", seed.dns_forward_rules.as_deref())?;
@@ -347,7 +345,6 @@ fn parse_dns_seed(seed: &DataPlaneSettingsSeed) -> Result<DnsNetworkSettings> {
         parse_json_seed("VPN_DNS_STATIC_RECORDS", seed.dns_static_records.as_deref())?;
     let settings = DnsNetworkSettings {
         mode,
-        split_domains,
         default_upstreams,
         forward_rules,
         static_records,
@@ -532,7 +529,6 @@ mod tests {
             server_routes: Some(String::new()),
             dns_mode: None,
             dns_default_upstreams: None,
-            dns_split_domains: None,
             dns_forward_rules: None,
             dns_static_records: None,
             obfs_psk: None,
@@ -615,6 +611,58 @@ mod tests {
         .unwrap();
         assert_eq!(service.desired().await.dns.mode, ClientDnsMode::Disabled);
         assert!(repo.get(KEY_DATA_PLANE_SETTINGS).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_split_database_loads_as_global_and_save_drops_domains() {
+        let (repo, peers) = repos().await;
+        let settings = parse_seed(&seed(), NetworkSettings::default()).unwrap();
+        let mut stored = serde_json::to_value(PersistedSettings {
+            version: 3,
+            settings,
+        })
+        .unwrap();
+        stored["settings"]["dns"] = serde_json::json!({
+            "mode": "split", "split_domains": ["invalid legacy domain"],
+            "default_upstreams": ["223.5.5.5:53"]
+        });
+        repo.set(KEY_DATA_PLANE_SETTINGS, &stored.to_string())
+            .await
+            .unwrap();
+        let service = NetworkSettingsService::load_or_seed(
+            repo.clone(),
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let desired = service.desired().await;
+        assert_eq!(desired.dns.mode, ClientDnsMode::Global);
+        assert_eq!(
+            service.shared_dns_settings().read().await.mode,
+            ClientDnsMode::Global
+        );
+        service.update(desired, &[]).await.unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&repo.get(KEY_DATA_PLANE_SETTINGS).await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(saved["settings"]["dns"]["mode"], "global");
+        assert!(saved["settings"]["dns"].get("split_domains").is_none());
+    }
+
+    #[test]
+    fn legacy_split_environment_seed_is_global_and_unknown_mode_fails() {
+        let mut seed = seed();
+        seed.dns_mode = Some("split".into());
+        seed.dns_default_upstreams = Some("223.5.5.5:53".into());
+        let settings = parse_dns_seed(&seed).unwrap();
+        assert_eq!(settings.mode, ClientDnsMode::Global);
+        assert_eq!(serde_json::to_value(settings).unwrap()["mode"], "global");
+        seed.dns_mode = Some("unknown".into());
+        assert!(parse_dns_seed(&seed).is_err());
     }
 
     #[tokio::test]

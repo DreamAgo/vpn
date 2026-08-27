@@ -111,18 +111,15 @@ export function NetworkSettingsPage() {
             <Radio.Group optionType="button">
               <Radio.Button value="disabled">关闭</Radio.Button>
               <Radio.Button value="global">全局</Radio.Button>
-              <Radio.Button value="split">分流</Radio.Button>
             </Radio.Group>
           </Form.Item>
-          <Paragraph type="secondary">DNS 仅监听 VPN 网关的 UDP/TCP 53，不发布公网端口。客户端断开时恢复原 DNS。</Paragraph>
+          <Paragraph type="secondary">启用后，将 VPN 网关设为客户端系统默认 DNS，不改变数据流量路由；应用自带的 DoH 不在接管范围内，也不覆盖其他 VPN 或系统已有的更具体 DNS 策略。DNS 仅监听 VPN 网关的 UDP/TCP 53，不发布公网端口，客户端断开时恢复原 DNS。策略变更在新连接或重连时生效。</Paragraph>
           <Form.Item name={['desired','dns','defaultUpstreams']} label="默认上游" rules={dnsMode === 'disabled' ? [] : [{ required: true, message: '启用 DNS 时至少配置一个默认上游' }, { validator: (_, values: string[] = []) => values.every((value) => dnsUpstreamRule.pattern.test(value)) ? Promise.resolve() : Promise.reject(new Error(dnsUpstreamRule.message)) }]}>
             <Select mode="tags" tokenSeparators={[',']} placeholder="223.5.5.5:53" />
           </Form.Item>
-          {dnsMode === 'split' && <Form.Item name={['desired','dns','splitDomains']} label="客户端分流域名" rules={[{ required: true, message: '分流模式至少配置一个域名' }, { validator: (_, values: string[] = []) => values.every((value) => domainRule.pattern.test(value)) ? Promise.resolve() : Promise.reject(new Error(domainRule.message)) }]}>
-            <Select mode="tags" tokenSeparators={[',']} placeholder="corp.example.com" />
-          </Form.Item>}
 
           <Title level={5}>按域名选择上游</Title>
+          <Paragraph type="secondary">以下规则仅决定服务端收到查询后使用哪个上游；未匹配的查询使用默认上游。</Paragraph>
           <Form.List name={['desired','dns','forwardRules']}>
             {(fields, { add, remove }) => <Space direction="vertical" style={{ width: '100%' }}>
               {fields.map(({ key, name: fieldName }) => <Row gutter={12} key={key} align="top">

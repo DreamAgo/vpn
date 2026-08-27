@@ -196,6 +196,74 @@ async fn admin_can_update_but_invalid_request_keeps_previous_value() {
 }
 
 #[tokio::test]
+async fn legacy_split_dns_api_saves_global_and_retains_server_resolution_rules() {
+    let (app, _temp, admin_token) = setup().await;
+    let (_, initial) = request(
+        &app,
+        "GET",
+        "/api/v1/admin/network/settings",
+        None,
+        Some(&admin_token),
+    )
+    .await;
+    let mut desired = initial["data"]["desired"].clone();
+    desired["dns"] = json!({
+        "mode": "split", "split_domains": ["invalid legacy domain"],
+        "default_upstreams": ["223.5.5.5:53"],
+        "forward_rules": [{"domain": "Corp.Example.COM.", "upstreams": ["10.0.0.53:53"]}],
+        "static_records": [{"name": "API.Corp.Example.COM.", "address": "10.0.0.10", "ttl": 300}]
+    });
+    let (status, updated) = request(
+        &app,
+        "PUT",
+        "/api/v1/admin/network/settings",
+        Some(json!({"desired": desired, "server_routes": []})),
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dns = &updated["data"]["desired"]["dns"];
+    assert_eq!(dns["mode"], "global");
+    assert!(dns.get("split_domains").is_none());
+    assert_eq!(dns["forward_rules"][0]["domain"], "corp.example.com");
+    assert_eq!(dns["static_records"][0]["name"], "api.corp.example.com");
+    assert_eq!(updated["data"]["restart_required"], false);
+    let (_, reloaded) = request(
+        &app,
+        "GET",
+        "/api/v1/admin/network/settings",
+        None,
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(reloaded["data"], updated["data"]);
+
+    let mut invalid = updated["data"]["desired"].clone();
+    invalid["dns"]["mode"] = json!("unknown");
+    let (status, _) = request(
+        &app,
+        "PUT",
+        "/api/v1/admin/network/settings",
+        Some(json!({"desired": invalid, "server_routes": []})),
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut disabled = updated["data"]["desired"].clone();
+    disabled["dns"]["mode"] = json!("disabled");
+    let (status, response) = request(
+        &app,
+        "PUT",
+        "/api/v1/admin/network/settings",
+        Some(json!({"desired": disabled, "server_routes": []})),
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["data"]["desired"]["dns"]["mode"], "disabled");
+}
+
+#[tokio::test]
 async fn non_admin_cannot_read_or_modify_network_settings() {
     let (app, _temp, admin_token) = setup().await;
     let (_, created) = request(

@@ -19,9 +19,7 @@ use vpn_api_types::peer::{
     ClientDnsSettings, ObfsMode, ObfsTransport, PeerHeartbeatRequest, PeerRegisterRequest,
     PeerRegisterResponse,
 };
-use vpn_api_types::system::{
-    normalize_dns_domain, ClientDnsMode, DnsNetworkSettings, NetworkSettings,
-};
+use vpn_api_types::system::{ClientDnsMode, DnsNetworkSettings, NetworkSettings};
 use vpn_core::{AppError, Result};
 use vpn_wireguard::{
     generate_keypair, public_key_from_private, render_client_config, IpPool,
@@ -540,16 +538,6 @@ impl PeerService {
                     .ok_or_else(|| AppError::Config("VPN 子网没有可用的 DNS 网关地址".into()))?
                     .to_string(),
                 mode: dns_settings.mode,
-                domains: if dns_settings.mode == ClientDnsMode::Split {
-                    dns_settings
-                        .split_domains
-                        .iter()
-                        .map(|domain| normalize_dns_domain(domain))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(AppError::Config)?
-                } else {
-                    Vec::new()
-                },
             })
         };
         drop(dns_settings);
@@ -1608,6 +1596,48 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_registration_payload_is_global_fixed_size_and_disabled_is_absent() {
+        use vpn_api_types::system::{DnsForwardRule, DnsStaticRecord};
+
+        let dns = Arc::new(RwLock::new(DnsNetworkSettings {
+            mode: ClientDnsMode::Global,
+            default_upstreams: vec!["223.5.5.5:53".into()],
+            ..Default::default()
+        }));
+        let svc = service(setup_pool().await).with_dns_settings(dns.clone());
+        let initial = svc.register("user-1", &reg("PK1")).await.unwrap();
+        let expected = serde_json::json!({"server": "10.8.0.1", "mode": "global"});
+        assert_eq!(
+            serde_json::to_value(initial.dns.as_ref().unwrap()).unwrap(),
+            expected
+        );
+        {
+            let mut settings = dns.write().await;
+            settings.forward_rules = (0..64)
+                .map(|index| DnsForwardRule {
+                    domain: format!("zone{index}.internal.example.com"),
+                    upstreams: vec!["10.0.0.53:53".into()],
+                })
+                .collect();
+            settings.static_records = (0..256)
+                .map(|index| DnsStaticRecord {
+                    name: format!("host{index}.internal.example.com"),
+                    address: "10.0.0.10".parse().unwrap(),
+                    ttl: 300,
+                })
+                .collect();
+            assert!(settings.validate().is_ok());
+        }
+        let large = svc.register("user-1", &reg("PK1")).await.unwrap();
+        assert_eq!(serde_json::to_value(large.dns.unwrap()).unwrap(), expected);
+        assert_eq!(large.allowed_routes, initial.allowed_routes);
+        dns.write().await.mode = ClientDnsMode::Disabled;
+        let disabled = svc.register("user-1", &reg("PK1")).await.unwrap();
+        assert!(disabled.dns.is_none());
+        assert!(serde_json::to_value(disabled).unwrap().get("dns").is_none());
     }
 
     #[tokio::test]

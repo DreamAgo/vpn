@@ -64,8 +64,9 @@ pub struct ObfsNetworkSettings {
 pub enum ClientDnsMode {
     #[default]
     Disabled,
+    /// 旧 split 配置升级为全局 DNS；仅兼容读取，不再输出旧模式。
+    #[serde(alias = "split")]
     Global,
-    Split,
 }
 
 /// 按域名后缀选择上游 DNS；最长后缀优先。
@@ -87,8 +88,6 @@ pub struct DnsStaticRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DnsNetworkSettings {
     pub mode: ClientDnsMode,
-    #[serde(default)]
-    pub split_domains: Vec<String>,
     #[serde(default)]
     pub default_upstreams: Vec<String>,
     #[serde(default)]
@@ -207,11 +206,6 @@ impl ObfsNetworkSettings {
 impl DnsNetworkSettings {
     pub fn normalized(mut self) -> Result<Self, String> {
         self.validate()?;
-        self.split_domains = self
-            .split_domains
-            .into_iter()
-            .map(|domain| normalize_dns_domain(&domain))
-            .collect::<Result<Vec<_>, _>>()?;
         for rule in &mut self.forward_rules {
             rule.domain = normalize_dns_domain(&rule.domain)?;
         }
@@ -225,19 +219,12 @@ impl DnsNetworkSettings {
         if self.mode != ClientDnsMode::Disabled && self.default_upstreams.is_empty() {
             return Err("启用 DNS 时必须配置至少一个默认上游".to_string());
         }
-        if self.mode == ClientDnsMode::Split && self.split_domains.is_empty() {
-            return Err("分流 DNS 模式必须配置至少一个分流域名".to_string());
-        }
         if self.default_upstreams.len() > 8 {
             return Err("默认 DNS 上游不能超过 8 个".to_string());
         }
         for upstream in &self.default_upstreams {
             validate_dns_upstream(upstream)?;
         }
-        if self.split_domains.len() > 64 {
-            return Err("分流域名不能超过 64 个".to_string());
-        }
-        validate_unique_domains("分流域名", self.split_domains.iter().map(String::as_str))?;
         if self.forward_rules.len() > 64 {
             return Err("DNS 转发规则不能超过 64 条".to_string());
         }
@@ -470,6 +457,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_split_dns_is_global_and_removed_fields_are_ignored() {
+        let settings: DnsNetworkSettings = serde_json::from_value(serde_json::json!({
+            "mode": "split",
+            "split_domains": ["invalid legacy domain", "corp.example.com"],
+            "default_upstreams": ["223.5.5.5:53"]
+        }))
+        .unwrap();
+        assert_eq!(settings.mode, ClientDnsMode::Global);
+        assert!(settings.validate().is_ok());
+        let serialized = serde_json::to_value(settings).unwrap();
+        assert_eq!(serialized["mode"], "global");
+        assert!(serialized.get("split_domains").is_none());
+        assert!(serde_json::from_value::<ClientDnsMode>(serde_json::json!("unknown")).is_err());
+        assert_eq!(
+            serde_json::to_value(ClientDnsMode::Disabled).unwrap(),
+            "disabled"
+        );
+        assert!(DnsNetworkSettings {
+            mode: ClientDnsMode::Global,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn obfs_safe_mtu_matches_both_transport_modes() {
         assert_eq!(obfs_transport_safe_mtu(ObfsMode::ParanoidV1, 1500), 1392);
         assert_eq!(obfs_transport_safe_mtu(ObfsMode::LowOverheadV1, 1500), 1440);
@@ -512,8 +525,7 @@ mod tests {
         assert!(normalize_dns_domain("localhost").is_err());
 
         let valid = DnsNetworkSettings {
-            mode: ClientDnsMode::Split,
-            split_domains: vec!["corp.example.com".into()],
+            mode: ClientDnsMode::Global,
             default_upstreams: vec!["223.5.5.5:53".into()],
             forward_rules: vec![DnsForwardRule {
                 domain: "internal.example.com".into(),

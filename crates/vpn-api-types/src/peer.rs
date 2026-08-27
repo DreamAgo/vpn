@@ -15,8 +15,6 @@ use crate::system::{ClientDnsMode, NetworkSettings};
 pub struct ClientDnsSettings {
     pub server: String,
     pub mode: ClientDnsMode,
-    #[serde(default)]
-    pub domains: Vec<String>,
 }
 
 /// 注册节点请求（POST /api/v1/peers/register）。
@@ -228,8 +226,38 @@ pub struct AdminPeerQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObfsMode, ObfsTransport, PeerRegisterRequest, PeerRegisterResponse};
+    use super::{
+        ClientDnsMode, ClientDnsSettings, ObfsMode, ObfsTransport, PeerRegisterRequest,
+        PeerRegisterResponse,
+    };
     use zeroize::Zeroizing;
+
+    #[test]
+    fn legacy_client_dns_is_global_without_domain_payload() {
+        for domains in [
+            serde_json::json!([]),
+            serde_json::json!(["invalid legacy domain"]),
+            serde_json::json!(vec!["corp.example.com"; 384]),
+        ] {
+            let settings: ClientDnsSettings = serde_json::from_value(serde_json::json!({
+                "server": "10.8.0.1", "mode": "split", "domains": domains
+            }))
+            .unwrap();
+            assert_eq!(settings.mode, ClientDnsMode::Global);
+            assert_eq!(
+                serde_json::to_value(settings).unwrap(),
+                serde_json::json!({
+                    "server": "10.8.0.1", "mode": "global"
+                })
+            );
+        }
+        assert!(
+            serde_json::from_value::<ClientDnsSettings>(serde_json::json!({
+                "server": "10.8.0.1", "mode": "unknown"
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn register_request_ignores_legacy_routed_subnets() {

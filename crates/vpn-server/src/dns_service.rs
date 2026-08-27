@@ -455,8 +455,7 @@ mod tests {
     #[test]
     fn longest_suffix_wins() {
         let settings = DnsNetworkSettings {
-            mode: ClientDnsMode::Split,
-            split_domains: vec!["corp.example.com".into()],
+            mode: ClientDnsMode::Global,
             default_upstreams: vec!["1.1.1.1:53".into()],
             forward_rules: vec![
                 DnsForwardRule {

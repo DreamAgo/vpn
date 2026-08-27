@@ -348,16 +348,6 @@ pub async fn connect_once(
                 "服务端下发的 DNS 地址不是 VPN 网关".to_string(),
             ));
         }
-        if dns.mode == vpn_api_types::system::ClientDnsMode::Split && dns.domains.is_empty() {
-            return Err(CliError::Invalid(
-                "服务端下发的分流 DNS 缺少域名".to_string(),
-            ));
-        }
-        for domain in &dns.domains {
-            vpn_api_types::system::normalize_dns_domain(domain).map_err(|error| {
-                CliError::Invalid(format!("服务端下发的 DNS 域名非法：{error}"))
-            })?;
-        }
     }
 
     tracing::info!(

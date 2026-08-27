@@ -1,5 +1,9 @@
 # Deferred Work
 
+## DNS command lifecycle
+
+- `crates/vpn-platform/src/dns.rs`：既有 `run_commands` 对 `scutil` / PowerShell 等系统命令没有执行超时或取消时终止子进程的保障，命令挂起可能阻塞 DNS 应用、恢复及连接流程。该行为在移除客户端分流前已存在；后续应为整个命令生命周期（含 stdin 写入）增加有界超时、取消清理与故障注入测试。
+
 ## Desktop lifecycle and privilege model
 
 - `desktop/src-tauri/src/lib.rs`: `quit_app` 直接调用 `app.exit(0)`，没有等待活动 VPN 任务完成路由清理。该退出行为在本次可观测性改动前已存在；后续应把退出流程改为异步 disconnect → 有界等待 → exit。

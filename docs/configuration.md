@@ -26,9 +26,8 @@
 | `VPN_TUN_MTU_MAX` | `1420` | 首次初始化自动模式上限。 |
 | `VPN_WG_BACKEND` | `noop` | WireGuard 数据平面后端：`kernel` / `userspace` / `auto` / `noop`。**生产必须显式设置**（默认 `noop` 不建真实隧道）。详见下节。 |
 | `VPN_WG_INTERFACE` | `wg0` | 首次初始化 WireGuard 接口名；之后在“网络设置”修改并重启生效。 |
-| `VPN_DNS_MODE` | `disabled` | 首次初始化客户端 DNS 策略：`disabled` / `global` / `split`。 |
+| `VPN_DNS_MODE` | `disabled` | 首次初始化客户端 DNS 策略：`disabled` / `global`。旧值 `split` 兼容解释为 `global`。 |
 | `VPN_DNS_DEFAULT_UPSTREAMS` | （空） | 首次初始化默认上游，逗号分隔 IPv4:53，如 `223.5.5.5:53,1.1.1.1:53`。 |
-| `VPN_DNS_SPLIT_DOMAINS` | （空） | 首次初始化客户端分流域名，逗号分隔。 |
 | `VPN_DNS_FORWARD_RULES` | `[]` | 首次初始化后缀转发规则 JSON 数组，如 `[{"domain":"corp.example.com","upstreams":["10.0.0.53:53"]}]`。 |
 | `VPN_DNS_STATIC_RECORDS` | `[]` | 首次初始化静态 A 记录 JSON 数组，如 `[{"name":"api.corp.example.com","address":"10.0.0.10","ttl":300}]`。 |
 | `VPN_AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期由后台任务自动清理。 |
@@ -56,7 +55,11 @@
 
 管理员可在“网络设置”页面维护基础 VPN、UDP 混淆、LAN 路由、内置 DNS 和隧道 MTU。基础 VPN 与混淆字段保存为待重启值，服务不会自动重启或强制断线；LAN 路由和 DNS 转发规则立即热更新，MTU 与客户端 DNS 对之后的新连接或重连生效。已有任何 Peer 记录（包括已删除记录）时禁止改变虚拟子网；空节点库保存新子网后会暂停节点注册，直至服务端重启并启用新地址池。启动时若 Peer IP 不属于保存的子网也会拒绝启动。`10.0.0.0/8` 等覆盖 VPN 子网的宽泛 LAN/组路由仍然允许。
 
-内置 DNS 只绑定 VPN 网关地址的 UDP/TCP 53，不应在 Docker `ports` 或主机防火墙中发布公网 53。它只接受 VPN 子网来源，静态 A 记录优先，分流规则按最长域名后缀选择上游，并支持上游故障切换、UDP 截断后的 TCP 回退和有界缓存。Linux 客户端需要 systemd-resolved 的 `resolvectl`；客户端不会修改 `/etc/resolv.conf`。
+客户端 DNS 仅提供“关闭”和“全局”。启用全局后，将 VPN 网关设为系统默认 DNS；这不改变 VPN 数据流量路由，也不接管应用自行配置的 DoH，不覆盖其他 VPN 或系统已有的更具体 DNS 策略。服务端按域名选择上游、静态 A 记录仍可独立配置，不需要客户端域名列表。客户端断开时仅恢复本产品设置，应用失败会回滚。
+
+升级注意：旧数据库、API 请求或客户端响应中的 `split` 模式兼容读取为 `global`，旧 `split_domains` / `domains` 字段忽略，不再输出。旧 `VPN_DNS_MODE=split` 同样表示全局，`VPN_DNS_SPLIT_DOMAINS` 已停止读取。原来只有部分域名经 VPN 解析的配置，升级并重连后会将 VPN 网关设为系统默认 DNS，不再仅限于原分流域名（上述 DoH 与其他 DNS 策略例外仍适用）；如不希望此行为，请在后台将 DNS 关闭。客户端策略仅在新连接或重连时应用，不强制刷新在线连接。
+
+内置 DNS 只绑定 VPN 网关地址的 UDP/TCP 53，不应在 Docker `ports` 或主机防火墙中发布公网 53。它只接受 VPN 子网来源，静态 A 记录优先，转发规则按最长域名后缀选择上游，其余使用默认上游，并支持上游故障切换、UDP 截断后的 TCP 回退和有界缓存。Linux 客户端需要 systemd-resolved 的 `resolvectl`；客户端不会修改 `/etc/resolv.conf` 或物理网卡 DNS。
 
 ## WireGuard 数据平面后端（`VPN_WG_BACKEND`）
 

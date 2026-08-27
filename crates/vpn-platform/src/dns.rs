@@ -3,10 +3,7 @@
 use std::net::Ipv4Addr;
 
 use tokio::{io::AsyncWriteExt, process::Command};
-use vpn_api_types::{
-    peer::ClientDnsSettings,
-    system::{normalize_dns_domain, ClientDnsMode},
-};
+use vpn_api_types::{peer::ClientDnsSettings, system::ClientDnsMode};
 
 use crate::{PlatformError, Result};
 
@@ -59,32 +56,16 @@ impl DnsSession {
 /// 应用 DNS。开始前先清理上次异常退出可能遗留的产品状态；失败时立即回滚。
 pub async fn apply_dns(ifindex: u32, settings: &ClientDnsSettings) -> Result<Option<DnsSession>> {
     if settings.mode == ClientDnsMode::Disabled {
+        cleanup_stale_dns(ifindex).await?;
         return Ok(None);
     }
     let server: Ipv4Addr = settings.server.parse().map_err(|_| {
         PlatformError::InvalidArgument(format!("服务端下发了非法 DNS 地址：{}", settings.server))
     })?;
-    let domains = settings
-        .domains
-        .iter()
-        .map(|domain| normalize_dns_domain(domain).map_err(PlatformError::InvalidArgument))
-        .collect::<Result<Vec<_>>>()?;
-    if settings.mode == ClientDnsMode::Split && domains.is_empty() {
-        return Err(PlatformError::InvalidArgument(
-            "分流 DNS 缺少域名".to_string(),
-        ));
-    }
     let platform = current_platform()?;
     let interface_name = interface_name(ifindex)?;
     run_commands(cleanup_commands(platform, ifindex, &interface_name)).await?;
-    let commands = apply_commands(
-        platform,
-        ifindex,
-        &interface_name,
-        server,
-        settings.mode,
-        &domains,
-    );
+    let commands = apply_commands(platform, ifindex, &interface_name, server);
     if let Err(error) = run_commands(commands).await {
         let rollback = run_commands(cleanup_commands(platform, ifindex, &interface_name)).await;
         return match rollback {
@@ -95,7 +76,7 @@ pub async fn apply_dns(ifindex: u32, settings: &ClientDnsSettings) -> Result<Opt
             }),
         };
     }
-    tracing::info!(stage = "dns_apply", result = "succeeded", ?settings.mode, domains = domains.len(), "客户端 DNS 已应用");
+    tracing::info!(stage = "dns_apply", result = "succeeded", ?settings.mode, "客户端全局 DNS 已应用");
     Ok(Some(DnsSession {
         platform,
         ifindex,
@@ -108,11 +89,18 @@ pub async fn apply_dns(ifindex: u32, settings: &ClientDnsSettings) -> Result<Opt
 pub async fn cleanup_stale_dns(ifindex: u32) -> Result<()> {
     let platform = current_platform()?;
     let interface_name = interface_name(ifindex)?;
-    let commands = match platform {
+    run_commands(stale_cleanup_commands(platform, ifindex, &interface_name)).await
+}
+
+fn stale_cleanup_commands(
+    platform: DnsPlatform,
+    ifindex: u32,
+    interface: &str,
+) -> Vec<CommandSpec> {
+    match platform {
         DnsPlatform::Linux => Vec::new(),
-        _ => cleanup_commands(platform, ifindex, &interface_name),
-    };
-    run_commands(commands).await
+        _ => cleanup_commands(platform, ifindex, interface),
+    }
 }
 
 async fn run_commands(commands: Vec<CommandSpec>) -> Result<()> {
@@ -163,59 +151,23 @@ fn apply_commands(
     ifindex: u32,
     interface: &str,
     server: Ipv4Addr,
-    mode: ClientDnsMode,
-    domains: &[String],
 ) -> Vec<CommandSpec> {
     match platform {
-        DnsPlatform::Linux => {
-            let mut commands = vec![spec("resolvectl", ["dns", interface, &server.to_string()])];
-            let routing_domains = if mode == ClientDnsMode::Global {
-                vec!["~.".to_string()]
-            } else {
-                domains.iter().map(|domain| format!("~{domain}")).collect()
-            };
-            let mut args = vec!["domain".to_string(), interface.to_string()];
-            args.extend(routing_domains);
-            commands.push(CommandSpec {
-                program: "resolvectl",
-                args,
-                stdin: None,
-            });
-            commands
-        }
-        DnsPlatform::Macos => {
-            let supplemental_domains = if mode == ClientDnsMode::Split {
-                domains.join(" ")
-            } else {
-                // Apple VPN DNS 语义：空 match domain 把分隧道 DNS 提升为默认解析器。
-                "\"\"".to_string()
-            };
-            vec![CommandSpec {
+        DnsPlatform::Linux => vec![
+            spec("resolvectl", ["dns", interface, &server.to_string()]),
+            spec("resolvectl", ["domain", interface, "~."]),
+        ],
+        // 空 match domain 将产品自有 VPN DNS 注册为默认解析器。
+        DnsPlatform::Macos => vec![CommandSpec {
                 program: "/usr/sbin/scutil",
                 args: vec![],
                 stdin: Some(format!(
-                    "d.init\nd.add ServerAddresses * {server}\nd.add InterfaceName {interface}\nd.add SearchOrder # 1\nd.add SupplementalMatchDomains * {supplemental_domains}\nd.add SupplementalMatchDomainsNoSearch # 1\nset State:/Network/Service/{OWNER}/DNS\nquit\n"
+                    "d.init\nd.add ServerAddresses * {server}\nd.add InterfaceName {interface}\nd.add SearchOrder # 1\nd.add SupplementalMatchDomains * \"\"\nd.add SupplementalMatchDomainsNoSearch # 1\nset State:/Network/Service/{OWNER}/DNS\nquit\n"
                 )),
-            }]
-        }
-        DnsPlatform::Windows => {
-            let mut script = "$ErrorActionPreference='Stop'".to_string();
-            if mode == ClientDnsMode::Global {
-                script.push_str(&format!(
-                    "; Set-DnsClientServerAddress -InterfaceIndex {ifindex} -ServerAddresses '{server}'; Set-NetIPInterface -InterfaceIndex {ifindex} -InterfaceMetric 1; Add-DnsClientNrptRule -Namespace '.' -NameServers '{server}' -Comment '{OWNER}'"
-                ));
-            } else {
-                script.push_str(&format!(
-                    "; Set-DnsClientServerAddress -InterfaceIndex {ifindex} -ResetServerAddresses"
-                ));
-                for domain in domains {
-                    script.push_str(&format!(
-                        "; Add-DnsClientNrptRule -Namespace '.{domain}' -NameServers '{server}' -Comment '{OWNER}'"
-                    ));
-                }
-            }
-            vec![powershell(script)]
-        }
+            }],
+        DnsPlatform::Windows => vec![powershell(format!(
+            "$ErrorActionPreference='Stop'; Set-DnsClientServerAddress -InterfaceIndex {ifindex} -ServerAddresses '{server}'; Add-DnsClientNrptRule -Namespace '.' -NameServers '{server}' -Comment '{OWNER}'"
+        ))],
     }
 }
 
@@ -279,76 +231,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linux_global_and_split_commands_are_scoped_to_link() {
-        let global = apply_commands(
-            DnsPlatform::Linux,
-            7,
-            "tun7",
-            "10.9.0.1".parse().unwrap(),
-            ClientDnsMode::Global,
-            &[],
-        );
+    fn disabled_or_absent_policy_cleanup_only_removes_product_persistent_state() {
+        assert!(stale_cleanup_commands(DnsPlatform::Linux, 7, "tun7").is_empty());
+        for platform in [DnsPlatform::Macos, DnsPlatform::Windows] {
+            assert_eq!(
+                stale_cleanup_commands(platform, 7, "tun7"),
+                cleanup_commands(platform, 7, "tun7")
+            );
+        }
+    }
+
+    #[test]
+    fn global_command_count_and_size_are_bounded_without_domain_input() {
+        for platform in [DnsPlatform::Linux, DnsPlatform::Macos, DnsPlatform::Windows] {
+            let commands = apply_commands(
+                platform,
+                u32::MAX,
+                "vpn-interface",
+                Ipv4Addr::new(255, 255, 255, 254),
+            );
+            assert!(commands.len() <= 2);
+            let size: usize = commands
+                .iter()
+                .map(|command| {
+                    command.args.iter().map(String::len).sum::<usize>()
+                        + command.stdin.as_ref().map_or(0, String::len)
+                })
+                .sum();
+            assert!(size < 1024);
+        }
+    }
+
+    #[test]
+    fn linux_global_commands_are_scoped_to_link() {
+        let global = apply_commands(DnsPlatform::Linux, 7, "tun7", "10.9.0.1".parse().unwrap());
         assert_eq!(global[1].args, ["domain", "tun7", "~."]);
-        let split = apply_commands(
-            DnsPlatform::Linux,
-            7,
-            "tun7",
-            "10.9.0.1".parse().unwrap(),
-            ClientDnsMode::Split,
-            &["corp.example.com".into()],
+        assert_eq!(global[0].args, ["dns", "tun7", "10.9.0.1"]);
+        assert_eq!(
+            cleanup_commands(DnsPlatform::Linux, 7, "tun7")[0].args,
+            ["revert", "tun7"]
         );
-        assert_eq!(split[1].args, ["domain", "tun7", "~corp.example.com"]);
     }
 
     #[test]
     fn macos_uses_only_product_owned_dynamic_store_key() {
-        let commands = apply_commands(
-            DnsPlatform::Macos,
-            4,
-            "utun4",
-            "10.9.0.1".parse().unwrap(),
-            ClientDnsMode::Split,
-            &["corp.example.com".into()],
-        );
+        let commands = apply_commands(DnsPlatform::Macos, 4, "utun4", "10.9.0.1".parse().unwrap());
         let input = commands[0].stdin.as_deref().unwrap();
         assert!(input.contains("State:/Network/Service/com.xeflow.yilian.vpn/DNS"));
-        assert!(input.contains("SupplementalMatchDomains"));
-        let global = apply_commands(
-            DnsPlatform::Macos,
-            4,
-            "utun4",
-            "10.9.0.1".parse().unwrap(),
-            ClientDnsMode::Global,
-            &[],
+        assert!(input.contains("SupplementalMatchDomains * \"\""));
+        let cleanup = cleanup_commands(DnsPlatform::Macos, 4, "utun4");
+        assert_eq!(
+            cleanup[0].stdin.as_deref(),
+            Some("remove State:/Network/Service/com.xeflow.yilian.vpn/DNS\nquit\n")
         );
-        assert!(global[0]
-            .stdin
-            .as_deref()
-            .unwrap()
-            .contains("SupplementalMatchDomains * \"\""));
     }
 
     #[test]
     fn windows_nrpt_rules_have_owner_marker() {
-        let commands = apply_commands(
-            DnsPlatform::Windows,
-            12,
-            "12",
-            "10.9.0.1".parse().unwrap(),
-            ClientDnsMode::Split,
-            &["corp.example.com".into()],
-        );
+        let commands = apply_commands(DnsPlatform::Windows, 12, "12", "10.9.0.1".parse().unwrap());
         let script = &commands[0].args[3];
         assert!(script.contains("Add-DnsClientNrptRule"));
         assert!(script.contains(OWNER));
-        let global = apply_commands(
-            DnsPlatform::Windows,
-            12,
-            "12",
-            "10.9.0.1".parse().unwrap(),
-            ClientDnsMode::Global,
-            &[],
-        );
-        assert!(global[0].args[3].contains("-Namespace '.'"));
+        assert!(script.contains("-Namespace '.'"));
+        assert!(!script.contains("Set-NetIPInterface"));
+        assert!(!script.contains("InterfaceMetric"));
+        assert_eq!(script.matches("Add-DnsClientNrptRule").count(), 1);
+        assert!(script.len() < 1024);
+        let cleanup = cleanup_commands(DnsPlatform::Windows, 12, "12");
+        assert!(cleanup[0].args[3].contains(&format!("$_.Comment -eq '{OWNER}'")));
+        assert!(cleanup[0].args[3].contains("-InterfaceIndex 12 -ResetServerAddresses"));
     }
 }
