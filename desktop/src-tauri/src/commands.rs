@@ -8,6 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use tauri::Manager;
 use vpn_api_types::auth::FeishuAuthPollStatus;
@@ -21,6 +22,8 @@ use crate::observability::{self, DiagnosticsInfo, LogSnapshot};
 
 static FEISHU_LOGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 const FEISHU_AUTH_WINDOW_LABEL: &str = "feishu-auth";
+const FEISHU_AUTH_WINDOW_CLOSE_POLL_ATTEMPTS: usize = 40;
+const FEISHU_AUTH_WINDOW_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 struct FeishuLoginGuard;
 
@@ -52,6 +55,43 @@ impl FeishuAuthWindowGuard {
 impl Drop for FeishuAuthWindowGuard {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+async fn wait_until<F>(mut condition: F, attempts: usize, interval: Duration) -> bool
+where
+    F: FnMut() -> bool,
+{
+    for attempt in 0..attempts {
+        if condition() {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    false
+}
+
+async fn close_existing_feishu_auth_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(stale) = app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    stale
+        .close()
+        .map_err(|error| format!("无法关闭已有飞书授权窗口：{error}"))?;
+    drop(stale);
+
+    if wait_until(
+        || app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_none(),
+        FEISHU_AUTH_WINDOW_CLOSE_POLL_ATTEMPTS,
+        FEISHU_AUTH_WINDOW_CLOSE_POLL_INTERVAL,
+    )
+    .await
+    {
+        Ok(())
+    } else {
+        Err("旧飞书授权窗口未能关闭，请手动关闭后重试".to_string())
     }
 }
 
@@ -122,13 +162,11 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
     let _single_flight = FeishuLoginGuard::acquire()?;
     let server = validate_server_url(&server)?;
     let api = ApiClient::new(&server).map_err(|e| e.to_string())?;
+    close_existing_feishu_auth_window(&app).await?;
     let started = api.feishu_start().await.map_err(|e| e.to_string())?;
     validate_authorization_url(&started.authorization_url)?;
     let authorization_url = url::Url::parse(&started.authorization_url)
         .map_err(|_| "服务端返回了无效的飞书授权地址".to_string())?;
-    if let Some(stale) = app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL) {
-        let _ = stale.close();
-    }
     let mut auth_window_builder = tauri::WebviewWindowBuilder::new(
         &app,
         FEISHU_AUTH_WINDOW_LABEL,
@@ -186,7 +224,7 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
                 let _ = api.logout().await;
                 return Err(error);
             }
-            auth_window.close();
+            drop(auth_window);
             crate::show_window(&app);
             return Ok(());
         }
@@ -351,5 +389,56 @@ mod tests {
         assert!(FeishuLoginGuard::acquire().is_err());
         drop(first);
         assert!(FeishuLoginGuard::acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_until_returns_immediately_when_condition_is_ready() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(
+            wait_until(
+                || {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                    true
+                },
+                4,
+                Duration::ZERO,
+            )
+            .await
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_until_handles_delayed_release() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(
+            wait_until(
+                || polls.fetch_add(1, Ordering::Relaxed) >= 2,
+                4,
+                Duration::ZERO,
+            )
+            .await
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn wait_until_stops_at_attempt_limit() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(
+            !wait_until(
+                || {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                    false
+                },
+                4,
+                Duration::ZERO,
+            )
+            .await
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 4);
     }
 }
