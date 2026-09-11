@@ -4,10 +4,10 @@ use axum::extract::{rejection::JsonRejection, Query};
 use axum::{extract::State, Json};
 use vpn_api_types::{
     system::{
-        EmailNotificationSettings, NetworkSettingsView, NotificationEventQuery,
-        NotificationEventView, SystemInfo, TestEmailNotificationRequest,
-        UpdateEmailNotificationSettingsRequest, UpdateNetworkSettingsRequest,
-        UpdateServerRoutesRequest,
+        EmailNotificationSettings, IntegrationSettingsView, NetworkSettingsView,
+        NotificationEventQuery, NotificationEventView, SystemInfo, TestEmailNotificationRequest,
+        UpdateEmailNotificationSettingsRequest, UpdateIntegrationSettingsRequest,
+        UpdateNetworkSettingsRequest, UpdateServerRoutesRequest,
     },
     ApiResponse,
 };
@@ -40,6 +40,46 @@ pub async fn system_info(
     };
     Ok(Json(ApiResponse::success(
         info,
+        "n/a".to_string(),
+        state.clock.now_unix_ms(),
+    )))
+}
+
+/// GET /api/v1/admin/integrations/settings：读取脱敏的 applied/desired 集成配置。
+#[tracing::instrument(skip(state))]
+pub async fn integration_settings(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+) -> Result<Json<ApiResponse<IntegrationSettingsView>>, ApiError> {
+    let settings = state.integration_settings_service()?.view().await?;
+    Ok(Json(ApiResponse::success(
+        settings,
+        "n/a".to_string(),
+        state.clock.now_unix_ms(),
+    )))
+}
+
+/// PUT /api/v1/admin/integrations/settings：原子保存 desired，重启后生效。
+#[tracing::instrument(skip(state, body))]
+pub async fn update_integration_settings(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+    body: Result<Json<UpdateIntegrationSettingsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<IntegrationSettingsView>>, ApiError> {
+    let Json(body) =
+        body.map_err(|error| AppError::Validation(format!("集成设置请求格式非法：{error}")))?;
+    let backend = state
+        .network_settings_service()?
+        .applied()
+        .vpn
+        .wg_backend
+        .clone();
+    let settings = state
+        .integration_settings_service()?
+        .update(body, &backend)
+        .await?;
+    Ok(Json(ApiResponse::success(
+        settings,
         "n/a".to_string(),
         state.clock.now_unix_ms(),
     )))

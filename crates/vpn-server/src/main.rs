@@ -18,10 +18,10 @@ use vpn_server::{
     services::{
         build_peer_service_with_backend, domain_event_service, ApiKeyService, Argon2Hasher,
         AuditService, AuthService, ConfigService, DomainEventService, ExternalOptionsService,
-        FeishuApprovalService, FeishuAuthService, JwtTokenIssuer, NetworkAclService,
-        NetworkSettingsService, NotificationService, PeerService, ReqwestFeishuApprovalApi,
-        ReqwestFeishuIdentityProvider, SubnetExternalOptionProvider, SubnetService,
-        UserGroupExternalOptionProvider, UserGroupService, UserService,
+        FeishuApprovalService, FeishuAuthService, IntegrationSettingsService, JwtTokenIssuer,
+        NetworkAclService, NetworkSettingsService, NotificationService, PeerService,
+        ReqwestFeishuApprovalApi, ReqwestFeishuIdentityProvider, SubnetExternalOptionProvider,
+        SubnetService, UserGroupExternalOptionProvider, UserGroupService, UserService,
     },
     shutdown::shutdown_signal,
     startup, AppState, ServerConfig,
@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // 加载配置
-    let config = ServerConfig::from_env().context("加载配置失败")?;
+    let mut config = ServerConfig::from_env().context("加载配置失败")?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "vpn-server starting");
 
     // 启动校验
@@ -60,6 +60,22 @@ async fn main() -> anyhow::Result<()> {
     let peer_repo = SqlitePeerRepository::new(pool.clone());
     let config_repo = SqliteSystemConfigRepository::new(pool.clone());
     let config_service = Arc::new(ConfigService::new(config_repo.clone()));
+    let integration_settings_service = Arc::new(
+        IntegrationSettingsService::load_or_seed(
+            config_repo.clone(),
+            pool.clone(),
+            &config.feishu,
+            &config.feishu_approval,
+            &config.feishu_approval_options,
+        )
+        .await
+        .context("初始化集成设置失败")?,
+    );
+    let (feishu, feishu_approval, feishu_approval_options) =
+        integration_settings_service.applied_runtime();
+    config.feishu = feishu;
+    config.feishu_approval = feishu_approval;
+    config.feishu_approval_options = feishu_approval_options;
     let network_settings_service = Arc::new(
         NetworkSettingsService::load_or_seed(
             config_repo.clone(),
@@ -295,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
         .with_audit_service(audit_service)
         .with_config_service(config_service)
         .with_network_settings_service(network_settings_service)
+        .with_integration_settings_service(integration_settings_service)
         .with_domain_event_service(domain_event_service)
         .with_notification_service(notification_service)
         .with_db_pool(pool.clone());

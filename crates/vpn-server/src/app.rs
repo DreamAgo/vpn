@@ -97,6 +97,11 @@ pub fn build_router(state: AppState) -> Router {
                     .put(handlers::system::update_network_settings),
             )
             .route(
+                "/api/v1/admin/integrations/settings",
+                get(handlers::system::integration_settings)
+                    .put(handlers::system::update_integration_settings),
+            )
+            .route(
                 "/api/v1/admin/notifications/email",
                 get(handlers::system::email_notification_settings)
                     .put(handlers::system::update_email_notification_settings),

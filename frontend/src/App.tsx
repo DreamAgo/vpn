@@ -29,6 +29,7 @@ import { BackupPage } from './pages/BackupPage';
 import { ApiKeysPage } from './pages/ApiKeysPage';
 import { NotificationSettingsPage } from './pages/NotificationSettingsPage';
 import { NetworkSettingsPage } from './pages/NetworkSettingsPage';
+import { IntegrationSettingsPage } from './pages/IntegrationSettingsPage';
 import { useAuthStore } from './stores/authStore';
 
 const queryClient = new QueryClient({
@@ -183,6 +184,14 @@ function App() {
                     element={
                       <RequireAdminRoute>
                         <NetworkSettingsPage />
+                      </RequireAdminRoute>
+                    }
+                  />
+                  <Route
+                    path="/integration-settings"
+                    element={
+                      <RequireAdminRoute>
+                        <IntegrationSettingsPage />
                       </RequireAdminRoute>
                     }
                   />

@@ -6,9 +6,9 @@ use vpn_core::time::{Clock, SystemClock};
 
 use crate::services::{
     ApiKeyService, AuditService, AuthService, ConfigService, DomainEventService,
-    ExternalOptionsService, FeishuApprovalService, FeishuAuthService, NetworkAclService,
-    NetworkSettingsService, NotificationService, PeerService, SubnetService, UserGroupService,
-    UserService,
+    ExternalOptionsService, FeishuApprovalService, FeishuAuthService, IntegrationSettingsService,
+    NetworkAclService, NetworkSettingsService, NotificationService, PeerService, SubnetService,
+    UserGroupService, UserService,
 };
 
 /// AppState 持有所有跨 handler 共享的资源。
@@ -32,6 +32,7 @@ pub struct AppState {
     pub notification_service: Option<Arc<NotificationService>>,
     pub network_acl_service: Option<Arc<NetworkAclService>>,
     pub network_settings_service: Option<Arc<NetworkSettingsService>>,
+    pub integration_settings_service: Option<Arc<IntegrationSettingsService>>,
     pub db_pool: Option<SqlitePool>,
 }
 
@@ -55,6 +56,7 @@ impl AppState {
             notification_service: None,
             network_acl_service: None,
             network_settings_service: None,
+            integration_settings_service: None,
             db_pool: None,
         }
     }
@@ -81,6 +83,14 @@ impl AppState {
 
     pub fn with_network_settings_service(mut self, svc: Arc<NetworkSettingsService>) -> Self {
         self.network_settings_service = Some(svc);
+        self
+    }
+
+    pub fn with_integration_settings_service(
+        mut self,
+        svc: Arc<IntegrationSettingsService>,
+    ) -> Self {
+        self.integration_settings_service = Some(svc);
         self
     }
 
@@ -158,6 +168,14 @@ impl AppState {
         self.feishu_auth_service
             .clone()
             .ok_or_else(|| vpn_core::AppError::Config("飞书登录未配置".to_string()))
+    }
+
+    pub fn integration_settings_service(
+        &self,
+    ) -> Result<Arc<IntegrationSettingsService>, vpn_core::AppError> {
+        self.integration_settings_service.clone().ok_or_else(|| {
+            vpn_core::AppError::Config("integration_settings_service 未初始化".to_string())
+        })
     }
 
     pub fn feishu_approval_service(
