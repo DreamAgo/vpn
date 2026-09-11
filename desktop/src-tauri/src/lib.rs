@@ -28,6 +28,10 @@ struct TrayUi {
     disconnect: MenuItem<tauri::Wry>,
 }
 
+fn should_keep_window_alive(label: &str) -> bool {
+    label == "main"
+}
+
 /// Show + focus the main popover window(健壮版:取消最小化 + 置顶一次 + 聚焦)。
 pub(crate) fn show_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
@@ -293,12 +297,13 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭按钮只隐藏不销毁(保活在菜单栏)。**不再**失焦自动隐藏——
-            // macOS 上隐藏后常唤不回来,导致"失焦就再也打不开";改由托盘点击切换 /
-            // 关闭按钮显隐。
+            // 主窗口关闭按钮只隐藏不销毁（保活在菜单栏）；授权等临时窗口必须允许
+            // 真正销毁，否则其固定 label 无法在下一次流程中复用。
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+                if should_keep_window_alive(window.label()) {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
             }
         })
         .build(tauri::generate_context!());
@@ -323,4 +328,19 @@ pub fn run() {
             tracing::info!("桌面客户端正常退出");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_keep_window_alive;
+
+    #[test]
+    fn main_window_is_kept_alive_on_close() {
+        assert!(should_keep_window_alive("main"));
+    }
+
+    #[test]
+    fn temporary_auth_window_is_allowed_to_close() {
+        assert!(!should_keep_window_alive("feishu-auth"));
+    }
 }

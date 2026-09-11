@@ -3,7 +3,7 @@ title: '修复飞书授权窗口重复创建失败'
 type: 'bugfix'
 created: '2026-09-11'
 status: 'done'
-baseline_commit: '15375f0057514148818e1662805947aac4188dba'
+baseline_commit: '15375f0fde8ab36c15e6b5e99c89b21a10e24480'
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/spec-client-feishu-login.md'
 ---
@@ -38,6 +38,7 @@ context:
 ## Code Map
 
 - `desktop/src-tauri/src/commands.rs` -- 飞书登录互斥、授权窗口创建、轮询和 RAII 清理均集中在此；当前关闭后立即创建导致竞态。
+- `desktop/src-tauri/src/lib.rs` -- 仅主窗口拦截关闭事件；授权窗口允许真正销毁并释放固定 label。
 - `_bmad-output/implementation-artifacts/spec-client-feishu-login.md` -- 既有飞书客户端登录安全边界和验证背景。
 
 ## Tasks & Acceptance
@@ -51,7 +52,17 @@ context:
 - Given 旧窗口在上限内无法销毁，when 用户重新发起登录，then 客户端停止创建并显示明确的中文重试提示，主窗口和既有登录状态不受影响。
 - Given 没有遗留授权窗口，when 用户发起飞书登录，then 原有窗口尺寸、父窗口、HTTPS 导航限制和 OAuth 轮询行为保持不变。
 
+### Review Findings
+
+- [x] [Review][Patch][P1] 全局 `CloseRequested` 处理器阻止 `feishu-auth` 真正销毁，核心修复无效 [`desktop/src-tauri/src/lib.rs:297`]
+- [x] [Review][Patch][P2] 测试仅覆盖通用轮询器，未覆盖窗口 label 的关闭策略 [`desktop/src-tauri/src/commands.rs:394`]
+- [x] [Review][Patch][P3] 规格中的完整 `baseline_commit` 无法解析，影响后续差异审查 [`_bmad-output/implementation-artifacts/spec-fix-feishu-auth-window-recreate.md:6`]
+- [x] [Review 2][Patch][P1] 用户关闭授权窗口后轮询仍在后台继续并阻止立即重试 [`desktop/src-tauri/src/commands.rs:202`]
+
 ## Spec Change Log
+
+- 2026-09-11：三层审查后将“关闭只隐藏”限定为主窗口，补充临时窗口关闭策略测试，并修正基线提交。
+- 2026-09-11：第二轮审查补充授权窗口关闭检测，用户取消后及时释放单飞锁；若授权同时完成则撤销远端会话。
 
 ## Design Notes
 
@@ -66,6 +77,8 @@ Tauri `WebviewWindow::close()` 只提交关闭请求；真正移除窗口发生�
 
 **Manual checks:**
 - 连续完成、取消并再次发起飞书授权，均只能出现一个授权窗口，且不再提示 `feishu-auth already exists`。
+
+**Review verification (2026-09-11):** 桌面端命令测试 7 项与库测试 24 项全部通过；Clippy `-D warnings`、格式及 diff 检查通过。
 
 ## Suggested Review Order
 
@@ -82,8 +95,14 @@ Tauri `WebviewWindow::close()` 只提交关闭请求；真正移除窗口发生�
 
 **清理与回归保护**
 
+- 仅主窗口关闭时隐藏，临时授权窗口正常销毁。
+  [`lib.rs:299`](../../desktop/src-tauri/src/lib.rs#L299)
+
+- 轮询检测用户关闭窗口，完成竞态时撤销远端会话。
+  [`commands.rs:202`](../../desktop/src-tauri/src/commands.rs#L202)
+
 - 成功路径显式交给 guard 单次关闭，再显示主窗口。
-  [`commands.rs:227`](../../desktop/src-tauri/src/commands.rs#L227)
+  [`commands.rs:249`](../../desktop/src-tauri/src/commands.rs#L249)
 
 - 三类测试锁定立即、延迟与超时边界行为。
   [`commands.rs:394`](../../desktop/src-tauri/src/commands.rs#L394)

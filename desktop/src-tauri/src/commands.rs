@@ -95,6 +95,14 @@ async fn close_existing_feishu_auth_window(app: &tauri::AppHandle) -> Result<(),
     }
 }
 
+fn ensure_feishu_auth_window_open(window_exists: bool) -> Result<(), String> {
+    if window_exists {
+        Ok(())
+    } else {
+        Err("飞书授权已取消，请重试".to_string())
+    }
+}
+
 /// Open a file-backed credential repo (most reliable, no keyring prompts).
 fn repo() -> Result<CredentialRepo, String> {
     CredentialRepo::file().map_err(|e| e.to_string())
@@ -192,11 +200,17 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(started.expires_in.max(1) as u64);
     loop {
+        ensure_feishu_auth_window_open(
+            app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_some(),
+        )?;
         if tokio::time::Instant::now() >= deadline {
             return Err("飞书登录已超时，请重试".to_string());
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         tokio::time::sleep(remaining.min(std::time::Duration::from_secs(2))).await;
+        ensure_feishu_auth_window_open(
+            app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_some(),
+        )?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err("飞书登录已超时，请重试".to_string());
@@ -205,6 +219,14 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
             .await
             .map_err(|_| "飞书登录已超时，请重试".to_string())?
             .map_err(|e| e.to_string())?;
+        if let Err(error) = ensure_feishu_auth_window_open(
+            app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_some(),
+        ) {
+            if matches!(response.status, FeishuAuthPollStatus::Complete) {
+                let _ = api.logout().await;
+            }
+            return Err(error);
+        }
         if matches!(response.status, FeishuAuthPollStatus::Complete) {
             let Some(username) = response.username else {
                 let _ = api.logout().await;
@@ -440,5 +462,14 @@ mod tests {
             .await
         );
         assert_eq!(polls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn closed_auth_window_is_treated_as_user_cancellation() {
+        assert!(ensure_feishu_auth_window_open(true).is_ok());
+        assert_eq!(
+            ensure_feishu_auth_window_open(false).unwrap_err(),
+            "飞书授权已取消，请重试"
+        );
     }
 }
