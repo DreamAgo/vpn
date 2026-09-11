@@ -8,6 +8,7 @@ pub mod domain_event_service;
 pub mod external_options_service;
 pub mod feishu_approval_service;
 pub mod feishu_auth_service;
+pub mod integration_settings_service;
 pub mod network_acl_service;
 pub mod network_settings_service;
 pub mod notification_channels;
@@ -34,6 +35,7 @@ pub use feishu_approval_service::{
     ReqwestFeishuApprovalApi,
 };
 pub use feishu_auth_service::{FeishuAuthService, ReqwestFeishuIdentityProvider};
+pub use integration_settings_service::IntegrationSettingsService;
 pub use network_acl_service::{NetworkAclService, ACL_LEASE_CAP_MS, ACL_REFRESH_INTERVAL};
 pub use network_settings_service::NetworkSettingsService;
 pub use notification_service::NotificationService;

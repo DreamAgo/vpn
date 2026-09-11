@@ -1,5 +1,12 @@
 # Deferred Work
 
+## Configuration and notification hardening
+
+- 通知设置 API 仍会在 GET 响应中返回 webhook、飞书机器人和钉钉 URL；这些 URL 往往包含可直接调用的秘密 token。后续应改为与集成设置一致的只写秘密三态与 `*_set` 脱敏视图。
+- 通知设置当前按多个 `system_config` key 顺序写入，任一步失败可能留下部分新旧值混合。后续应迁移为单键版本化聚合配置或事务化批量更新。
+- `VPN_HTTPS` / `VPN_DOMAIN` 的自动 TLS 配置虽存在于配置和文档，但当前 `main.rs` 实际只启动普通 `axum::serve`，没有接线已有 ACME/TLS 启动实现。后续应完成 TLS listener 接线或修正文档与配置表面，避免误以为源站已启用 HTTPS。
+- `main.rs` 只创建 `VPN_DATA_DIR`，不会根据任意 `DATABASE_URL` 自动创建 SQLite 父目录；文档曾宣称会创建。后续应安全解析 file SQLite URL 并只创建本地数据库父目录，或在启动错误中明确要求部署先建目录。
+
 ## DNS command lifecycle
 
 - `crates/vpn-platform/src/dns.rs`：既有 `run_commands` 对 `scutil` / PowerShell 等系统命令没有执行超时或取消时终止子进程的保障，命令挂起可能阻塞 DNS 应用、恢复及连接流程。该行为在移除客户端分流前已存在；后续应为整个命令生命周期（含 stdin 写入）增加有界超时、取消清理与故障注入测试。

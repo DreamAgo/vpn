@@ -53,7 +53,7 @@ API Key 只在创建时返回一次明文，服务端只保存哈希。
 
 ### 飞书 OAuth
 
-服务端配置以下三个环境变量后启用：
+服务端首次启动可通过以下三个环境变量初始化；之后由管理后台“集成设置”维护，保存后需重启：
 
 - `VPN_FEISHU_APP_ID`
 - `VPN_FEISHU_APP_SECRET`（仅存服务端，禁止写入客户端配置或日志）
@@ -64,6 +64,8 @@ API Key 只在创建时返回一次明文，服务端只保存哈希。
 服务端只接受非空 `union_id` 作为稳定身份主键；邮箱会去除首尾空白并转为小写。缺少 `union_id`、邮箱非法或大小写不敏感匹配到多个历史账号时，登录会被拒绝并要求管理员先清理账号数据。
 
 桌面流程：先调用 `config` 探测，再调用 `start` 得到浏览器授权地址和高熵 `poll_token`；浏览器完成固定服务端 `callback` 后，客户端调用 `poll`。pending 时继续短轮询，complete 时只可领取一次现有格式的登录凭证。state、授权码、完成结果、失败结果和过期结果都不可重放，回调 HTML 永不包含 token。
+
+管理员集成配置接口为 `GET/PUT /api/v1/admin/integrations/settings`。GET 返回启动时 `applied`、数据库 `desired` 和 `restart_required`；秘密仅返回是否已设置。PUT 中秘密字段使用 `{ "value": null, "clear": false }` 保持、非空 `value` 替换、`clear: true` 显式清除，整组校验成功后才原子保存。
 
 ## 响应格式
 
@@ -164,7 +166,7 @@ https://<域名>/api/v1/integrations/feishu/approval-events
    ```
 
    返回 `code: 0` 后才表示订阅成功。更换审批定义时需要对新的 `approval_code` 再执行一次；首期不会由服务端自动订阅。
-6. 将 `approval_code`、三个控件 ID、Verification Token、Encrypt Key 写入对应 `VPN_FEISHU_APPROVAL_*` 环境变量并重启服务。
+6. 在“集成设置”填写 `approval_code`、三个控件 ID、Verification Token、Encrypt Key 并重启服务。首次部署也可用对应 `VPN_FEISHU_APPROVAL_*` 环境变量初始化。
 
 普通事件由服务端先校验 5 分钟时间窗和 `X-Lark-Signature`，再 AES-CBC 解密并校验 Verification Token。飞书首次保存回调地址所发的 challenge 可能没有签名头，此时只允许返回已成功解密且 Verification Token 正确的 challenge，不会写入业务数据。只把匹配 `approval_code` 且状态为 `APPROVED` 的普通事件写入 durable inbox，然后快速 ACK；后台 worker 会重新查询审批实例并再次确认状态。授权严格按控件 ID 和外部选项的用户组 ID 解析，不依赖中文标题或显示文案。
 
@@ -181,6 +183,7 @@ https://<域名>/api/v1/integrations/feishu/approval-events
 - 节点治理：`/api/v1/admin/peers`
 - 节点变更：`/api/v1/admin/peer-events`
 - 服务端状态：`/api/v1/admin/system/info`
+- 集成设置：`GET/PUT /api/v1/admin/integrations/settings`
 - 服务端 LAN：`/api/v1/admin/system/routes`
 - 审计日志：`/api/v1/admin/audit-logs`
 - 备份恢复：`/api/v1/admin/backup`

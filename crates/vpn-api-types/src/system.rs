@@ -444,6 +444,92 @@ pub struct NotificationEventQuery {
     pub limit: Option<u32>,
 }
 
+/// 秘密字段更新命令。`value` 为空且 `clear=false` 表示保持现值。
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SecretUpdate {
+    pub value: Option<String>,
+    #[serde(default)]
+    pub clear: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeishuLoginSettingsView {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub app_secret_set: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeishuApprovalSettingsView {
+    pub enabled: bool,
+    pub approval_code: Option<String>,
+    pub group_control_id: Option<String>,
+    pub expiry_control_id: Option<String>,
+    pub reason_control_id: Option<String>,
+    pub verification_token_set: bool,
+    pub encrypt_key_set: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeishuExternalOptionsSettingsView {
+    pub token_set: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationSettingsSnapshotView {
+    pub feishu_login: FeishuLoginSettingsView,
+    pub feishu_approval: FeishuApprovalSettingsView,
+    pub external_options: FeishuExternalOptionsSettingsView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationSettingsView {
+    pub applied: IntegrationSettingsSnapshotView,
+    pub desired: IntegrationSettingsSnapshotView,
+    pub restart_required: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateFeishuLoginSettings {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub app_secret: SecretUpdate,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateFeishuApprovalSettings {
+    pub enabled: bool,
+    pub approval_code: Option<String>,
+    pub group_control_id: Option<String>,
+    pub expiry_control_id: Option<String>,
+    pub reason_control_id: Option<String>,
+    #[serde(default)]
+    pub verification_token: SecretUpdate,
+    #[serde(default)]
+    pub encrypt_key: SecretUpdate,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateFeishuExternalOptionsSettings {
+    #[serde(default)]
+    pub token: SecretUpdate,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateIntegrationSettingsRequest {
+    pub feishu_login: UpdateFeishuLoginSettings,
+    pub feishu_approval: UpdateFeishuApprovalSettings,
+    pub external_options: UpdateFeishuExternalOptionsSettings,
+}
+
 fn default_quiet_minutes() -> u32 {
     30
 }
@@ -541,5 +627,35 @@ mod tests {
         let mut invalid = valid;
         invalid.default_upstreams = vec!["223.5.5.5:5353".into()];
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn integration_update_rejects_unknown_fields_at_every_sensitive_layer() {
+        let base = serde_json::json!({
+            "feishu_login": {
+                "enabled": false,
+                "app_id": null,
+                "redirect_uri": null,
+                "app_secret": { "value": null, "clear": false }
+            },
+            "feishu_approval": {
+                "enabled": false,
+                "approval_code": null,
+                "group_control_id": null,
+                "expiry_control_id": null,
+                "reason_control_id": null,
+                "verification_token": { "value": null, "clear": false },
+                "encrypt_key": { "value": null, "clear": false }
+            },
+            "external_options": { "token": { "value": null, "clear": false } }
+        });
+        assert!(serde_json::from_value::<UpdateIntegrationSettingsRequest>(base.clone()).is_ok());
+
+        let mut top = base.clone();
+        top["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<UpdateIntegrationSettingsRequest>(top).is_err());
+        let mut secret = base;
+        secret["feishu_login"]["app_secret"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<UpdateIntegrationSettingsRequest>(secret).is_err());
     }
 }

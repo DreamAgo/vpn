@@ -340,7 +340,6 @@ impl ServerConfig {
         let feishu_approval_options = FeishuApprovalOptionsConfig {
             token: optional_non_blank(env::var("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN").ok()),
         };
-        validate_approval_options_token(feishu_approval_options.token.as_deref())?;
         let feishu_approval = FeishuApprovalConfig {
             approval_code: optional_non_blank(env::var("VPN_FEISHU_APPROVAL_CODE").ok()),
             group_control_id: optional_non_blank(
@@ -357,42 +356,6 @@ impl ServerConfig {
             ),
             encrypt_key: optional_non_blank(env::var("VPN_FEISHU_APPROVAL_ENCRYPT_KEY").ok()),
         };
-        let approval_fields = [
-            feishu_approval.approval_code.is_some(),
-            feishu_approval.group_control_id.is_some(),
-            feishu_approval.expiry_control_id.is_some(),
-            feishu_approval.reason_control_id.is_some(),
-            feishu_approval.verification_token.is_some(),
-            feishu_approval.encrypt_key.is_some(),
-        ];
-        if approval_fields.iter().any(|set| *set) && !feishu_approval.enabled() {
-            anyhow::bail!("飞书审批配置必须六项同时设置");
-        }
-        if feishu_approval.enabled() && !feishu.enabled() {
-            anyhow::bail!(
-                "飞书审批需要同时配置 VPN_FEISHU_APP_ID、VPN_FEISHU_APP_SECRET 与 VPN_FEISHU_REDIRECT_URI"
-            );
-        }
-        if feishu_approval
-            .verification_token
-            .as_deref()
-            .is_some_and(|value| value.len() < 16)
-            || feishu_approval
-                .encrypt_key
-                .as_deref()
-                .is_some_and(|value| value.len() < 16)
-        {
-            anyhow::bail!("飞书审批 Verification Token 与 Encrypt Key 至少需要 16 个字符");
-        }
-
-        if feishu.enabled() {
-            if let Some(uri) = feishu.redirect_uri.as_deref() {
-                if !uri.trim().starts_with("https://") {
-                    anyhow::bail!("VPN_FEISHU_REDIRECT_URI 必须使用 HTTPS");
-                }
-            }
-        }
-
         Ok(Self {
             bind_addr,
             database_url,
@@ -414,13 +377,6 @@ fn optional_non_blank(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn validate_approval_options_token(token: Option<&str>) -> anyhow::Result<()> {
-    if token.is_some_and(|token| token.len() < 32) {
-        anyhow::bail!("VPN_FEISHU_APPROVAL_OPTIONS_TOKEN 至少需要 32 个字符");
-    }
-    Ok(())
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -519,12 +475,5 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("configured: true"));
         assert!(!debug.contains("super-secret"));
-    }
-
-    #[test]
-    fn approval_options_token_requires_minimum_length() {
-        assert!(validate_approval_options_token(None).is_ok());
-        assert!(validate_approval_options_token(Some(&"x".repeat(32))).is_ok());
-        assert!(validate_approval_options_token(Some("too-short")).is_err());
     }
 }

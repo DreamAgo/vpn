@@ -7,6 +7,7 @@ import { http } from './http';
 import type {
   ChangePasswordRequest,
   EmailNotificationSettings,
+  IntegrationSettingsView,
   FirstTimeSetupRequest,
   FirstTimeSetupResponse,
   LoginRequest,
@@ -20,6 +21,7 @@ import type {
   SystemInfo,
   TestEmailNotificationRequest,
   UpdateEmailNotificationSettingsRequest,
+  UpdateIntegrationSettingsRequest,
   UpdateNetworkSettingsRequest,
 } from '@/types/api';
 
@@ -73,6 +75,18 @@ export const systemApi = {
 
   async updateNetworkSettings(req: UpdateNetworkSettingsRequest): Promise<NetworkSettingsView> {
     const res = await http.put<NetworkSettingsView>('/admin/network/settings', req);
+    return res.data;
+  },
+
+  async getIntegrationSettings(): Promise<IntegrationSettingsView> {
+    const res = await http.get<IntegrationSettingsView>('/admin/integrations/settings');
+    return res.data;
+  },
+
+  async updateIntegrationSettings(
+    req: UpdateIntegrationSettingsRequest
+  ): Promise<IntegrationSettingsView> {
+    const res = await http.put<IntegrationSettingsView>('/admin/integrations/settings', req);
     return res.data;
   },
 

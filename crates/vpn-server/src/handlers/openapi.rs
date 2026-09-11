@@ -177,6 +177,22 @@ pub async fn openapi_json() -> Json<Value> {
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
                 }
             },
+            "/api/v1/admin/integrations/settings": {
+                "get": {
+                    "tags": ["Integrations"],
+                    "summary": "读取脱敏的飞书集成 applied/desired 配置",
+                    "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+                },
+                "put": {
+                    "tags": ["Integrations"],
+                    "summary": "原子保存飞书集成 desired 配置（重启后生效）",
+                    "description": "秘密只支持保持、替换或显式清除，响应仅返回是否已设置。",
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/Envelope" },
+                        "400": { "$ref": "#/components/responses/Envelope" }
+                    }
+                }
+            },
             "/api/v1/admin/users": {
                 "get": {
                     "tags": ["Users"],

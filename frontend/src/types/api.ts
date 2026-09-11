@@ -190,6 +190,59 @@ export interface NotificationEventQuery {
   limit?: number;
 }
 
+export interface SecretUpdate {
+  value?: string | null;
+  clear?: boolean;
+}
+
+export interface IntegrationSettingsSnapshot {
+  feishuLogin: {
+    enabled: boolean;
+    appId: string | null;
+    redirectUri: string | null;
+    appSecretSet: boolean;
+  };
+  feishuApproval: {
+    enabled: boolean;
+    approvalCode: string | null;
+    groupControlId: string | null;
+    expiryControlId: string | null;
+    reasonControlId: string | null;
+    verificationTokenSet: boolean;
+    encryptKeySet: boolean;
+  };
+  externalOptions: {
+    tokenSet: boolean;
+  };
+}
+
+export interface IntegrationSettingsView {
+  applied: IntegrationSettingsSnapshot;
+  desired: IntegrationSettingsSnapshot;
+  restartRequired: boolean;
+}
+
+export interface UpdateIntegrationSettingsRequest {
+  feishuLogin: {
+    enabled: boolean;
+    appId?: string | null;
+    redirectUri?: string | null;
+    appSecret: SecretUpdate;
+  };
+  feishuApproval: {
+    enabled: boolean;
+    approvalCode?: string | null;
+    groupControlId?: string | null;
+    expiryControlId?: string | null;
+    reasonControlId?: string | null;
+    verificationToken: SecretUpdate;
+    encryptKey: SecretUpdate;
+  };
+  externalOptions: {
+    token: SecretUpdate;
+  };
+}
+
 // ===== User management DTOs (与 vpn-api-types::user 对齐, Epic 3) =====
 
 export interface UserDto {
