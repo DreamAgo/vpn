@@ -27,3 +27,15 @@ pub async fn shutdown_signal() {
         _ = terminate => tracing::info!("Received SIGTERM, shutting down gracefully"),
     }
 }
+
+/// 重启请求与操作系统停止信号共用 HTTP 优雅关闭路径。
+pub async fn shutdown_or_restart(mut restart: tokio::sync::watch::Receiver<bool>) {
+    tokio::select! {
+        _ = shutdown_signal() => {},
+        _ = async {
+            let _ = restart.wait_for(|requested| *requested).await;
+            // 让触发重启的 HTTP 响应先完成发送。
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        } => tracing::info!("Restart requested, draining HTTP connections"),
+    }
+}

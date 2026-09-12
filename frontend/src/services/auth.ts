@@ -57,6 +57,10 @@ export const authApi = {
 };
 
 export const systemApi = {
+  async restartServer(): Promise<void> {
+    await http.post('/admin/system/restart');
+  },
+
   async getSystemInfo(): Promise<SystemInfo> {
     const res = await http.get<SystemInfo>('/admin/system/info');
     return res.data;

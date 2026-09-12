@@ -17,6 +17,7 @@ use crate::services::{
 #[derive(Clone)]
 pub struct AppState {
     pub clock: Arc<dyn Clock>,
+    pub restart_tx: Option<tokio::sync::watch::Sender<bool>>,
     pub auth_service: Option<Arc<AuthService>>,
     pub feishu_auth_service: Option<Arc<FeishuAuthService>>,
     pub feishu_approval_service: Option<Arc<FeishuApprovalService>>,
@@ -41,6 +42,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             clock: Arc::new(SystemClock),
+            restart_tx: None,
             auth_service: None,
             feishu_auth_service: None,
             feishu_approval_service: None,
