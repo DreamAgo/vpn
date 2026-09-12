@@ -23,7 +23,7 @@ function changedRestartFields(applied: DataPlaneSettings, desired: DataPlaneSett
 }
 
 export function NetworkSettingsPage() {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
   const [form] = Form.useForm<UpdateNetworkSettingsRequest>();
   const mode = Form.useWatch(['desired', 'mtu', 'mode'], form);
@@ -55,9 +55,40 @@ export function NetworkSettingsPage() {
         form.setFieldsValue({ desired: result.desired, serverRoutes: result.serverRoutes });
         hydratedVersion.current = version;
       }
-      message.success(result.restartRequired ? '配置已保存，请安排重启服务端' : '网络配置已保存');
+      message.success(result.restartRequired ? '配置已保存，点击“重启并应用”即可生效' : '网络配置已保存');
     },
     onError: (reason) => message.error(reason instanceof Error ? reason.message : '保存失败'),
+  });
+
+  const restart = useMutation({
+    mutationFn: async () => {
+      await systemApi.restartServer();
+      message.info('服务端正在重启，等待配置生效…');
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        try {
+          const settings = await systemApi.getNetworkSettings();
+          if (!settings.restartRequired) return settings;
+        } catch {
+          // 重启期间连接暂时不可用，继续等待。
+        }
+      }
+      throw new Error('尚未确认配置生效，请稍后刷新页面检查服务状态');
+    },
+    onSuccess: (settings) => {
+      queryClient.setQueryData(QUERY_KEY, settings);
+      void queryClient.invalidateQueries({ queryKey: ['system-info'] });
+      message.success('服务端已重启，配置已生效');
+    },
+    onError: (reason) => message.error(reason instanceof Error ? reason.message : '重启失败'),
+  });
+  const confirmRestart = () => modal.confirm({
+    title: '重启服务端并应用已保存配置？',
+    content: '在线 VPN 连接会暂时中断。仅应用已保存的配置，请先保存表单中的修改。',
+    okText: '重启并应用',
+    cancelText: '取消',
+    onOk: () => { restart.mutate(); },
   });
 
   const save = async () => {
@@ -72,13 +103,13 @@ export function NetworkSettingsPage() {
   return <div>
     <div className="page-heading">
       <div><span className="bp-eyebrow">数据面策略</span><Title level={4} style={{ margin: '6px 0 0' }}>网络设置</Title></div>
-      <Button type="primary" icon={<SaveOutlined />} disabled={!data || isError} loading={mutation.isPending} onClick={() => void save()}>保存配置</Button>
+      <Button type="primary" icon={<SaveOutlined />} disabled={!data || isError || restart.isPending} loading={mutation.isPending} onClick={() => void save()}>保存配置</Button>
     </div>
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {isError && <Alert showIcon type="error" message="网络参数加载失败" description={error instanceof Error ? error.message : '请稍后重试'} action={<Button onClick={() => void refetch()}>重试</Button>} />}
-      {data?.restartRequired && <Alert showIcon type="warning" message="存在待重启配置" description={`待生效：${restartChanges.join('、')}。服务不会自动重启或断开节点；若包含虚拟子网，重启前暂停节点注册。`} />}
+      {data?.restartRequired && <Alert showIcon type="warning" message="存在待重启配置" description={`待生效：${restartChanges.join('、')}。点击“重启并应用”使配置生效；若包含虚拟子网，重启前暂停节点注册。`} action={<Button loading={restart.isPending} disabled={mutation.isPending} onClick={confirmRestart}>重启并应用</Button>} />}
       <Alert showIcon type="info" message="生效方式" description="基础 VPN 与混淆配置重启后生效；LAN 路由和 DNS 转发规则立即热更新；客户端 DNS 在新连接或重连时应用。环境变量只用于首次初始化。" />
-      <Form form={form} layout="vertical" disabled={!data || isError || mutation.isPending} onValuesChange={() => { editVersion.current += 1; }}>
+      <Form form={form} layout="vertical" disabled={!data || isError || mutation.isPending || restart.isPending} onValuesChange={() => { editVersion.current += 1; }}>
         <Card title="基础 VPN" loading={isLoading}>
           <Row gutter={16}>
             <Col xs={24} md={12}><Form.Item name={['desired','vpn','vpnSubnet']} label="虚拟子网" rules={[{ required: true }, { validator: (_, value) => isValidCidr(value) ? Promise.resolve() : Promise.reject(new Error('请输入合法 IPv4 CIDR')) }]}><Input placeholder="10.8.0.0/24" /></Form.Item></Col>

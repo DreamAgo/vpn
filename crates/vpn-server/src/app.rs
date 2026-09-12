@@ -88,6 +88,10 @@ pub fn build_router(state: AppState) -> Router {
                 get(handlers::system::system_info),
             )
             .route(
+                "/api/v1/admin/system/restart",
+                post(handlers::system::restart_server),
+            )
+            .route(
                 "/api/v1/admin/system/routes",
                 axum::routing::put(handlers::system::update_server_routes),
             )

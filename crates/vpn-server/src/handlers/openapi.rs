@@ -162,6 +162,17 @@ pub async fn openapi_json() -> Json<Value> {
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
                 }
             },
+            "/api/v1/admin/system/restart": {
+                "post": {
+                    "summary": "管理员重启服务端并应用已保存配置",
+                    "security": [{"bearerAuth": []}],
+                    "responses": {
+                        "200": {"description": "重启请求已接受"},
+                        "403": {"description": "需要管理员权限"},
+                        "500": {"description": "在线重启不可用"}
+                    }
+                }
+            },
             "/api/v1/admin/system/info": {
                 "get": {
                     "tags": ["System"],

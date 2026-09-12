@@ -51,6 +51,12 @@ async fn request(
 }
 
 async fn setup() -> (axum::Router, tempfile::TempDir, String) {
+    setup_with_restart(None).await
+}
+
+async fn setup_with_restart(
+    restart_tx: Option<tokio::sync::watch::Sender<bool>>,
+) -> (axum::Router, tempfile::TempDir, String) {
     let url = format!(
         "sqlite:file:network_settings_flow_{}?mode=memory&cache=shared",
         uuid::Uuid::new_v4()
@@ -100,12 +106,12 @@ async fn setup() -> (axum::Router, tempfile::TempDir, String) {
         .await
         .unwrap(),
     );
-    let app = build_router(
-        AppState::new()
-            .with_auth_service(auth_service)
-            .with_user_service(user_service)
-            .with_network_settings_service(network_settings_service),
-    );
+    let mut state = AppState::new()
+        .with_auth_service(auth_service)
+        .with_user_service(user_service)
+        .with_network_settings_service(network_settings_service);
+    state.restart_tx = restart_tx;
+    let app = build_router(state);
     let (_, setup_body) = request(
         &app,
         "POST",
@@ -285,6 +291,16 @@ async fn non_admin_cannot_read_or_modify_network_settings() {
     .await;
     let user_token = logged_in["data"]["access_token"].as_str().unwrap();
 
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/admin/system/restart",
+        None,
+        Some(user_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
     for method in ["GET", "PUT"] {
         let body = (method == "PUT").then(|| json!({ "desired": {}, "server_routes": [] }));
         let (status, _) = request(
@@ -297,4 +313,50 @@ async fn non_admin_cannot_read_or_modify_network_settings() {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
+}
+
+#[tokio::test]
+async fn restart_requires_auth_and_notifies_lifecycle_without_exiting_test_process() {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (app, _temp, admin_token) = setup_with_restart(Some(tx)).await;
+    let (status, _) = request(&app, "POST", "/api/v1/admin/system/restart", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!*rx.borrow());
+    for _ in 0..2 {
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/api/v1/admin/system/restart",
+            None,
+            Some(&admin_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], 0);
+        assert!(*rx.borrow());
+    }
+    drop(rx);
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/admin/system/restart",
+        None,
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn unavailable_restart_returns_error() {
+    let (app, _temp, admin_token) = setup().await;
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/admin/system/restart",
+        None,
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }

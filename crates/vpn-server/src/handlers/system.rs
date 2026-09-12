@@ -210,3 +210,22 @@ pub async fn list_notification_events(
         state.clock.now_unix_ms(),
     )))
 }
+
+/// POST /api/v1/admin/system/restart：管理员请求重启，先返回响应再关闭监听。
+pub async fn restart_server(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let tx = state
+        .restart_tx
+        .as_ref()
+        .ok_or_else(|| AppError::Config("当前运行环境不支持在线重启".to_string()))?;
+    tx.send(true)
+        .map_err(|_| AppError::Config("服务正在关闭，请稍后检查运行状态".to_string()))?;
+    tracing::info!("管理员请求重启服务端");
+    Ok(Json(ApiResponse::success(
+        (),
+        "n/a".to_string(),
+        state.clock.now_unix_ms(),
+    )))
+}

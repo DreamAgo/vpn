@@ -23,12 +23,11 @@ use vpn_server::{
         ReqwestFeishuApprovalApi, ReqwestFeishuIdentityProvider, SubnetExternalOptionProvider,
         SubnetService, UserGroupExternalOptionProvider, UserGroupService, UserService,
     },
-    shutdown::shutdown_signal,
+    shutdown::shutdown_or_restart,
     startup, AppState, ServerConfig,
 };
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // 初始化 tracing（JSON 输出到 stdout，由 RUST_LOG 控制级别）
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -37,6 +36,28 @@ async fn main() -> anyhow::Result<()> {
         .with_target(true)
         .init();
 
+    let runtime = tokio::runtime::Runtime::new()?;
+    let (restart_tx, restart_rx) = tokio::sync::watch::channel(false);
+    runtime.block_on(run(restart_tx, restart_rx.clone()))?;
+    // 先销毁运行时，释放监听端口、数据库连接和所有后台任务，再替换进程。
+    drop(runtime);
+    if *restart_rx.borrow() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let error = std::process::Command::new(std::env::current_exe()?)
+                .args(std::env::args_os().skip(1))
+                .exec();
+            return Err(error).context("重新启动服务端失败");
+        }
+    }
+    Ok(())
+}
+
+async fn run(
+    restart_tx: tokio::sync::watch::Sender<bool>,
+    restart_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     // 加载配置
     let mut config = ServerConfig::from_env().context("加载配置失败")?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "vpn-server starting");
@@ -324,6 +345,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(service) = feishu_approval_service {
         state = state.with_feishu_approval_service(service);
     }
+    if cfg!(unix) {
+        state.restart_tx = Some(restart_tx);
+    }
     let app = build_router(state);
 
     // 监听端口
@@ -336,7 +360,7 @@ async fn main() -> anyhow::Result<()> {
     // 启动服务（含优雅关闭）
     if let Some(proxy) = obfs_proxy {
         tokio::select! {
-            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_or_restart(restart_rx.clone())) => {
                 result.context("HTTP 服务运行失败")?;
             }
             result = proxy.run() => {
@@ -348,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         tokio::select! {
-            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_or_restart(restart_rx.clone())) => {
                 result.context("HTTP 服务运行失败")?;
             }
             result = dns_server.run() => {
