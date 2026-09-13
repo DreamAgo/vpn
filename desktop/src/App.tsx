@@ -313,7 +313,7 @@ export default function App() {
       currentState === "connecting" ||
       currentState === "reconnecting";
     if (hasActiveLink || busy) {
-      const ok = window.confirm("当前安全链路可能仍在运行。退出易链会停止托盘进程，确定退出吗？");
+      const ok = window.confirm("退出易链将断开当前安全链路，确定退出吗？");
       if (!ok) return;
     }
     void quitApp();

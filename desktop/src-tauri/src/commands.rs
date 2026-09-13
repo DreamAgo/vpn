@@ -122,14 +122,8 @@ pub async fn get_status(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<Status
 
 /// 建立连接(注册 + 建用户态隧道 + 心跳)。需以特权运行(开 TUN)。
 #[tauri::command]
-pub async fn connect(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = mgr;
-        crate::macos_helper::connect().await
-    }
-    #[cfg(not(target_os = "macos"))]
-    mgr.connect().await
+pub async fn connect(app: tauri::AppHandle) -> Result<(), String> {
+    crate::connect_vpn(&app).await
 }
 
 /// 断开连接。
