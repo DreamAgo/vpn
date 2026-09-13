@@ -7,15 +7,16 @@
 //! - tokio UDP：与服务端 endpoint 收发密文。
 //!
 //! 转发循环（单任务 `tokio::select!`）：
-//! - TUN 读到出站 IP 包 → `Tunn::encapsulate` → UDP 送服务端；
+//! - TUN 读到 IPv4 TCP → 本地 TCP Router 按连接选择内网或 VPN；
+//! - 其余 IP 包及 TCP 的 VPN 分支 → `Tunn::encapsulate` → UDP 送服务端；
 //! - UDP 收到密文 → `Tunn::decapsulate` → 写回 TUN（或回送握手包）；
 //! - 定时 `Tunn::update_timers` → 维护握手 / persistent-keepalive。
 //!
 //! 运行要求：仅需 root/管理员（开 TUN 设备），**无需安装任何 WireGuard 工具**。
 //! Windows 额外需随包分发的 `wintun.dll`（由 `tun` 依赖加载，非用户安装）。
 
-use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use base64::Engine;
@@ -33,6 +34,7 @@ use zeroize::Zeroizing;
 
 use crate::daemon::{SharedState, TunnelTransport};
 use crate::error::{CliError, CliResult};
+use crate::tcp_proxy::{Event as TcpEvent, Router as TcpRouter};
 
 const IP_UDP_OVERHEAD: u16 = 28;
 const WG_OVERHEAD: u16 = 32;
@@ -216,6 +218,7 @@ fn prefix_to_netmask_v4(prefix: u8) -> Ipv4Addr {
 }
 
 /// 解析 `a.b.c.d/n` 为 (网络地址, 前缀)。
+#[cfg(test)]
 fn parse_cidr_v4(s: &str) -> Option<(Ipv4Addr, u8)> {
     let (ip, pfx) = s.trim().split_once('/')?;
     let ip: Ipv4Addr = ip.parse().ok()?;
@@ -224,6 +227,34 @@ fn parse_cidr_v4(s: &str) -> Option<(Ipv4Addr, u8)> {
         return None;
     }
     Some((ip, pfx))
+}
+
+/// Keep configured destinations on the TUN. The TCP router chooses a path per
+/// connection, so it must never install a physical /32 that redirects other
+/// connections to the same address. Retain the VPN subnet as its own route.
+fn tunnel_routes(allowed: &[String], vpn: ipnet::Ipv4Net, ifindex: u32) -> Vec<Route> {
+    let mut networks = BTreeMap::new();
+    for cidr in allowed {
+        let Ok(network) = cidr.trim().parse::<ipnet::Ipv4Net>() else {
+            continue;
+        };
+        if network.prefix_len() == 0 {
+            continue;
+        }
+        let network = network.trunc();
+        networks.insert(
+            network,
+            Route::new(network.network().into(), network.prefix_len()).with_ifindex(ifindex),
+        );
+    }
+    if vpn.prefix_len() != 0 {
+        let vpn = vpn.trunc();
+        networks.insert(
+            vpn,
+            Route::new(vpn.network().into(), vpn.prefix_len()).with_ifindex(ifindex),
+        );
+    }
+    networks.into_values().collect()
 }
 
 /// 用户态隧道句柄（保留拆除所需信息）。任务在 shutdown 信号后自行清理路由并退出。
@@ -409,62 +440,26 @@ impl UserspaceTunnel {
             "VPN UDP endpoint 已就绪"
         );
 
-        // 5) 加路由：把所有 allowed_routes（含 VPN 子网）显式指向 TUN 接口。
-        // 不能依赖"接口地址自动产生连通路由"——macOS utun 是点对点接口，不会自动生成
-        // 子网路由（发往 10.8.0.1 的包会走默认网卡而非隧道）。Linux 上若连通路由已存在，
-        // 这里的重复添加只会无害告警。
-        let routes_started = std::time::Instant::now();
-        tracing::info!(
-            stage = "route_apply",
-            result = "started",
-            requested = allowed_routes.len(),
-            "开始应用 VPN 路由"
-        );
-        let requested_routes = allowed_routes.len();
-        let handle = Handle::new().map_err(|error| {
-            tracing::warn!(stage = "route_apply", result = "failed", elapsed_ms = routes_started.elapsed().as_millis(), error = %crate::error::redact_sensitive(&error.to_string()), "创建路由句柄失败");
-            CliError::Other(format!("路由句柄失败: {error}"))
-        })?;
-        // 以 (归一化 CIDR 串, Route) 记账,便于后续与心跳下发的新集合做增量 diff。
-        let mut added: Vec<(String, Route)> = Vec::new();
-        for r in allowed_routes {
-            let Some((dest, pfx)) = parse_cidr_v4(r) else {
-                tracing::warn!(route = %r, "跳过非法 allowed_route");
-                continue;
-            };
-            if pfx == 0 {
-                // 默认路由（0.0.0.0/0）缺少 endpoint 旁路会把发往服务端的 UDP 也卷进隧道形成
-                // 回环、瘫痪连接。服务端已在路由校验处拒绝 0.0.0.0/0，这里再兜底跳过以防旧配置。
-                tracing::warn!(route = %r, "跳过默认路由(0.0.0.0/0):用户态后端暂不支持全隧道");
-                continue;
-            }
-            let route = Route::new(IpAddr::V4(dest), pfx).with_ifindex(ifindex);
-            match handle.add(&route).await {
-                Ok(()) => added.push((r.clone(), route)),
-                Err(e) => tracing::warn!(
-                    stage = "route_apply",
-                    result = "failed",
-                    route = %r,
-                    error = %crate::error::redact_sensitive(&e.to_string()),
-                    "加路由失败（可能已存在）"
-                ),
-            }
-        }
-
-        let route_result = if added.len() == requested_routes {
+        // 5) Configured destinations stay on the TUN. A TCP connection can use
+        // a physical socket without changing the routes of other connections.
+        let vpn_subnet = ipnet::Ipv4Net::new(vpn_ip, subnet_prefix)
+            .map_err(|error| CliError::Invalid(format!("无效 VPN 子网: {error}")))?
+            .trunc();
+        let handle =
+            Handle::new().map_err(|error| CliError::Other(format!("路由句柄失败: {error}")))?;
+        let desired = tunnel_routes(allowed_routes, vpn_subnet, ifindex);
+        let mut added = Vec::new();
+        crate::route_reconcile::reconcile(&handle, &mut added, &desired).await;
+        let route_result = if added.len() == desired.len() {
             "succeeded"
-        } else if added.is_empty() && requested_routes > 0 {
-            "failed"
         } else {
             "degraded"
         };
         tracing::info!(
             stage = "route_apply",
             result = route_result,
-            elapsed_ms = routes_started.elapsed().as_millis(),
-            requested = requested_routes,
+            requested = desired.len(),
             applied = added.len(),
-            skipped_or_failed = requested_routes.saturating_sub(added.len()),
             "VPN 路由应用完成"
         );
 
@@ -474,8 +469,8 @@ impl UserspaceTunnel {
             match vpn_platform::apply_dns(ifindex, settings).await {
                 Ok(session) => session,
                 Err(error) => {
-                    for (_, route) in &added {
-                        let _ = handle.delete(route).await;
+                    if crate::route_reconcile::cleanup(&handle, &mut added).await > 0 {
+                        return Err(CliError::Cleanup("DNS 配置失败且路由回滚未完成".into()));
                     }
                     tracing::warn!(stage = "dns_apply", result = "failed", error = %error, "应用客户端 DNS 失败，连接已回滚");
                     return Err(CliError::Other(format!("应用客户端 DNS 失败：{error}")));
@@ -483,8 +478,8 @@ impl UserspaceTunnel {
             }
         } else {
             if let Err(error) = vpn_platform::cleanup_stale_dns(ifindex).await {
-                for (_, route) in &added {
-                    let _ = handle.delete(route).await;
+                if crate::route_reconcile::cleanup(&handle, &mut added).await > 0 {
+                    return Err(CliError::Cleanup("DNS 清理失败且路由回滚未完成".into()));
                 }
                 tracing::warn!(stage = "dns_cleanup", result = "failed", error = %error, "清理上次遗留的客户端 DNS 失败，连接已回滚");
                 return Err(CliError::Other(format!("清理遗留客户端 DNS 失败：{error}")));
@@ -517,6 +512,9 @@ impl UserspaceTunnel {
                 routes_rx,
                 obfs,
                 dns_session,
+                allowed_routes.to_vec(),
+                vpn_subnet,
+                usize::from(mtu),
                 usize::from(mtu) + usize::from(WG_OVERHEAD) + 64,
             )
             .instrument(tracing::Span::current()),
@@ -540,6 +538,9 @@ async fn forward_loop(
     mut routes_rx: Option<watch::Receiver<Vec<String>>>,
     mut obfs: Option<ObfsRuntime>,
     mut dns_session: Option<vpn_platform::DnsSession>,
+    mut allowed_routes: Vec<String>,
+    vpn_subnet: ipnet::Ipv4Net,
+    mtu: usize,
     packet_buffer_size: usize,
 ) -> CliResult<()> {
     let loop_started = std::time::Instant::now();
@@ -553,6 +554,9 @@ async fn forward_loop(
     let mut enc_buf = vec![0u8; packet_buffer_size];
     let mut udp_read_buf = vec![0u8; 65535];
     let mut ticker = tokio::time::interval(TIMER_TICK);
+    let mut tcp = TcpRouter::start(allowed_routes.clone(), vpn_subnet, ifindex, mtu);
+    let mut route_retry = tokio::time::interval(Duration::from_secs(5));
+    route_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // 本地累加收发字节，按 TIMER_TICK 节奏批量刷回 SharedState——避免每包都锁 mutex
     // （高吞吐时每秒数千包，逐包加锁会成为热点）。统计的是隧道明文负载（用户可见的
@@ -582,66 +586,33 @@ async fn forward_loop(
                 // 显式置位 true，或 sender 被 drop（通道关闭）→ 退出并在循环末尾清理路由。
                 if res.is_err() || *shutdown.borrow() { break Ok(()); }
             }
-            // 出站：TUN → 加密 → UDP
+            // 出站：TCP 交给按连接选路，其余报文直接进入 WireGuard。
             r = device.recv(&mut tun_read_buf) => {
                 match r {
                     Ok(n) => {
                         if n == 0 {
                             continue;
                         }
-                        let plaintext = match pad_wireguard_plaintext(&mut tun_read_buf, n) {
-                            Ok(packet) => packet,
+                        if tcp.try_send(tun_read_buf[..n].to_vec()) {
+                            continue;
+                        }
+                        match encapsulate_outgoing(
+                            &mut tunn,
+                            &udp,
+                            obfs.as_ref(),
+                            &mut tun_read_buf,
+                            n,
+                            &mut enc_buf,
+                            &mut send_state,
+                        ).await {
+                            Ok((tx_bytes, failures)) => {
+                                tx_acc = tx_acc.saturating_add(tx_bytes);
+                                udp_send_failures = udp_send_failures.saturating_add(failures);
+                            }
                             Err(error) => {
-                                tracing::warn!(
-                                    stage = "wireguard_padding",
-                                    result = "failed",
-                                    original_len = n,
-                                    buffer_capacity = tun_read_buf.len(),
-                                    error = %error.safe_diagnostic(),
-                                    "WireGuard 业务报文填充失败，数据面停止"
-                                );
-                                if let Some(s) = &traffic {
-                                    s.set_error(
-                                        format!("数据面中断(WireGuard 填充失败): {}", error.safe_diagnostic()),
-                                        crate::daemon::now_unix(),
-                                    ).await;
-                                }
-                                let _ = shutdown_tx.send(true);
+                                stop_data_plane(&traffic, &shutdown_tx, &error).await;
                                 break Err(error);
                             }
-                        };
-                        match tunn.encapsulate(plaintext, &mut enc_buf) {
-                            TunnResult::WriteToNetwork(p) => {
-                                let is_data = wireguard_packet_type(p) == Some(4);
-                                let sent = match send_network(&udp, obfs.as_ref(), p).await {
-                                    Ok(()) => true,
-                                    Err(error) => {
-                                        send_state.failure_logger.record("tun_data", p, &error);
-                                        udp_send_failures = udp_send_failures.saturating_add(1);
-                                        false
-                                    }
-                                };
-                                if is_data && sent {
-                                    // 只在业务 Data 报文实际发送成功后统计；握手包不算用户流量。
-                                    tx_acc = tx_acc.saturating_add(n as u64);
-                                } else if !is_data {
-                                    send_state.track_pending_tx(n);
-                                }
-                            }
-                            TunnResult::Done => {
-                                send_state.track_pending_tx(n);
-                            }
-                            TunnResult::Err(error) => {
-                                tracing::warn!(
-                                    stage = "wireguard_encapsulate",
-                                    result = "failed",
-                                    original_len = n,
-                                    padded_len = plaintext.len(),
-                                    error = ?error,
-                                    "WireGuard 业务报文封装失败"
-                                );
-                            }
-                            _ => {}
                         }
                     }
                     Err(e) => {
@@ -711,10 +682,74 @@ async fn forward_loop(
             changed = wait_routes_change(&mut routes_rx) => {
                 if changed {
                     if let Some(rx) = routes_rx.as_ref() {
-                        let desired = rx.borrow().clone();
-                        apply_route_diff(&handle, ifindex, &mut added_routes, &desired).await;
+                        allowed_routes = rx.borrow().clone();
+                        tcp.set_allowed(allowed_routes.clone());
+                        let desired = tunnel_routes(&allowed_routes, vpn_subnet, ifindex);
+                        crate::route_reconcile::reconcile(&handle, &mut added_routes, &desired).await;
                     }
                 }
+            }
+            event = tcp.recv() => {
+                match event {
+                    Some(TcpEvent::ToVpn(packet)) => {
+                        // A delayed decision must use the same padding, error
+                        // handling and byte accounting as immediate VPN traffic.
+                        let size = packet.len();
+                        let Some(buffer) = tun_read_buf.get_mut(..size) else {
+                            let error = CliError::Other(format!(
+                                "TCP 选路返回的报文长度 {size} 超过缓冲区容量 {}",
+                                tun_read_buf.len()
+                            ));
+                            stop_data_plane(&traffic, &shutdown_tx, &error).await;
+                            break Err(error);
+                        };
+                        buffer.copy_from_slice(&packet);
+                        match encapsulate_outgoing(
+                            &mut tunn,
+                            &udp,
+                            obfs.as_ref(),
+                            &mut tun_read_buf,
+                            size,
+                            &mut enc_buf,
+                            &mut send_state,
+                        ).await {
+                            Ok((tx_bytes, failures)) => {
+                                tx_acc = tx_acc.saturating_add(tx_bytes);
+                                udp_send_failures = udp_send_failures.saturating_add(failures);
+                            }
+                            Err(error) => {
+                                stop_data_plane(&traffic, &shutdown_tx, &error).await;
+                                break Err(error);
+                            }
+                        }
+                    }
+                    Some(TcpEvent::ToTun(packet)) => {
+                        if let Err(error) = device.send(&packet).await {
+                            let error = CliError::Other(format!("TCP 直连写入 TUN 失败: {error}"));
+                            stop_data_plane(&traffic, &shutdown_tx, &error).await;
+                            break Err(error);
+                        }
+                        rx_acc = rx_acc.saturating_add(packet.len() as u64);
+                    }
+                    Some(TcpEvent::Traffic { tx, rx }) => {
+                        // Router emits direct TX here; direct RX is counted
+                        // by ToTun above, so its corresponding Traffic.rx is 0.
+                        tx_acc = tx_acc.saturating_add(tx);
+                        rx_acc = rx_acc.saturating_add(rx);
+                    }
+                    None => {
+                        // A stopped router must not silently drop all TCP or
+                        // keep this select branch immediately ready forever.
+                        let error = CliError::Other("TCP 选路任务意外退出，数据面停止".into());
+                        stop_data_plane(&traffic, &shutdown_tx, &error).await;
+                        break Err(error);
+                    }
+                }
+            }
+            _ = route_retry.tick() => {
+                // Retry failed OS operations even if configuration is unchanged.
+                let desired = tunnel_routes(&allowed_routes, vpn_subnet, ifindex);
+                crate::route_reconcile::reconcile(&handle, &mut added_routes, &desired).await;
             }
             // 定时器：握手重传 / keepalive，并顺带把累计流量刷回状态。
             _ = ticker.tick() => {
@@ -770,20 +805,21 @@ async fn forward_loop(
         }
     }
 
-    // 清理：先恢复 DNS，再删除本任务加的路由（TUN 设备随 device drop 关闭）。
+    // Join the TCP router before DNS and route cleanup: all pending decisions,
+    // local streams and physical sockets must stop with this tunnel session.
     let mut cleanup_failures = 0;
+    if let Err(error) = tcp.shutdown().await {
+        cleanup_failures += 1;
+        tracing::warn!(stage = "tcp_proxy_cleanup", result = "failed", error = %error, "TCP 选路资源清理失败");
+    }
+    // 清理：先恢复 DNS，再删除本任务加的路由（TUN 设备随 device drop 关闭）。
     if let Some(session) = dns_session.as_mut() {
         if let Err(error) = session.restore().await {
             cleanup_failures += 1;
             tracing::warn!(stage = "dns_restore", result = "failed", error = %error, "恢复客户端 DNS 失败");
         }
     }
-    for (cidr, route) in &added_routes {
-        if let Err(error) = handle.delete(route).await {
-            cleanup_failures += 1;
-            tracing::warn!(route = %cidr, error = %error, "删除 VPN 路由失败");
-        }
-    }
+    cleanup_failures += crate::route_reconcile::cleanup(&handle, &mut added_routes).await;
     if cleanup_failures == 0 {
         tracing::info!(
             stage = "forward_loop",
@@ -802,7 +838,7 @@ async fn forward_loop(
         // 清理结果比运行期错误更关键：上层需要据此决定是否
         // fail-closed 阻止重连。即使运行期也出过错，仍要返回专用清理错误。
         return Err(CliError::Cleanup(format!(
-            "VPN 路由或 DNS 清理失败: {cleanup_failures} 项"
+            "VPN 路由、DNS 或 TCP 选路资源清理失败: {cleanup_failures} 项"
         )));
     }
     outcome
@@ -828,58 +864,92 @@ async fn wait_routes_change(rx: &mut Option<watch::Receiver<Vec<String>>>) -> bo
     }
 }
 
-/// 把本地路由表增量对齐到 `desired`:删除已不在集合的、新增缺少的(按 CIDR 串比对,
-/// 顺序无关)。VPN 子网与各站点网段都恒在 desired 内 → 保持;仅组/服务端网段的增减
-/// 被实际增删。net-route 操作 best-effort,失败仅告警不致命。
-async fn apply_route_diff(
-    handle: &Handle,
-    ifindex: u32,
-    added: &mut Vec<(String, Route)>,
-    desired: &[String],
-) {
-    // 1) 删除不再需要的。
-    let mut keep: Vec<(String, Route)> = Vec::with_capacity(added.len());
-    for (cidr, route) in std::mem::take(added) {
-        if desired.iter().any(|d| d == &cidr) {
-            keep.push((cidr, route));
-        } else {
-            let _ = handle.delete(&route).await;
-            tracing::info!(route = %cidr, "allowed_routes 变更:移除路由");
-        }
-    }
-    *added = keep;
-    // 2) 新增缺少的。
-    for d in desired {
-        if added.iter().any(|(c, _)| c == d) {
-            continue;
-        }
-        let Some((dest, pfx)) = parse_cidr_v4(d) else {
-            continue;
-        };
-        if pfx == 0 {
-            tracing::warn!(route = %d, "跳过默认路由(0.0.0.0/0):用户态后端暂不支持全隧道");
-            continue;
-        }
-        let route = Route::new(IpAddr::V4(dest), pfx).with_ifindex(ifindex);
-        match handle.add(&route).await {
-            Ok(()) => {
-                added.push((d.clone(), route));
-                tracing::info!(route = %d, "allowed_routes 变更:新增路由");
+/// Shared by immediate TUN traffic and packets released after a TCP path
+/// decision. Count plaintext bytes only when WireGuard data is actually sent;
+/// keep lengths for packets queued behind a handshake in the existing ledger.
+async fn encapsulate_outgoing(
+    tunn: &mut Tunn,
+    udp: &UdpSocket,
+    obfs: Option<&ObfsRuntime>,
+    buffer: &mut [u8],
+    original_len: usize,
+    encrypted: &mut [u8],
+    send_state: &mut SendState,
+) -> CliResult<(u64, u64)> {
+    let capacity = buffer.len();
+    let plaintext = pad_wireguard_plaintext(buffer, original_len).inspect_err(|error| {
+        tracing::warn!(
+            stage = "wireguard_padding",
+            result = "failed",
+            original_len,
+            buffer_capacity = capacity,
+            error = %error.safe_diagnostic(),
+            "WireGuard 业务报文填充失败，数据面停止"
+        );
+    })?;
+    let padded_len = plaintext.len();
+    match tunn.encapsulate(plaintext, encrypted) {
+        TunnResult::WriteToNetwork(packet) => {
+            let is_data = wireguard_packet_type(packet) == Some(4);
+            let failed = match send_network(udp, obfs, packet).await {
+                Ok(()) => false,
+                Err(error) => {
+                    send_state.failure_logger.record("tun_data", packet, &error);
+                    true
+                }
+            };
+            if !is_data {
+                send_state.track_pending_tx(original_len);
             }
-            Err(e) => tracing::warn!(
-                stage = "route_update",
-                result = "failed",
-                route = %d,
-                error = %crate::error::redact_sensitive(&e.to_string()),
-                "新增路由失败(可能已存在)"
-            ),
+            Ok((
+                if is_data && !failed {
+                    original_len as u64
+                } else {
+                    0
+                },
+                u64::from(failed),
+            ))
         }
+        TunnResult::Done => {
+            send_state.track_pending_tx(original_len);
+            Ok((0, 0))
+        }
+        TunnResult::Err(error) => {
+            tracing::warn!(
+                stage = "wireguard_encapsulate",
+                result = "failed",
+                original_len,
+                padded_len,
+                error = ?error,
+                "WireGuard 业务报文封装失败"
+            );
+            Ok((0, 0))
+        }
+        _ => Ok((0, 0)),
     }
+}
+
+async fn stop_data_plane(
+    traffic: &Option<SharedState>,
+    shutdown: &watch::Sender<bool>,
+    error: &CliError,
+) {
+    tracing::warn!(error = %error.safe_diagnostic(), "VPN 数据面停止");
+    if let Some(state) = traffic {
+        state
+            .set_error(
+                format!("数据面中断: {}", error.safe_diagnostic()),
+                crate::daemon::now_unix(),
+            )
+            .await;
+    }
+    let _ = shutdown.send(true);
 }
 
 /// 处理一个入站 UDP 数据报：解密后写回 TUN；握手响应回送网络；并排空队列。
 ///
 /// 返回写回 TUN 的明文字节数（用于流量统计）；握手 / keepalive / 错误返回 0。
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     tunn: &mut Tunn,
     udp: &UdpSocket,
@@ -979,6 +1049,58 @@ async fn send_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_routes_preserve_configured_boundaries_and_vpn_subnet() {
+        let vpn = "10.8.0.0/24".parse().unwrap();
+        let routes = tunnel_routes(
+            &[
+                "10.0.0.0/8".into(),
+                "192.168.188.111/32".into(),
+                "192.168.188.0/24".into(),
+            ],
+            vpn,
+            9,
+        );
+        assert_eq!(routes.len(), 4);
+        for cidr in [
+            "10.0.0.0/8",
+            "10.8.0.0/24",
+            "192.168.188.0/24",
+            "192.168.188.111/32",
+        ] {
+            let net = cidr.parse::<ipnet::Ipv4Net>().unwrap();
+            assert!(routes
+                .contains(&Route::new(net.network().into(), net.prefix_len()).with_ifindex(9)));
+        }
+        assert!(routes
+            .iter()
+            .all(|route| route.ifindex == Some(9) && route.gateway.is_none()));
+        assert_eq!(
+            tunnel_routes(&[], vpn, 9),
+            vec![Route::new("10.8.0.0".parse().unwrap(), 24).with_ifindex(9)]
+        );
+    }
+
+    #[test]
+    fn tunnel_routes_normalize_deduplicate_and_reject_default_ipv6_and_invalid_routes() {
+        let routes = tunnel_routes(
+            &[
+                " 192.168.188.111/24 ".into(),
+                "192.168.188.0/24".into(),
+                "10.8.0.5/24".into(),
+                "0.0.0.0/0".into(),
+                "::/0".into(),
+                "10.1.1.1/33".into(),
+                "invalid".into(),
+            ],
+            "10.8.0.2/24".parse().unwrap(),
+            9,
+        );
+        assert_eq!(routes.len(), 2);
+        assert!(routes.contains(&Route::new("192.168.188.0".parse().unwrap(), 24).with_ifindex(9)));
+        assert!(routes.contains(&Route::new("10.8.0.0".parse().unwrap(), 24).with_ifindex(9)));
+    }
 
     #[test]
     fn netmask_from_prefix() {
@@ -1147,6 +1269,123 @@ mod tests {
         packet[12..16].copy_from_slice(&[10, 9, 0, 2]);
         packet[16..20].copy_from_slice(&[10, 9, 0, 1]);
         packet
+    }
+
+    #[tokio::test]
+    async fn outgoing_vpn_helper_sends_original_bytes_and_counts_plaintext_once() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut client, mut server) = establish_tunn_pair();
+        let original = ipv4_packet_84_bytes();
+        let mut plaintext = [0xa5; 128];
+        plaintext[..original.len()].copy_from_slice(&original);
+        let mut encrypted = [0; 2048];
+        let mut send_state = SendState::default();
+
+        let (bytes, failures) = encapsulate_outgoing(
+            &mut client,
+            &sender,
+            None,
+            &mut plaintext,
+            original.len(),
+            &mut encrypted,
+            &mut send_state,
+        )
+        .await
+        .unwrap();
+        assert_eq!((bytes, failures), (original.len() as u64, 0));
+        assert!(send_state.pending_tx_lengths.is_empty());
+        let mut received = [0; 2048];
+        let size = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        match server.decapsulate(None, &received[..size], &mut encrypted) {
+            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(&*packet, original.as_slice()),
+            result => panic!("expected original VPN packet, got {result:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn outgoing_vpn_helper_does_not_count_failed_udp_data_as_sent() {
+        // An unconnected UDP socket makes send fail locally, without contacting
+        // any external peer or modifying host routes.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, _) = establish_tunn_pair();
+        let original = ipv4_packet_84_bytes();
+        let mut plaintext = [0; 128];
+        plaintext[..original.len()].copy_from_slice(&original);
+        let mut encrypted = [0; 2048];
+        let mut send_state = SendState::default();
+
+        assert_eq!(
+            encapsulate_outgoing(
+                &mut client,
+                &sender,
+                None,
+                &mut plaintext,
+                original.len(),
+                &mut encrypted,
+                &mut send_state,
+            )
+            .await
+            .unwrap(),
+            (0, 1)
+        );
+        assert!(send_state.pending_tx_lengths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outgoing_vpn_helper_tracks_data_queued_behind_handshake() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let server_public = PublicKey::from(&StaticSecret::from([2u8; 32]));
+        let mut client = Tunn::new(
+            StaticSecret::from([1u8; 32]),
+            server_public,
+            None,
+            None,
+            1,
+            None,
+        );
+        let original = ipv4_packet_84_bytes();
+        let mut plaintext = [0; 128];
+        plaintext[..original.len()].copy_from_slice(&original);
+        let mut encrypted = [0; 2048];
+        let mut send_state = SendState::default();
+
+        assert_eq!(
+            encapsulate_outgoing(
+                &mut client,
+                &sender,
+                None,
+                &mut plaintext,
+                original.len(),
+                &mut encrypted,
+                &mut send_state,
+            )
+            .await
+            .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            send_state.pending_tx_lengths,
+            VecDeque::from([original.len() as u64])
+        );
+        let mut received = [0; 2048];
+        let size = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wireguard_packet_type(&received[..size]), Some(1));
     }
 
     #[test]
