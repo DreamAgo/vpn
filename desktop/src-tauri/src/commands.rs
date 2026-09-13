@@ -200,17 +200,13 @@ pub async fn feishu_login(app: tauri::AppHandle, server: String) -> Result<(), S
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(started.expires_in.max(1) as u64);
     loop {
-        ensure_feishu_auth_window_open(
-            app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_some(),
-        )?;
+        ensure_feishu_auth_window_open(app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_some())?;
         if tokio::time::Instant::now() >= deadline {
             return Err("飞书登录已超时，请重试".to_string());
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         tokio::time::sleep(remaining.min(std::time::Duration::from_secs(2))).await;
-        ensure_feishu_auth_window_open(
-            app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_some(),
-        )?;
+        ensure_feishu_auth_window_open(app.get_webview_window(FEISHU_AUTH_WINDOW_LABEL).is_some())?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err("飞书登录已超时，请重试".to_string());

@@ -138,12 +138,12 @@ impl BoundedLogWriter {
     fn rotate(&mut self) -> std::io::Result<()> {
         std::io::Write::flush(&mut self.file)?;
         for index in (1..=HELPER_LOG_ROTATIONS).rev() {
-            let destination = Path::new(HELPER_LOG_DIR).join(format!("{HELPER_LOG_PREFIX}.{index}"));
+            let destination =
+                Path::new(HELPER_LOG_DIR).join(format!("{HELPER_LOG_PREFIX}.{index}"));
             let source = if index == 1 {
                 Path::new(HELPER_LOG_DIR).join(HELPER_LOG_PREFIX)
             } else {
-                Path::new(HELPER_LOG_DIR)
-                    .join(format!("{HELPER_LOG_PREFIX}.{}", index - 1))
+                Path::new(HELPER_LOG_DIR).join(format!("{HELPER_LOG_PREFIX}.{}", index - 1))
             };
             match std::fs::rename(source, destination) {
                 Ok(()) => {}
@@ -329,14 +329,7 @@ fn spawn_console_change_events() -> tokio::sync::mpsc::UnboundedReceiver<()> {
                 udata: std::ptr::null_mut(),
             };
             let registered = unsafe {
-                libc::kevent(
-                    queue,
-                    &change,
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
+                libc::kevent(queue, &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
             };
             let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
             let received = if registered == 0 {
@@ -648,9 +641,7 @@ async fn ensure_ready() -> Result<(), String> {
         }
         // 只有 root 事务遗留的 .bak 能证明上次安装在 bootstrap 前中断；此时允许
         // 一次授权修复。普通“匹配但暂时不可达”仍禁止重装，避免日常重复密码框。
-        if backup_artifacts_exist()
-            && std::env::var_os("VPN_DESKTOP_NO_HELPER_INSTALL").is_none()
-        {
+        if backup_artifacts_exist() && std::env::var_os("VPN_DESKTOP_NO_HELPER_INSTALL").is_none() {
             let repair_expected = expected.clone();
             tokio::task::spawn_blocking(move || install_helper(&repair_expected))
                 .await
@@ -832,7 +823,10 @@ fn record_blocked_login_hash(hash: &str) -> Result<(), String> {
     let mut updated = blocked.clone();
     if !updated.iter().any(|item| item == hash) {
         if updated.len() >= MAX_BLOCKED_LOGIN_HASHES {
-            return Err("注销令牌安全栅栏已满；为避免旧凭据复活，已拒绝注销，请联系管理员清理已吊销条目".to_string());
+            return Err(
+                "注销令牌安全栅栏已满；为避免旧凭据复活，已拒绝注销，请联系管理员清理已吊销条目"
+                    .to_string(),
+            );
         }
         updated.push(hash.to_string());
     }
@@ -1061,7 +1055,12 @@ fn read_helper_logs() -> Result<HelperLogSnapshot, String> {
                 .starts_with(HELPER_LOG_PREFIX)
         })
         .collect::<Vec<_>>();
-    files.sort_by_key(|entry| entry.metadata().and_then(|metadata| metadata.modified()).ok());
+    files.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
     let mut bytes = Vec::new();
     let mut truncated = false;
     let mut prefix_is_partial = false;
@@ -1191,10 +1190,8 @@ mod tests {
 
     #[test]
     fn macos_lockf_accepts_an_open_file_descriptor() {
-        let path = std::env::temp_dir().join(format!(
-            "{HELPER_LABEL}-lockf-test-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("{HELPER_LABEL}-lockf-test-{}", std::process::id()));
         let command = format!(
             "set -e; L={}; /usr/bin/touch $L; exec 9>$L; /usr/bin/lockf -t 1 9",
             shell_quote(&path.to_string_lossy())
