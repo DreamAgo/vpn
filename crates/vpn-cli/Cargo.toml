@@ -26,6 +26,8 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 zeroize = { workspace = true }
 ipnet = { workspace = true }
+futures = { workspace = true }
+smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "socket-tcp"] }
 
 # CLI 解析与交互（本 crate 私有依赖）
 clap = { version = "4", features = ["derive"] }
@@ -34,6 +36,13 @@ rand = { workspace = true }
 boringtun = "0.7"
 tun = { version = "0.8", features = ["async"] }
 net-route = "0.4"
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 tempfile = "3"
