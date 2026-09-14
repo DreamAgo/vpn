@@ -6,7 +6,7 @@
  * - 操作列：重置密码 / 启用·禁用 / 删除（均带确认，成功后刷新 + message）。
  * - 空态：无任何用户 → users-empty；搜索无结果 → search-empty。
  */
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Button,
   Tag,
@@ -51,6 +51,47 @@ function GroupTags({ groupIds }: { groupIds: string[] }) {
           </Tag>
         );
       })}
+    </Space>
+  );
+}
+
+/** 独占截止时刻按上海时区展示，避免浏览器所在时区改变审批日期。 */
+const expiryFormatter = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+});
+
+function ApprovalAccess({ user }: { user: UserDto }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  if (!user.accessMode || !user.approvalGrants) {
+    return <Typography.Text type="secondary">服务端未提供授权信息</Typography.Text>;
+  }
+  return (
+    <Space direction="vertical" size={4}>
+      <Tag>{user.accessMode === 'approval_required' ? '审批管控' : '历史权限规则'}</Tag>
+      {user.approvalGrants.length === 0 && (
+        <Typography.Text type="secondary">暂无审批授权</Typography.Text>
+      )}
+      {user.approvalGrants.map((grant) => (
+        <div key={grant.groupId}>
+          <div>
+            <Tag color={grant.expiresAt > now ? 'success' : 'error'}>
+              {grant.expiresAt > now ? '有效' : '已到期'}
+            </Tag>
+            {grant.groupName}
+          </div>
+          <Typography.Text type="secondary">
+            {expiryFormatter.format(grant.expiresAt)} 到期
+          </Typography.Text>
+        </div>
+      ))}
+      {user.groupIds.length > 0 && (
+        <Typography.Text type="secondary">人工分组不设到期，仍按账号状态生效</Typography.Text>
+      )}
     </Space>
   );
 }
@@ -167,10 +208,16 @@ export function UsersPage() {
           ),
       },
       {
-        title: '用户组',
+        title: '人工分组',
         dataIndex: 'groupIds',
         width: 160,
         render: (_, record) => <GroupTags groupIds={record.groupIds} />,
+      },
+      {
+        title: '审批授权 / 到期时间（上海）',
+        key: 'approvalAccess',
+        width: 280,
+        render: (_, record) => <ApprovalAccess user={record} />,
       },
       {
         title: '终端上限',
@@ -286,6 +333,7 @@ export function UsersPage() {
         actionRef={actionRef}
         rowKey="id"
         columns={columns}
+        scroll={{ x: 1200 }}
         search={false}
         options={{ reload: true, density: false, setting: false }}
         pagination={{ defaultPageSize: 10, showSizeChanger: true }}

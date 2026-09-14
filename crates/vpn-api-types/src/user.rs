@@ -25,7 +25,19 @@ pub struct UserDto {
     /// 允许同时注册的终端数量上限（≥1，默认 1）。
     #[serde(default = "default_max_devices")]
     pub max_devices: i64,
+    /// 网络访问模式：legacy / approval_required。
+    pub access_mode: String,
+    /// 按用户组汇总的审批期限（同组取最晚期限，包含已到期授权）。
+    pub approval_grants: Vec<UserApprovalGrantDto>,
     pub created_at: i64,
+}
+
+/// 管理端展示的用户组审批授权。expires_at 为 Unix 毫秒，独占截止时间。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserApprovalGrantDto {
+    pub group_id: String,
+    pub group_name: String,
+    pub expires_at: i64,
 }
 
 /// max_devices 的默认值（兼容旧服务端响应缺省该字段）。

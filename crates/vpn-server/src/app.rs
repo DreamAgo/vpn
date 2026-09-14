@@ -114,6 +114,11 @@ pub fn build_router(state: AppState) -> Router {
                     .put(handlers::system::update_integration_settings),
             )
             .route(
+                "/api/v1/admin/integrations/feishu/approval-subscription",
+                get(handlers::system::approval_subscription)
+                    .post(handlers::system::subscribe_approval),
+            )
+            .route(
                 "/api/v1/admin/notifications/email",
                 get(handlers::system::email_notification_settings)
                     .put(handlers::system::update_email_notification_settings),

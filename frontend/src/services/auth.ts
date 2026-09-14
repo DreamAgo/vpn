@@ -7,6 +7,7 @@ import { http } from './http';
 import type {
   ChangePasswordRequest,
   EmailNotificationSettings,
+  FeishuApprovalSubscriptionView,
   IntegrationSettingsView,
   FirstTimeSetupRequest,
   FirstTimeSetupResponse,
@@ -84,6 +85,20 @@ export const systemApi = {
 
   async getIntegrationSettings(): Promise<IntegrationSettingsView> {
     const res = await http.get<IntegrationSettingsView>('/admin/integrations/settings');
+    return res.data;
+  },
+
+  async getFeishuApprovalSubscription(): Promise<FeishuApprovalSubscriptionView> {
+    const res = await http.get<FeishuApprovalSubscriptionView>(
+      '/admin/integrations/feishu/approval-subscription'
+    );
+    return res.data;
+  },
+
+  async subscribeFeishuApproval(): Promise<FeishuApprovalSubscriptionView> {
+    const res = await http.post<FeishuApprovalSubscriptionView>(
+      '/admin/integrations/feishu/approval-subscription'
+    );
     return res.data;
   },
 

@@ -129,6 +129,31 @@ impl SqliteUserRepository {
         }
     }
 
+    /// 一次读取当前页用户的审批期限，保留过期记录以供管理端展示。
+    pub async fn approval_expiries(
+        &self,
+        user_ids: &[&str],
+    ) -> Result<Vec<(String, String, String, i64)>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT a.user_id, a.group_id, g.name, MAX(a.expires_at) \
+             FROM access_grants a JOIN user_groups g ON g.id = a.group_id \
+             WHERE a.user_id IN (",
+        );
+        let mut ids = query.separated(", ");
+        for id in user_ids {
+            ids.push_bind(*id);
+        }
+        query.push(") GROUP BY a.user_id, a.group_id, g.name ORDER BY g.name, a.group_id");
+        query
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))
+    }
+
     pub async fn count_admins(&self) -> Result<i64> {
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
             .fetch_one(&self.pool)

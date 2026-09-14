@@ -229,6 +229,13 @@ export interface IntegrationSettingsView {
   restartRequired: boolean;
 }
 
+export interface FeishuApprovalSubscriptionView {
+  appId: string | null;
+  approvalCode: string | null;
+  lastSuccessAt: number | null;
+  canSubscribe: boolean;
+}
+
 export interface UpdateIntegrationSettingsRequest {
   feishuLogin: {
     enabled: boolean;
@@ -252,6 +259,12 @@ export interface UpdateIntegrationSettingsRequest {
 
 // ===== User management DTOs (与 vpn-api-types::user 对齐, Epic 3) =====
 
+export interface UserApprovalGrantDto {
+  groupId: string;
+  groupName: string;
+  expiresAt: number; // Unix 毫秒，独占截止时间
+}
+
 export interface UserDto {
   id: string;
   username: string;
@@ -260,6 +273,8 @@ export interface UserDto {
   status: string; // "active" | "disabled"
   mustChangePassword: boolean;
   lastLoginAt: number | null;
+  accessMode?: 'legacy' | 'approval_required';
+  approvalGrants?: UserApprovalGrantDto[];
   groupIds: string[]; // 所属用户组 id 列表（可属多个组；未分组为空）
   maxDevices: number; // 终端数量上限（≥1，默认 1）
   createdAt: number;

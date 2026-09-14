@@ -155,18 +155,25 @@ https://<域名>/api/v1/integrations/feishu/approval-events
 
 1. 在飞书审批后台发布“网络授权申请”，记下审批定义 `approval_code` 与三个控件的稳定 ID。
 2. “网络组”使用上节 `user_groups` 外部选项，首期必须单选；既有 `user-groups` 地址继续兼容。
-3. 在应用“事件与回调”中配置上述请求地址、Verification Token 和 Encrypt Key，并添加审批实例状态事件；配置或权限变化后发布应用。
-4. 给应用开通读取原生审批实例和联系人基础信息/邮箱所需权限，获取应用 `tenant_access_token`。
-5. **按审批定义手动订阅一次**（仅在后台添加事件还不会收到该定义的推送）：
+3. 在飞书应用获取 Verification Token 和 Encrypt Key；在易链“集成设置”完整填写飞书登录配置、审批 `approval_code`、三个控件 ID、Verification Token、Encrypt Key，启用并保存后重启服务。首次部署也可用对应环境变量初始化。服务未启用时不能返回地址验证 challenge。
+4. 在飞书应用“事件与回调 → 事件配置”中配置上述请求地址，并添加“审批实例状态变更”事件。开通读取原生审批实例、订阅审批定义和联系人基础信息/邮箱所需权限；按飞书后台要求发布应用。
+5. 在易链“集成设置 → 飞书审批”点击 **订阅审批事件**。服务端使用当前已应用的 App ID、App Secret 获取 tenant token，再订阅当前审批 Code；页面有未保存修改、配置待重启或审批未启用时不可执行。仅添加事件还不会收到该审批定义的推送。
+6. 页面展示当前应用、审批 Code 和本系统最近成功执行时间；刷新或重启后记录保留，更换 App ID 或审批 Code 后不会沿用其他组合的记录。**无记录不代表飞书未订阅，历史成功也不是远端实时状态**：外部 curl 操作和外部取消订阅不会自动同步。如需再次确认，可点“重新执行订阅”，服务端会实际请求飞书。
 
-   ```bash
-   curl -X POST 'https://open.feishu.cn/open-apis/approval/v4/approvals/<approval_code>/subscribe' \
-     -H 'Authorization: Bearer <tenant_access_token>' \
-     -H 'Content-Type: application/json; charset=utf-8'
-   ```
+管理员接口：
 
-   返回 `code: 0` 后才表示订阅成功。更换审批定义时需要对新的 `approval_code` 再执行一次；首期不会由服务端自动订阅。
-6. 在“集成设置”填写 `approval_code`、三个控件 ID、Verification Token、Encrypt Key 并重启服务。首次部署也可用对应 `VPN_FEISHU_APPROVAL_*` 环境变量初始化。
+- `GET /api/v1/admin/integrations/feishu/approval-subscription`：只读取本系统记录，返回 `app_id`、`approval_code`、`last_success_at`（Unix 毫秒或 `null`）、`can_subscribe`。
+- `POST /api/v1/admin/integrations/feishu/approval-subscription`：手动执行订阅，成功后更新记录并返回同样结构。失败不覆盖此前成功记录。请求不接收前端凭据或审批 Code，以服务端已应用配置为准。
+
+如需通过命令行订阅，也可自行获取应用 `tenant_access_token` 后调用：
+
+```bash
+curl -X POST 'https://open.feishu.cn/open-apis/approval/v4/approvals/<approval_code>/subscribe' \
+  -H 'Authorization: Bearer <tenant_access_token>' \
+  -H 'Content-Type: application/json; charset=utf-8'
+```
+
+返回 `code: 0` 表示成功。服务端不会在启动时自动订阅；命令行操作不会写入上述本系统执行记录。
 
 普通事件由服务端先校验 5 分钟时间窗和 `X-Lark-Signature`，再 AES-CBC 解密并校验 Verification Token。飞书首次保存回调地址所发的 challenge 可能没有签名头，此时只允许返回已成功解密且 Verification Token 正确的 challenge，不会写入业务数据。只把匹配 `approval_code` 且状态为 `APPROVED` 的普通事件写入 durable inbox，然后快速 ACK；后台 worker 会重新查询审批实例并再次确认状态。授权严格按控件 ID 和外部选项的用户组 ID 解析，不依赖中文标题或显示文案。
 
