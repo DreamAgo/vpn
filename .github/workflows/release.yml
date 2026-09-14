@@ -323,23 +323,22 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      - name: Tauri build (DMG)
+      - name: Tauri build (app + DMG)
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            npx tauri build --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+            npx tauri build --target ${{ matrix.target }} --bundles app,dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
           else
-            npx tauri build --target ${{ matrix.target }} --bundles dmg
+            npx tauri build --target ${{ matrix.target }} --bundles app,dmg
           fi
 
       - name: Verify macOS privileged helper entrypoint
         shell: bash
         run: |
-          # Tauri removes the temporary bundle/macos/*.app after creating the DMG.
-          # Verify the exact release executable that was copied into that bundle.
+          # Verify the exact release executable copied into the app and DMG bundles.
           binary='desktop/src-tauri/target/${{ matrix.target }}/release/vpn-desktop'
           test -x "$binary"
           build_hash=$(shasum -a 256 "$binary" | awk '{print $1}')
@@ -359,7 +358,8 @@ jobs:
           name: vpn-desktop-macos-${{ matrix.arch }}
           path: |
             desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.sig
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
 
   # ============================================================
   # Linux 桌面 GUI 客户端（Tauri 2）：AppImage + deb amd64/arm64
@@ -499,8 +499,10 @@ jobs:
 
           copy_one "artifacts/vpn-desktop-windows/msi/*.msi" "vpn-gui-windows-amd64-${tag}.msi"
           copy_one "artifacts/vpn-desktop-windows/nsis/*.exe" "vpn-gui-windows-amd64-setup-${tag}.exe"
-          copy_one "artifacts/vpn-desktop-macos-amd64/*.dmg" "vpn-gui-macos-amd64-${tag}.dmg"
-          copy_one "artifacts/vpn-desktop-macos-arm64/*.dmg" "vpn-gui-macos-arm64-${tag}.dmg"
+          copy_one "artifacts/vpn-desktop-macos-amd64/dmg/*.dmg" "vpn-gui-macos-amd64-${tag}.dmg"
+          copy_one "artifacts/vpn-desktop-macos-arm64/dmg/*.dmg" "vpn-gui-macos-arm64-${tag}.dmg"
+          copy_one "artifacts/vpn-desktop-macos-amd64/macos/*.app.tar.gz" "vpn-gui-macos-amd64-${tag}.app.tar.gz"
+          copy_one "artifacts/vpn-desktop-macos-arm64/macos/*.app.tar.gz" "vpn-gui-macos-arm64-${tag}.app.tar.gz"
           copy_one "artifacts/vpn-desktop-linux-amd64/appimage/*.AppImage" "vpn-gui-linux-amd64-${tag}.AppImage"
           copy_one "artifacts/vpn-desktop-linux-amd64/deb/*.deb" "vpn-gui-linux-amd64-${tag}.deb"
           copy_one "artifacts/vpn-desktop-linux-arm64/appimage/*.AppImage" "vpn-gui-linux-arm64-${tag}.AppImage"
@@ -514,41 +516,10 @@ jobs:
       - name: Generate Tauri updater manifest
         shell: bash
         run: |
-          python3 <<'PY'
-          import json
-          import os
-          from datetime import datetime, timezone
-          from pathlib import Path
-          from urllib.parse import quote
-
-          tag = os.environ["GITHUB_REF_NAME"]
-          version = tag[1:] if tag.startswith("v") else tag
-          repo = os.environ["GITHUB_REPOSITORY"]
-          root = Path("release-assets")
-
-          exe = root / f"vpn-gui-windows-amd64-setup-{tag}.exe"
-          sig = Path(str(exe) + ".sig")
-          if not sig.exists():
-            print(f"Skipping latest.json because updater signature is missing for {exe}")
-            raise SystemExit(0)
-
-          filename = quote(exe.name)
-          manifest = {
-            "version": version,
-            "notes": f"VPN Client {version}",
-            "pub_date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "platforms": {
-              "windows-x86_64": {
-                "signature": sig.read_text(encoding="utf-8").strip(),
-                "url": f"https://github.com/{repo}/releases/download/{tag}/{filename}",
-              }
-            },
-          }
-          (root / "latest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-          )
-          PY
+          python3 desktop/scripts/generate-updater-manifest.py \
+            --tag "$GITHUB_REF_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --assets-dir release-assets
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

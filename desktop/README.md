@@ -95,8 +95,40 @@ Windows、macOS、Linux 原生 runner 分别构建前端并执行桌面 Rust 测
 
 ## Auto Update
 
-桌面端已接入 Tauri updater。应用启动后会静默检查 GitHub Release 中的
-`latest.json`,设置面板里也可以手动检查并安装更新。安装完成后应用会自动重启。
+桌面端已接入 Tauri updater。应用启动约 3.5 秒后会静默检查
+`src-tauri/tauri.conf.json` 中配置的更新地址（当前为自建服务器的
+`/updates/latest.json`），设置面板里也可以手动检查并安装更新。
+点击“安装并重启”后下载、校验签名、安装并重启；不会无人确认自动安装。
+
+| 平台 | 架构 | 应用内更新包 |
+| --- | --- | --- |
+| Windows | x64 | NSIS `.exe` |
+| macOS | Intel / Apple Silicon | `.app.tar.gz`（首次安装仍用 DMG） |
+| Linux | x64 / ARM64 | `.AppImage` 或 `.deb`，按当前安装格式选择 |
+
+Linux deb 更新使用 updater 2.10.1 的包格式识别，更新清单中的
+`linux-<arch>-deb` 优先于通用 AppImage 条目。deb 安装需要 `dpkg` 和系统提权
+（例如 `pkexec`）；AppImage 应放在当前用户可写的位置。
+macOS 应先把应用从 DMG 拷贝到可安装的位置，再运行应用内升级。
+
+发布流程会收集五个操作系统/架构目标的更新包及签名（Linux 两种格式），
+由 `scripts/generate-updater-manifest.py` 生成完整清单。
+正式 tag 发布缺少任一更新包或签名时失败，避免发布不完整的更新清单。
+手动 workflow_dispatch 无签名密钥时仍可构建普通安装包。
+
+GitHub Release 默认清单中的下载地址指向该 Release。自建更新服务器需要同步
+`latest.json`；如果安装包也托管在自建服务器，先同步所有包，再用下面的命令
+生成指向镜像的清单，最后替换线上 `latest.json`：
+
+```sh
+python3 desktop/scripts/generate-updater-manifest.py \
+  --tag v0.1.16 --repository OWNER/REPO \
+  --assets-dir release-assets \
+  --base-url https://updates.example.com/updates
+```
+
+`--tag` 必须与包内应用版本一致；示例域名需要替换为实际包下载地址。
+脚本只生成本地清单，不会自动上传或部署。
 
 更新包必须签名:
 
