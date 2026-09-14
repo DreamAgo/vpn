@@ -402,7 +402,7 @@ impl FeishuApprovalService {
         self.repo
             .apply_approved(ApprovedGrant {
                 instance_code: &item.instance_code,
-                group_id: &fields.group_id,
+                group_ids: fields.group_ids,
                 expires_at: fields.expires_at,
                 reason: &fields.reason,
                 identity: ApprovalIdentity {
@@ -423,7 +423,7 @@ impl FeishuApprovalService {
 }
 
 struct FormFields {
-    group_id: String,
+    group_ids: Vec<String>,
     expires_at: i64,
     reason: String,
 }
@@ -449,7 +449,7 @@ fn parse_form(
     let expiry = unique_widget(widgets, expiry_id)?;
     let reason = unique_widget(widgets, reason_id)?;
     Ok(FormFields {
-        group_id: single_option_id(widget_value(group)?)?,
+        group_ids: group_option_ids(group)?,
         expires_at: exclusive_expiry(widget_value(expiry)?)?,
         reason: scalar_text(widget_value(reason)?)?,
     })
@@ -482,23 +482,52 @@ fn widget_value(widget: &Value) -> Result<&Value> {
         .ok_or_else(|| AppError::Validation("审批控件缺少 value".into()))
 }
 
-fn single_option_id(value: &Value) -> Result<String> {
-    let selected = match value {
-        Value::Array(values) if values.len() == 1 => &values[0],
-        Value::Array(_) => return Err(AppError::Validation("网络组必须且只能选择一个".into())),
-        value => value,
-    };
-    match selected {
-        Value::String(value) => {
-            if let Ok(nested) = serde_json::from_str::<Value>(value) {
-                return single_option_id(&nested);
-            }
-            (!value.trim().is_empty()).then(|| value.trim().to_string())
-        }
-        Value::Object(_) => string_at(selected, &["id", "key", "value", "option_id"]),
-        _ => None,
+// 实例详情中的 value 是显示文案；option 才携带已选项的稳定 key。
+fn group_option_ids(widget: &Value) -> Result<Vec<String>> {
+    if let Some(options) = widget.get("option") {
+        let selected = match options {
+            Value::Array(values) => values.as_slice(),
+            value => std::slice::from_ref(value),
+        };
+        let keys: Result<Vec<Value>> = selected
+            .iter()
+            .map(|option| {
+                string_at(option, &["key", "id", "option_id"])
+                    .filter(|key| !key.trim().is_empty())
+                    .map(Value::String)
+                    .ok_or_else(|| AppError::Validation("用户组选项缺少稳定 ID".into()))
+            })
+            .collect();
+        return option_ids(&Value::Array(keys?));
     }
-    .ok_or_else(|| AppError::Validation("网络组控件没有稳定选项 ID".into()))
+    option_ids(widget_value(widget)?)
+}
+
+fn option_ids(value: &Value) -> Result<Vec<String>> {
+    if let Value::String(text) = value {
+        if let Ok(nested @ (Value::Array(_) | Value::Object(_))) = serde_json::from_str(text) {
+            return option_ids(&nested);
+        }
+    }
+    let selected = match value {
+        Value::Array(values) => values.as_slice(),
+        value => std::slice::from_ref(value),
+    };
+    if selected.is_empty() {
+        return Err(AppError::Validation("至少选择一个用户组".into()));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for selected in selected {
+        let id = match selected {
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Object(_) => string_at(selected, &["id", "key", "value", "option_id"]),
+            _ => None,
+        }
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| AppError::Validation("用户组控件没有稳定选项 ID".into()))?;
+        ids.insert(id.trim().to_string());
+    }
+    Ok(ids.into_iter().collect())
 }
 
 fn scalar_text(value: &Value) -> Result<String> {
@@ -864,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn form_uses_only_exact_control_ids_and_single_group() {
+    fn form_uses_exact_control_ids_and_multiple_groups() {
         let form = json!([
             {"id":"group-control","value":[{"id":"group-42","text":"中文文案不参与授权"}]},
             {"widgetId":"expiry-control","value":"2026-07-31"},
@@ -877,7 +906,7 @@ mod tests {
             "reason-control",
         )
         .unwrap();
-        assert_eq!(fields.group_id, "group-42");
+        assert_eq!(fields.group_ids, ["group-42"]);
         assert_eq!(fields.reason, "project access");
         let expected = FixedOffset::east_opt(8 * 3600)
             .unwrap()
@@ -889,14 +918,50 @@ mod tests {
 
         let mut multiple = form;
         multiple[0]["value"] = json!([{"id":"g1"},{"id":"g2"}]);
-        assert!(parse_form(
-            &multiple,
-            "group-control",
-            "expiry-control",
-            "reason-control"
-        )
-        .is_err());
+        assert_eq!(
+            parse_form(
+                &multiple,
+                "group-control",
+                "expiry-control",
+                "reason-control"
+            )
+            .unwrap()
+            .group_ids,
+            ["g1", "g2"]
+        );
+        assert_eq!(
+            option_ids(&json!(["g2", "g1", "g2"])).unwrap(),
+            ["g1", "g2"]
+        );
+        assert_eq!(option_ids(&json!("[\"g1\",\"g2\"]")).unwrap(), ["g1", "g2"]);
+        assert!(option_ids(&json!([])).is_err());
+        assert!(option_ids(&json!(["g1", ""])).is_err());
+        assert!(option_ids(&json!([{"text":"display label only"}])).is_err());
         assert!(parse_form(&multiple, "网络组", "expiry-control", "reason-control").is_err());
+    }
+
+    #[test]
+    fn instance_selected_options_take_precedence_over_display_names() {
+        let form = json!([
+            {"id":"group","type":"checkboxV2","value":["开发", "本地开发"],
+             "option":[{"key":"g1","text":"开发"},{"key":"g2","text":"本地开发"}]},
+            {"id":"expiry","type":"date","value":"2026-09-14T00:00:00+08:00"},
+            {"id":"reason","value":"access"}
+        ]);
+        assert_eq!(
+            parse_form(&form, "group", "expiry", "reason")
+                .unwrap()
+                .group_ids,
+            ["g1", "g2"]
+        );
+        assert_eq!(
+            group_option_ids(&json!({"value":"显示名称", "option":{"key":"g1","text":"显示名称"}}))
+                .unwrap(),
+            ["g1"]
+        );
+        // 选项损坏时不能回退到碰巧等于用户组 ID 的文案。
+        assert!(group_option_ids(&json!({"value":["g1"],"option":[{"text":"g1"}]})).is_err());
+        assert!(group_option_ids(&json!({"value":["g1"],"option":[]})).is_err());
     }
 
     #[test]

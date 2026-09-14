@@ -154,7 +154,7 @@ https://<域名>/api/v1/integrations/feishu/approval-events
 运维步骤：
 
 1. 在飞书审批后台发布“网络授权申请”，记下审批定义 `approval_code` 与三个控件的稳定 ID。
-2. “网络组”使用上节 `user_groups` 外部选项，首期必须单选；既有 `user-groups` 地址继续兼容。
+2. “网络组”使用上节 `user_groups` 外部选项，支持单选和多选，选项值必须为用户组 ID（不能使用显示名称）；既有 `user-groups` 地址继续兼容。
 3. 在飞书应用获取 Verification Token 和 Encrypt Key；在易链“集成设置”完整填写飞书登录配置、审批 `approval_code`、三个控件 ID、Verification Token、Encrypt Key，启用并保存后重启服务。首次部署也可用对应环境变量初始化。服务未启用时不能返回地址验证 challenge。
 4. 在飞书应用“事件与回调 → 事件配置”中配置上述请求地址，并添加“审批实例状态变更”事件。开通读取原生审批实例、订阅审批定义和联系人基础信息/邮箱所需权限；按飞书后台要求发布应用。
 5. 在易链“集成设置 → 飞书审批”点击 **订阅审批事件**。服务端使用当前已应用的 App ID、App Secret 获取 tenant token，再订阅当前审批 Code；页面有未保存修改、配置待重启或审批未启用时不可执行。仅添加事件还不会收到该审批定义的推送。
@@ -175,9 +175,9 @@ curl -X POST 'https://open.feishu.cn/open-apis/approval/v4/approvals/<approval_c
 
 返回 `code: 0` 表示成功。服务端不会在启动时自动订阅；命令行操作不会写入上述本系统执行记录。
 
-普通事件由服务端先校验 5 分钟时间窗和 `X-Lark-Signature`，再 AES-CBC 解密并校验 Verification Token。飞书首次保存回调地址所发的 challenge 可能没有签名头，此时只允许返回已成功解密且 Verification Token 正确的 challenge，不会写入业务数据。只把匹配 `approval_code` 且状态为 `APPROVED` 的普通事件写入 durable inbox，然后快速 ACK；后台 worker 会重新查询审批实例并再次确认状态。授权严格按控件 ID 和外部选项的用户组 ID 解析，不依赖中文标题或显示文案。
+普通事件由服务端先校验 5 分钟时间窗和 `X-Lark-Signature`，再 AES-CBC 解密并校验 Verification Token。飞书首次保存回调地址所发的 challenge 可能没有签名头，此时只允许返回已成功解密且 Verification Token 正确的 challenge，不会写入业务数据。只把匹配 `approval_code` 且状态为 `APPROVED` 的普通事件写入 durable inbox，然后快速 ACK；后台 worker 会重新查询审批实例并再次确认状态。授权严格按控件 ID 和外部选项的用户组 ID 解析，不依赖中文标题或显示文案。飞书实例详情若同时返回 `value` 文案和 `option`，使用 `option[].key`（单选为 `option.key`）中的稳定 ID；缺少有效选项 ID 时拒绝，不按名称猜测用户组。
 
-每张审批保存独立 `expires_at`。同一审批重推幂等，延期只延长不缩短；人工用户组不会被审批覆盖。新飞书原生账号没有有效审批时只能访问 VPN 基础网段，历史账号继续保持原未分组回退行为。撤回后的追溯撤权、单张审批多组及 userspace/auto 后端 ACL 不在首期范围。
+每张审批按所选用户组分别保存授权，共用该审批的 `expires_at`；重复组 ID 会去重，任何无效组 ID 都会导致整批授权失败。同一审批重推幂等，组集合或用户变化时拒绝，延期只延长不缩短；人工用户组不会被审批覆盖。新飞书原生账号没有有效审批时只能访问 VPN 基础网段，历史账号继续保持原未分组回退行为。撤回后的追溯撤权及 userspace/auto 后端 ACL 不在首期范围。
 
 ## 主要资源
 

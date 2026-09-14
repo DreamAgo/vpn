@@ -44,7 +44,7 @@
 | `VPN_FEISHU_REDIRECT_URI` | （无） | 飞书 OAuth HTTPS 回调；固定路径 `/api/v1/auth/feishu/callback`。 |
 | `VPN_FEISHU_APPROVAL_OPTIONS_TOKEN` | （无） | 飞书审批“关联外部选项”请求校验 token。至少 32 个字符；应使用独立高熵随机值。 |
 | `VPN_FEISHU_APPROVAL_CODE` | （无） | 只接受该审批定义 Code 的网络授权审批。与下列五项全部配置时启用审批 webhook。 |
-| `VPN_FEISHU_APPROVAL_GROUP_CONTROL_ID` | （无） | “网络组”控件的稳定 ID；值必须是 `user_groups` 外部选项返回的用户组 ID。 |
+| `VPN_FEISHU_APPROVAL_GROUP_CONTROL_ID` | （无） | “网络组”控件的稳定 ID；支持单选或多选；值必须是 `user_groups` 外部选项返回的用户组 ID，不能使用组名称。 |
 | `VPN_FEISHU_APPROVAL_EXPIRY_CONTROL_ID` | （无） | “授权到期日期”控件的稳定 ID。到期日按上海时区次日 00:00 保存为独占 `expires_at`。 |
 | `VPN_FEISHU_APPROVAL_REASON_CONTROL_ID` | （无） | “申请事由”控件的稳定 ID。 |
 | `VPN_FEISHU_APPROVAL_VERIFICATION_TOKEN` | （无） | 飞书事件订阅 Verification Token（敏感值）。 |
