@@ -32,7 +32,7 @@ pub struct ApprovalIdentity<'a> {
 #[derive(Debug, Clone)]
 pub struct ApprovedGrant<'a> {
     pub instance_code: &'a str,
-    pub group_id: &'a str,
+    pub group_ids: Vec<String>,
     pub expires_at: i64,
     pub reason: &'a str,
     pub identity: ApprovalIdentity<'a>,
@@ -191,13 +191,21 @@ impl SqliteAccessGrantRepository {
     /// 同一事务完成身份绑定/建号/逐审批授权；既有账号保持 legacy，授权不碰人工组。
     pub async fn apply_approved(&self, grant: ApprovedGrant<'_>) -> Result<String> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let group_exists: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_groups WHERE id=?1")
-            .bind(grant.group_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db)?;
-        if group_exists.0 != 1 {
-            return Err(AppError::Validation("审批选择的用户组不存在".into()));
+        let group_ids: std::collections::BTreeSet<&str> =
+            grant.group_ids.iter().map(String::as_str).collect();
+        if group_ids.is_empty() {
+            return Err(AppError::Validation("至少选择一个用户组".into()));
+        }
+        for group_id in &group_ids {
+            let group_exists: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM user_groups WHERE id=?1")
+                    .bind(group_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db)?;
+            if group_exists.0 != 1 {
+                return Err(AppError::Validation("审批选择的用户组不存在".into()));
+            }
         }
         let existing: Option<(String,)> = sqlx::query_as(
             "SELECT user_id FROM external_identities WHERE provider='feishu' AND subject=?1",
@@ -267,29 +275,31 @@ impl SqliteAccessGrantRepository {
             id
         };
 
-        let prior: Option<(String, String, i64)> = sqlx::query_as(
+        let prior: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT user_id,group_id,expires_at FROM access_grants WHERE approval_instance_code=?1",
         )
         .bind(grant.instance_code)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
-        if let Some((prior_user, prior_group, prior_expiry)) = prior {
-            if prior_user != user_id || prior_group != grant.group_id {
+        if !prior.is_empty() {
+            let prior_groups: std::collections::BTreeSet<&str> =
+                prior.iter().map(|(_, group, _)| group.as_str()).collect();
+            if prior_groups != group_ids || prior.iter().any(|(id, _, _)| id != &user_id) {
                 return Err(AppError::Validation("审批实例授权内容发生冲突".into()));
             }
-            if grant.expires_at > prior_expiry {
-                sqlx::query("UPDATE access_grants SET expires_at=?2,reason=?3,updated_at=?4 WHERE approval_instance_code=?1")
-                    .bind(grant.instance_code).bind(grant.expires_at).bind(grant.reason)
-                    .bind(Utc::now().timestamp_millis()).execute(&mut *tx).await.map_err(db)?;
-            }
+            sqlx::query("UPDATE access_grants SET expires_at=?2,reason=?3,updated_at=?4 WHERE approval_instance_code=?1 AND expires_at<?2")
+                .bind(grant.instance_code).bind(grant.expires_at).bind(grant.reason)
+                .bind(Utc::now().timestamp_millis()).execute(&mut *tx).await.map_err(db)?;
         } else {
             let now = Utc::now().timestamp_millis();
-            sqlx::query(r#"INSERT INTO access_grants(id,approval_instance_code,user_id,group_id,expires_at,reason,created_at,updated_at)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,?7)"#)
-                .bind(uuid::Uuid::now_v7().to_string()).bind(grant.instance_code).bind(&user_id)
-                .bind(grant.group_id).bind(grant.expires_at).bind(grant.reason).bind(now)
-                .execute(&mut *tx).await.map_err(db)?;
+            for group_id in group_ids {
+                sqlx::query(r#"INSERT INTO access_grants(id,approval_instance_code,user_id,group_id,expires_at,reason,created_at,updated_at)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?7)"#)
+                    .bind(uuid::Uuid::now_v7().to_string()).bind(grant.instance_code).bind(&user_id)
+                    .bind(group_id).bind(grant.expires_at).bind(grant.reason).bind(now)
+                    .execute(&mut *tx).await.map_err(db)?;
+            }
         }
         tx.commit().await.map_err(db)?;
         Ok(user_id)
@@ -348,7 +358,7 @@ mod tests {
     fn grant<'a>(instance: &'a str, expires_at: i64) -> ApprovedGrant<'a> {
         ApprovedGrant {
             instance_code: instance,
-            group_id: "g1",
+            group_ids: vec!["g1".into()],
             expires_at,
             reason: "need access",
             identity: ApprovalIdentity {
@@ -420,6 +430,51 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(expiry.0, 20_000);
+    }
+
+    #[tokio::test]
+    async fn multiple_groups_are_atomic_idempotent_and_reject_changed_sets() {
+        let pool = setup().await;
+        for id in ["g1", "g2"] {
+            sqlx::query("INSERT INTO user_groups(id,name,routes,created_at,updated_at) VALUES(?1,?1,'10.0.0.0/8',0,0)")
+                .bind(id).execute(&pool).await.unwrap();
+        }
+        let repo = SqliteAccessGrantRepository::new(pool.clone());
+        let mut invalid = grant("i1", 20_000);
+        invalid.group_ids = vec!["g1".into(), "missing".into()];
+        assert!(matches!(
+            repo.apply_approved(invalid).await,
+            Err(AppError::Validation(_))
+        ));
+        let users: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users.0, 0);
+        for (groups, expires) in [
+            (vec!["g1", "g2", "g1"], 20_000),
+            (vec!["g2", "g1"], 10_000),
+            (vec!["g1", "g2"], 30_000),
+        ] {
+            let mut approved = grant("i1", expires);
+            approved.group_ids = groups.into_iter().map(str::to_string).collect();
+            assert_eq!(repo.apply_approved(approved).await.unwrap(), "u-new");
+        }
+        assert!(matches!(
+            repo.apply_approved(grant("i1", 40_000)).await,
+            Err(AppError::Validation(_))
+        ));
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT group_id,expires_at FROM access_grants ORDER BY group_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![("g1".into(), 30_000), ("g2".into(), 30_000)]);
+        let identities: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM external_identities")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(identities.0, 1);
     }
 
     #[tokio::test]
