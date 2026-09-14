@@ -80,6 +80,14 @@ pub fn build_router(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/auth/logout", post(handlers::auth::logout))
             .route(
+                "/api/v1/admin/client-updates",
+                get(handlers::client_updates::status).put(handlers::client_updates::configure),
+            )
+            .route(
+                "/api/v1/admin/client-updates/sync",
+                post(handlers::client_updates::sync),
+            )
+            .route(
                 "/api/v1/auth/change-password",
                 post(handlers::auth::change_password),
             )
@@ -211,11 +219,20 @@ pub fn build_router(state: AppState) -> Router {
         std::env::var("VPN_DATA_DIR").unwrap_or_else(|_| "./data".to_string())
     );
     let _ = std::fs::create_dir_all(&updates_dir);
+    let update_service = std::sync::Arc::new(
+        crate::services::client_update_service::ClientUpdateService::new(std::path::PathBuf::from(
+            std::env::var("VPN_DATA_DIR").unwrap_or_else(|_| "./data".into()),
+        )),
+    );
+    if state.auth_service.is_some() {
+        crate::services::client_update_service::ClientUpdateService::start(&update_service);
+    }
 
     Router::new()
         .merge(public_routes)
         .merge(authed_routes)
         .nest_service("/updates", ServeDir::new(&updates_dir))
+        .layer(axum::Extension(update_service))
         .with_state(state)
         .fallback(handlers::static_files::static_handler)
         .layer(middleware)

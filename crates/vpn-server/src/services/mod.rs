@@ -48,3 +48,5 @@ pub use subnet_service::SubnetService;
 pub use token_issuer::{JwtTokenIssuer, TokenIssuerError};
 pub use user_group_service::UserGroupService;
 pub use user_service::UserService;
+
+pub mod client_update_service;

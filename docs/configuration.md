@@ -150,3 +150,37 @@ VPN_LISTEN_PORT=51820
 VPN_WG_BACKEND=auto        # 现代机器走内核态，老内核(如 CentOS 7)自动回退用户态
 RUST_LOG=info
 ```
+
+## 客户端版本与本地安装包镜像
+
+管理员在「客户端版本」页面填写客户端可访问的服务端地址（例如
+`https://vpn.xe-flow.com:8443`），保存后点击「立即同步最新版本」。
+开启自动同步后，一分钟内首次检查，此后每小时检查 GitHub `DreamAgo/vpn`
+的最新正式 Release。默认关闭；设置及最后同步结果保存到
+`VPN_DATA_DIR/client-update-sync.json`，重启后仍然有效。
+
+同步在服务端后台执行，关闭浏览器不会中断。服务端需要访问 GitHub API、GitHub
+及其 release-assets 下载域名，客户端只需访问本服务端：
+
+- 更新清单：`/updates/latest.json`
+- 本地安装包及签名：`/updates/releases/<发布批次>/<文件名>`
+- 包括 Windows 安装器、macOS DMG/更新归档、Linux AppImage/deb。
+
+所有包先下载到数据目录内的私有临时目录，校验文件长度和 GitHub SHA-256，
+并核对更新签名文件与清单中的签名一致，然后发布文件并原子替换清单。
+下载失败、缺包、摘要错误均保留旧清单。客户端仍使用原 Tauri 公钥校验更新包签名。
+相同版本的完整本地镜像会复用；低于已发布版本的 GitHub Release 会被拒绝。
+单文件限制 1 GiB、单次发布总量限制 4 GiB、同步超时 30 分钟。
+
+旧批次保留，以保证已经取得旧清单的客户端仍可下载；管理员可在确认不再使用后
+清理旧批次。异常关机遗留的 `.client-update-staging-*` 临时目录也可在无同步任务时清理。
+数据目录应持久化并留足磁盘空间。安装包与镜像设置为文件数据，需随数据目录备份。
+
+管理接口均要求管理员 JWT：
+
+- `GET /api/v1/admin/client-updates`：当前版本、文件下载地址、同步结果与状态。
+- `PUT /api/v1/admin/client-updates`：保存 `auto_sync` 和 `public_base_url`。
+- `POST /api/v1/admin/client-updates/sync`：启动后台同步；轮询 GET 查看结果。
+
+客户端登录地址和更新地址是独立配置。已发布的 0.1.21 仍使用旧 IP 更新地址；
+只有将旧入口同步或转发到新清单，或安装使用新更新地址的客户端，才能发现此镜像。

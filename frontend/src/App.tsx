@@ -29,6 +29,7 @@ import { BackupPage } from './pages/BackupPage';
 import { ApiKeysPage } from './pages/ApiKeysPage';
 import { NotificationSettingsPage } from './pages/NotificationSettingsPage';
 import { NetworkSettingsPage } from './pages/NetworkSettingsPage';
+import { ClientVersionsPage } from './pages/ClientVersionsPage';
 import { IntegrationSettingsPage } from './pages/IntegrationSettingsPage';
 import { useAuthStore } from './stores/authStore';
 
@@ -113,6 +114,7 @@ function App() {
                       </RequireAdminRoute>
                     }
                   />
+                  <Route path="/client-versions" element={<RequireAdminRoute><ClientVersionsPage /></RequireAdminRoute>} />
                   <Route path="/account" element={<AccountSettingsPage />} />
                   <Route path="/account/password" element={<AccountSettingsPage />} />
                   <Route
