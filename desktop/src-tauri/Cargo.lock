@@ -1070,46 +1070,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "defmt"
-version = "0.3.100"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0963443817029b2024136fc4dd07a5107eb8f977eaf18fcd1fdeb11306b64ad"
-dependencies = [
- "defmt 1.1.1",
-]
-
-[[package]]
-name = "defmt"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2953bfe4f93bbd20cc71198842756f77d161884c99ebbabc41d80231ded88d1"
-dependencies = [
- "bitflags 1.3.2",
- "defmt-macros",
-]
-
-[[package]]
-name = "defmt-macros"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad9c72e7ca2137e0dc3813245a0d282fd6daad32fd800af018306a9169b5fe8"
-dependencies = [
- "defmt-parser",
- "proc-macro2",
- "quote",
- "syn 2.0.106",
-]
-
-[[package]]
-name = "defmt-parser"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
-dependencies = [
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1967,15 +1927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hash32"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1995,16 +1946,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-
-[[package]]
-name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32",
- "stable_deref_trait",
-]
 
 [[package]]
 name = "heck"
@@ -2710,12 +2651,6 @@ dependencies = [
  "objc2-foundation",
  "time",
 ]
-
-[[package]]
-name = "managed"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "markup5ever"
@@ -4679,21 +4614,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
-name = "smoltcp"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad095989c1533c1c266d9b1e8d70a1329dd3723c3edac6d03bbd67e7bf6f4bb"
-dependencies = [
- "bitflags 1.3.2",
- "byteorder",
- "cfg-if",
- "defmt 0.3.100",
- "heapless",
- "log",
- "managed",
-]
-
-[[package]]
 name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5954,7 +5874,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpn-api-types"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "ipnet",
  "serde",
@@ -5964,7 +5884,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-cli"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5972,7 +5892,6 @@ dependencies = [
  "boringtun",
  "chrono",
  "clap",
- "futures",
  "ipnet",
  "libc",
  "net-route",
@@ -5982,8 +5901,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "smoltcp",
- "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6000,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-core"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6012,7 +5929,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-desktop"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
@@ -6038,7 +5955,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-obfs"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "aes",
  "chacha20poly1305",
@@ -6051,7 +5968,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-platform"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6069,7 +5986,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-wireguard"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

@@ -68,13 +68,18 @@ impl SqliteSystemConfigRepository {
 
     /// 在同一事务中写入两个配置项，供整组网络配置与热更新路由原子保存。
     pub async fn set_pair(&self, first: (&str, &str), second: (&str, &str)) -> Result<()> {
+        self.set_many(&[first, second]).await
+    }
+
+    /// 同一事务保存完整网络设置及其热更新策略。
+    pub async fn set_many(&self, entries: &[(&str, &str)]) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
-        for (key, value) in [first, second] {
+        for &(key, value) in entries {
             sqlx::query(
                 r#"INSERT INTO system_config (key, value, updated_at)
                    VALUES (?1, ?2, ?3)

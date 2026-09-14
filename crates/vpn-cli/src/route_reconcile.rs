@@ -44,6 +44,28 @@ fn same_prefix(left: &Route, right: &Route) -> bool {
     left.destination == right.destination && left.prefix == right.prefix
 }
 
+fn overlapping_prefix(left: &Route, right: &Route) -> bool {
+    match (left.destination, right.destination) {
+        (IpAddr::V4(left_address), IpAddr::V4(right_address)) => {
+            let prefix = left.prefix.min(right.prefix);
+            if prefix > 32 {
+                return false;
+            }
+            let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
+            u32::from(left_address) & mask == u32::from(right_address) & mask
+        }
+        (IpAddr::V6(left_address), IpAddr::V6(right_address)) => {
+            let prefix = left.prefix.min(right.prefix);
+            if prefix > 128 {
+                return false;
+            }
+            let mask = u128::MAX.checked_shl(u32::from(128 - prefix)).unwrap_or(0);
+            u128::from(left_address) & mask == u128::from(right_address) & mask
+        }
+        _ => false,
+    }
+}
+
 fn gateway(route: &Route) -> Option<IpAddr> {
     // Windows reads on-link next hops back as Some(0.0.0.0) / Some(::),
     // although the route was added with None.
@@ -106,6 +128,45 @@ async fn reconcile_with(
     };
     let mut removed_for_replacement: Vec<(String, Route)> = Vec::new();
 
+    // Different-prefix replacements can coexist with the old route. Install
+    // them first: deleting a /8 before installing its remaining CIDRs would
+    // otherwise send every failed fragment to the default route. Conversely,
+    // install the /8 before removing fragments when an exclusion is revoked.
+    // Same-prefix interface/gateway replacements keep the transaction below.
+    let obsolete: Vec<_> = added
+        .iter()
+        .filter(|(_, owned)| {
+            current.iter().any(|route| same_route(route, owned))
+                && !desired.iter().any(|route| same_route(route, owned))
+        })
+        .map(|(_, route)| route.clone())
+        .collect();
+    let mut attempted_before_removal = Vec::new();
+    for route in desired {
+        if !obsolete
+            .iter()
+            .any(|old| !same_prefix(old, route) && overlapping_prefix(old, route))
+            || current.iter().any(|existing| same_prefix(existing, route))
+            || added.iter().any(|(_, owned)| same_prefix(owned, route))
+        {
+            continue;
+        }
+        attempted_before_removal.push(route.clone());
+        let label = format!("{}/{}", route.destination, route.prefix);
+        match backend.add(route).await {
+            Ok(()) => {
+                added.push((label.clone(), route.clone()));
+                current.push(route.clone());
+                tracing::debug!(route = %label, "已先添加覆盖替代范围的新路由");
+            }
+            Err(error) => tracing::warn!(
+                route = %label,
+                error = %crate::error::redact_sensitive(&error.to_string()),
+                "添加替代路由失败，保留对应旧路径并等待重试"
+            ),
+        }
+    }
+
     let mut index = 0;
     while index < added.len() {
         let (label, owned) = &added[index];
@@ -131,6 +192,21 @@ async fn reconcile_with(
             added.remove(index);
             continue;
         };
+        if desired.iter().any(|replacement| {
+            !same_prefix(replacement, owned)
+                && overlapping_prefix(replacement, owned)
+                && !current.iter().any(|route| same_route(route, replacement))
+        }) {
+            // Use the fresh table, not merely successful add results: another
+            // process may already have removed or replaced a new fragment.
+            // A conflicting foreign route does not prove the intended path is
+            // usable, and must never be adopted as this connection's route.
+            // No overlapping desired route means a real revocation; unrelated
+            // failures must not keep such an obsolete route alive.
+            tracing::warn!(route = %label, "替代范围尚未全部就绪，保留旧路由并等待重试");
+            index += 1;
+            continue;
+        }
         if backend.deletion_requires_unique_prefix()
             && current
                 .iter()
@@ -186,6 +262,14 @@ async fn reconcile_with(
     };
     current = fresh;
     for desired_route in desired {
+        if attempted_before_removal
+            .iter()
+            .any(|route| same_route(route, desired_route))
+        {
+            // A failed pre-install is retried next round, never after removing
+            // old routes in this round. Successful pre-installs are owned.
+            continue;
+        }
         if added
             .iter()
             .any(|(_, route)| same_prefix(route, desired_route))
@@ -263,6 +347,7 @@ mod tests {
         disappear_on_delete_failure: bool,
         list_failures: VecDeque<bool>,
         list_replacements: VecDeque<Option<Vec<Route>>>,
+        mutation_snapshots: Vec<Vec<Route>>,
     }
 
     struct FakeBackend {
@@ -304,6 +389,8 @@ mod tests {
                 return Err(io::Error::other("add failed"));
             }
             state.routes.push(route.clone());
+            let snapshot = state.routes.clone();
+            state.mutation_snapshots.push(snapshot);
             Ok(())
         }
 
@@ -332,6 +419,8 @@ mod tests {
             // differ from the original add request).
             assert_eq!(&state.routes[index], route);
             state.routes.remove(index);
+            let snapshot = state.routes.clone();
+            state.mutation_snapshots.push(snapshot);
             Ok(())
         }
 
@@ -352,6 +441,194 @@ mod tests {
 
     fn ledger(route: Route) -> Vec<(String, Route)> {
         vec![(format!("{}/{}", route.destination, route.prefix), route)]
+    }
+
+    fn broad_tunnel() -> Route {
+        Route::new("10.0.0.0".parse().unwrap(), 8).with_ifindex(99)
+    }
+
+    fn split_tunnel() -> Vec<Route> {
+        vec![
+            Route::new("10.0.0.0".parse().unwrap(), 9).with_ifindex(99),
+            Route::new("10.128.0.0".parse().unwrap(), 10).with_ifindex(99),
+        ]
+    }
+
+    fn owns(added: &[(String, Route)], route: &Route) -> bool {
+        added.iter().any(|(_, owned)| same_route(owned, route))
+    }
+
+    fn assert_tunnel_coverage_during_mutations(state: &State, addresses: &[&str]) {
+        for snapshot in &state.mutation_snapshots {
+            for address in addresses {
+                let host = Route::new(address.parse().unwrap(), 32);
+                assert!(
+                    snapshot.iter().any(|route| {
+                        route.ifindex == Some(99) && overlapping_prefix(route, &host)
+                    }),
+                    "lost VPN coverage for {address}: {snapshot:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn split_add_failure_keeps_broad_route_until_all_fragments_are_ready() {
+        let broad = broad_tunnel();
+        let fragments = split_tunnel();
+        let backend = FakeBackend::new(vec![broad.clone()]);
+        backend.state.lock().unwrap().add_failures = 1;
+        let mut added = ledger(broad.clone());
+
+        reconcile_with(&backend, &mut added, &fragments).await;
+        assert!(owns(&added, &broad));
+        assert!(!owns(&added, &fragments[0]));
+        assert!(owns(&added, &fragments[1]));
+        assert!(!backend.state.lock().unwrap().calls.contains(&"delete"));
+
+        reconcile_with(&backend, &mut added, &fragments).await;
+        assert!(!owns(&added, &broad));
+        assert!(fragments.iter().all(|route| owns(&added, route)));
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.routes.len(), fragments.len());
+        assert_tunnel_coverage_during_mutations(&state, &["10.32.0.1", "10.160.0.1"]);
+    }
+
+    #[tokio::test]
+    async fn merge_add_failure_keeps_all_fragments_and_retries_before_removal() {
+        let broad = broad_tunnel();
+        let fragments = split_tunnel();
+        let backend = FakeBackend::new(fragments.clone());
+        backend.state.lock().unwrap().add_failures = 1;
+        let mut added: Vec<_> = fragments.iter().cloned().flat_map(ledger).collect();
+
+        reconcile_with(&backend, &mut added, std::slice::from_ref(&broad)).await;
+        assert_eq!(backend.state.lock().unwrap().routes, fragments);
+        assert!(!backend.state.lock().unwrap().calls.contains(&"delete"));
+
+        reconcile_with(&backend, &mut added, std::slice::from_ref(&broad)).await;
+        assert_eq!(added, ledger(broad.clone()));
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.routes, [broad]);
+        assert_tunnel_coverage_during_mutations(&state, &["10.32.0.1", "10.160.0.1"]);
+    }
+
+    #[tokio::test]
+    async fn successful_split_installs_every_fragment_before_removing_broad_route() {
+        let broad = broad_tunnel();
+        let fragments = split_tunnel();
+        let backend = FakeBackend::new(vec![broad.clone()]);
+        let mut added = ledger(broad);
+        reconcile_with(&backend, &mut added, &fragments).await;
+        let state = backend.state.lock().unwrap();
+        let mutations: Vec<_> = state
+            .calls
+            .iter()
+            .copied()
+            .filter(|call| *call != "list")
+            .collect();
+        assert_eq!(mutations, ["add", "add", "delete"]);
+        assert_eq!(state.routes, fragments);
+        assert_tunnel_coverage_during_mutations(&state, &["10.32.0.1", "10.160.0.1"]);
+        let excluded = Route::new("10.224.0.1".parse().unwrap(), 32);
+        assert!(!state
+            .routes
+            .iter()
+            .any(|route| overlapping_prefix(route, &excluded)));
+    }
+
+    #[tokio::test]
+    async fn foreign_fragment_conflict_keeps_old_path_without_adoption() {
+        let broad = broad_tunnel();
+        let fragments = split_tunnel();
+        let foreign = fragments[0].clone().with_ifindex(4);
+        let backend = FakeBackend::new(vec![broad.clone(), foreign.clone()]);
+        let mut added = ledger(broad.clone());
+
+        reconcile_with(&backend, &mut added, &fragments).await;
+        assert!(owns(&added, &broad));
+        assert!(!owns(&added, &foreign));
+        assert!(!owns(&added, &fragments[0]));
+        assert!(owns(&added, &fragments[1]));
+        assert!(!backend.state.lock().unwrap().calls.contains(&"delete"));
+
+        // The foreign owner later removes its conflicting row.
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .routes
+            .retain(|route| !same_route(route, &foreign));
+        reconcile_with(&backend, &mut added, &fragments).await;
+        assert!(!owns(&added, &broad));
+        assert!(fragments.iter().all(|route| owns(&added, route)));
+        assert_eq!(backend.state.lock().unwrap().routes.len(), fragments.len());
+    }
+
+    #[tokio::test]
+    async fn identical_preexisting_fragment_satisfies_coverage_but_is_not_owned() {
+        let broad = broad_tunnel();
+        let fragments = split_tunnel();
+        let backend = FakeBackend::new(vec![broad.clone(), fragments[0].clone()]);
+        let mut added = ledger(broad);
+        reconcile_with(&backend, &mut added, &fragments).await;
+        assert_eq!(added, ledger(fragments[1].clone()));
+        reconcile_with(&backend, &mut added, &[]).await;
+        assert!(added.is_empty());
+        assert_eq!(backend.state.lock().unwrap().routes, [fragments[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn foreign_supernet_conflict_keeps_owned_fragments_on_merge() {
+        let broad = broad_tunnel();
+        let fragments = split_tunnel();
+        let foreign = broad.clone().with_ifindex(4);
+        let mut routes = fragments.clone();
+        routes.push(foreign.clone());
+        let backend = FakeBackend::new(routes.clone());
+        let mut added: Vec<_> = fragments.iter().cloned().flat_map(ledger).collect();
+        reconcile_with(&backend, &mut added, &[broad]).await;
+        assert!(fragments.iter().all(|route| owns(&added, route)));
+        assert!(!owns(&added, &foreign));
+        assert_eq!(backend.state.lock().unwrap().routes, routes);
+        assert!(!backend.state.lock().unwrap().calls.contains(&"delete"));
+        reconcile_with(&backend, &mut added, &[]).await;
+        assert!(added.is_empty());
+        assert_eq!(backend.state.lock().unwrap().routes, [foreign]);
+    }
+
+    #[tokio::test]
+    async fn replacement_removed_before_delete_does_not_authorize_broad_removal() {
+        let broad = broad_tunnel();
+        let fragment = split_tunnel().remove(0);
+        let backend = FakeBackend::new(vec![broad.clone()]);
+        backend.state.lock().unwrap().list_replacements =
+            VecDeque::from([None, Some(vec![broad.clone()])]);
+        let mut added = ledger(broad.clone());
+        reconcile_with(&backend, &mut added, &[fragment]).await;
+        assert_eq!(added, ledger(broad.clone()));
+        assert_eq!(backend.state.lock().unwrap().routes, [broad]);
+        assert!(!backend.state.lock().unwrap().calls.contains(&"delete"));
+    }
+
+    #[tokio::test]
+    async fn failed_split_does_not_keep_unrelated_revoked_route() {
+        let broad = broad_tunnel();
+        let revoked = tunnel();
+        let backend = FakeBackend::new(vec![broad.clone(), revoked.clone()]);
+        backend.state.lock().unwrap().add_failures = 1;
+        let mut added = ledger(broad.clone());
+        added.extend(ledger(revoked.clone()));
+        reconcile_with(&backend, &mut added, &split_tunnel()).await;
+        assert!(owns(&added, &broad));
+        assert!(!owns(&added, &revoked));
+        assert!(!backend
+            .state
+            .lock()
+            .unwrap()
+            .routes
+            .iter()
+            .any(|route| same_route(route, &revoked)));
     }
 
     #[tokio::test]

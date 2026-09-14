@@ -84,6 +84,7 @@ pub async fn heartbeat(
         &state,
         PeerHeartbeatResponse {
             allowed_routes: heartbeat.allowed_routes,
+            local_route_bypass: Some(heartbeat.local_route_bypass),
         },
     ))
 }

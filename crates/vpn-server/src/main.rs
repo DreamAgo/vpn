@@ -243,6 +243,7 @@ async fn run(
         .with_obfs_transport(obfs.as_ref())
         .with_network_settings(network_settings_service.shared_settings())
         .with_dns_settings(network_settings_service.shared_dns_settings())
+        .with_local_route_bypass(network_settings_service.shared_local_route_bypass())
         .with_registration_gate(network_settings_service.registration_gate()),
     );
     tracing::info!(

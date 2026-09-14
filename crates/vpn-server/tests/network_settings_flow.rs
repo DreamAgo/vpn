@@ -15,10 +15,12 @@ use vpn_server::{
     config::{DataPlaneSettingsSeed, NetworkSettingsSeed},
     ratelimit::LoginAttempts,
     repositories::{
-        SqlitePeerRepository, SqliteSessionRepository, SqliteSystemConfigRepository,
-        SqliteUserRepository,
+        SqlitePeerEventRepository, SqlitePeerRepository, SqliteSessionRepository,
+        SqliteSystemConfigRepository, SqliteUserGroupRepository, SqliteUserRepository,
     },
-    services::{Argon2Hasher, AuthService, JwtTokenIssuer, NetworkSettingsService, UserService},
+    services::{
+        Argon2Hasher, AuthService, JwtTokenIssuer, NetworkSettingsService, PeerService, UserService,
+    },
     AppState,
 };
 
@@ -83,7 +85,7 @@ async fn setup_with_restart(
     let network_settings_service = Arc::new(
         NetworkSettingsService::load_or_seed(
             SqliteSystemConfigRepository::new(pool.clone()),
-            SqlitePeerRepository::new(pool),
+            SqlitePeerRepository::new(pool.clone()),
             &DataPlaneSettingsSeed {
                 vpn_subnet: Some("10.8.0.0/24".into()),
                 vpn_listen_port: Some("51820".into()),
@@ -106,9 +108,24 @@ async fn setup_with_restart(
         .await
         .unwrap(),
     );
+    let peer_service = Arc::new(
+        PeerService::new(
+            SqlitePeerRepository::new(pool.clone()),
+            SqliteSystemConfigRepository::new(pool.clone()),
+            SqliteUserGroupRepository::new(pool.clone()),
+            SqliteUserRepository::new(pool.clone()),
+            SqlitePeerEventRepository::new(pool),
+            Arc::new(vpn_wireguard::NoopWireGuardControl::new("SERVER_PUB")),
+            vpn_wireguard::IpPool::new("10.8.0.0/24".parse().unwrap()),
+            "vpn.example.com:51820".into(),
+            vec![],
+        )
+        .with_local_route_bypass(network_settings_service.shared_local_route_bypass()),
+    );
     let mut state = AppState::new()
         .with_auth_service(auth_service)
         .with_user_service(user_service)
+        .with_peer_service(peer_service)
         .with_network_settings_service(network_settings_service);
     state.restart_tx = restart_tx;
     let app = build_router(state);
@@ -129,6 +146,96 @@ async fn setup_with_restart(
         .unwrap()
         .to_string();
     (app, temp, admin_token)
+}
+
+#[tokio::test]
+async fn local_bypass_settings_normalize_preserve_legacy_saves_and_clear_explicitly() {
+    let (app, _temp, token) = setup().await;
+    let (_, initial) = request(
+        &app,
+        "GET",
+        "/api/v1/admin/network/settings",
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(initial["data"]["local_route_bypass"], json!([]));
+    let desired = initial["data"]["desired"].clone();
+    let (status, saved) = request(&app, "PUT", "/api/v1/admin/network/settings", Some(json!({
+        "desired": desired, "server_routes": ["192.168.188.0/24"],
+        "local_route_bypass": [{"local_subnets": ["192.168.187.7/24"], "excluded_routes": ["192.168.188.111/24"]}]
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let expected =
+        json!([{"local_subnets": ["192.168.187.0/24"], "excluded_routes": ["192.168.188.0/24"]}]);
+    assert_eq!(saved["data"]["local_route_bypass"], expected);
+    assert_eq!(saved["data"]["restart_required"], json!(false));
+    let (status, registered) = request(
+        &app,
+        "POST",
+        "/api/v1/peers/register",
+        Some(json!({
+            "wg_public_key": "POLICY_TEST_PEER", "device_name": "Mac policy test"
+        })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    assert_eq!(registered["data"]["local_route_bypass"], expected);
+    let (status, legacy) = request(
+        &app,
+        "PUT",
+        "/api/v1/admin/network/settings",
+        Some(json!({
+            "desired": desired, "server_routes": ["192.168.188.0/24"]
+        })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(legacy["data"]["local_route_bypass"], expected);
+    let (status, _) = request(&app, "PUT", "/api/v1/admin/network/settings", Some(json!({
+        "desired": desired, "server_routes": [],
+        "local_route_bypass": [{"local_subnets": ["192.168.187.0/24"], "excluded_routes": ["0.0.0.0/0"]}]
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, retained) = request(
+        &app,
+        "GET",
+        "/api/v1/admin/network/settings",
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(retained["data"]["local_route_bypass"], expected);
+    assert_eq!(
+        retained["data"]["server_routes"],
+        json!(["192.168.188.0/24"])
+    );
+    let (status, cleared) = request(
+        &app,
+        "PUT",
+        "/api/v1/admin/network/settings",
+        Some(json!({
+            "desired": desired, "server_routes": [], "local_route_bypass": []
+        })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["data"]["local_route_bypass"], json!([]));
+    let (status, heartbeat) = request(
+        &app,
+        "POST",
+        "/api/v1/peers/heartbeat",
+        Some(json!({
+            "wg_public_key": "POLICY_TEST_PEER"
+        })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{heartbeat}");
+    assert_eq!(heartbeat["data"]["local_route_bypass"], json!([]));
 }
 
 #[tokio::test]

@@ -9,6 +9,35 @@ import { isValidCidr } from '@/utils/cidr';
 
 const { Title, Paragraph } = Typography;
 const QUERY_KEY = ['network-settings'];
+const MAX_BYPASS_RULES = 32;
+const MAX_BYPASS_SUBNETS = 32;
+
+function isValidBypassCidr(cidr: string): boolean {
+  if (!isValidCidr(cidr)) return false;
+  const [address, prefix] = cidr.trim().split('/');
+  const ip = address.split('.').reduce((value, octet) => (value << 8) | Number(octet), 0) >>> 0;
+  const first = (ip & (0xffffffff << (32 - Number(prefix)))) >>> 0;
+  const last = first + 2 ** (32 - Number(prefix)) - 1;
+  // Match the server's forbidden address ranges, including partial overlap.
+  return ![
+    [0x00000000, 0x00ffffff], // 0.0.0.0/8
+    [0x7f000000, 0x7fffffff], // 127.0.0.0/8
+    [0xa9fe0000, 0xa9feffff], // 169.254.0.0/16
+    [0xe0000000, 0xffffffff], // 224.0.0.0/3
+  ].some(([start, end]) => first <= end && last >= start);
+}
+
+function validateBypassSubnets(_: unknown, values: unknown): Promise<void> {
+  if (!Array.isArray(values) || values.length === 0) {
+    return Promise.reject(new Error('请至少填写一个网段'));
+  }
+  if (values.length > MAX_BYPASS_SUBNETS) {
+    return Promise.reject(new Error(`每个列表最多 ${MAX_BYPASS_SUBNETS} 个网段`));
+  }
+  return values.every((value) => typeof value === 'string' && isValidBypassCidr(value))
+    ? Promise.resolve()
+    : Promise.reject(new Error('请输入合法 IPv4 CIDR，不支持 /0、回环、链路本地、组播或保留地址'));
+}
 
 function changedRestartFields(applied: DataPlaneSettings, desired: DataPlaneSettings): string[] {
   const fields: Array<[string, unknown, unknown]> = [
@@ -39,7 +68,7 @@ export function NetworkSettingsPage() {
 
   useEffect(() => {
     if (data && (!hydrated.current || editVersion.current === hydratedVersion.current)) {
-      form.setFieldsValue({ desired: data.desired, serverRoutes: data.serverRoutes });
+      form.setFieldsValue({ desired: data.desired, serverRoutes: data.serverRoutes, localRouteBypass: data.localRouteBypass ?? [] });
       hydrated.current = true;
       hydratedVersion.current = editVersion.current;
     }
@@ -52,7 +81,7 @@ export function NetworkSettingsPage() {
     onSuccess: ({ result, version }) => {
       queryClient.setQueryData(QUERY_KEY, result);
       if (editVersion.current === version) {
-        form.setFieldsValue({ desired: result.desired, serverRoutes: result.serverRoutes });
+        form.setFieldsValue({ desired: result.desired, serverRoutes: result.serverRoutes, localRouteBypass: result.localRouteBypass ?? [] });
         hydratedVersion.current = version;
       }
       message.success(result.restartRequired ? '配置已保存，点击“重启并应用”即可生效' : '网络配置已保存');
@@ -92,7 +121,9 @@ export function NetworkSettingsPage() {
   });
 
   const save = async () => {
-    const request = await form.validateFields();
+    const values = await form.validateFields().catch(() => undefined);
+    if (!values) return;
+    const request = { ...values, localRouteBypass: values.localRouteBypass ?? [] };
     mutation.mutate({ request, version: editVersion.current });
   };
   const endpointRule = { pattern: /^[^:\s]+:\d+$/, message: '请输入 host:port' };
@@ -108,7 +139,7 @@ export function NetworkSettingsPage() {
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {isError && <Alert showIcon type="error" message="网络参数加载失败" description={error instanceof Error ? error.message : '请稍后重试'} action={<Button onClick={() => void refetch()}>重试</Button>} />}
       {data?.restartRequired && <Alert showIcon type="warning" message="存在待重启配置" description={`待生效：${restartChanges.join('、')}。点击“重启并应用”使配置生效；若包含虚拟子网，重启前暂停节点注册。`} action={<Button loading={restart.isPending} disabled={mutation.isPending} onClick={confirmRestart}>重启并应用</Button>} />}
-      <Alert showIcon type="info" message="生效方式" description="基础 VPN 与混淆配置重启后生效；LAN 路由和 DNS 转发规则立即热更新；客户端 DNS 在新连接或重连时应用。环境变量只用于首次初始化。" />
+      <Alert showIcon type="info" message="生效方式" description="基础 VPN 与混淆配置重启后生效；LAN 路由和 DNS 转发规则保存后生效；路由排除规则通过客户端心跳同步，无需重启；客户端 DNS 在新连接或重连时应用。环境变量只用于首次初始化。" />
       <Form form={form} layout="vertical" disabled={!data || isError || mutation.isPending || restart.isPending} onValuesChange={() => { editVersion.current += 1; }}>
         <Card title="基础 VPN" loading={isLoading}>
           <Row gutter={16}>
@@ -135,6 +166,40 @@ export function NetworkSettingsPage() {
         <Card title="LAN 路由" style={{ marginTop: 16 }}>
           <Form.Item name="serverRoutes" label="CIDR 列表" rules={[{ validator: (_, routes: string[] = []) => routes.every((route) => isValidCidr(route) && route !== '0.0.0.0/0') ? Promise.resolve() : Promise.reject(new Error('请输入合法 IPv4 CIDR，且不能使用 0.0.0.0/0')) }]}><Select mode="tags" tokenSeparators={[',']} placeholder="192.168.0.0/16" /></Form.Item>
           <Paragraph type="secondary">允许使用 10.0.0.0/8 等覆盖 VPN 子网的宽泛 LAN/组路由；禁止默认路由。</Paragraph>
+        </Card>
+
+        <Card title="按网络排除 VPN 路由" style={{ marginTop: 16 }}>
+          <Paragraph type="secondary">客户端处于指定网络时，不接管列出的目标网段，TCP、UDP 和 ICMP 都由系统现有路由处理。离开该网络后恢复 VPN；VPN 虚拟子网始终保留。其他代理仍可能影响实际路径。规则切换后，已有连接可能需要重新建立。</Paragraph>
+          <Form.List name="localRouteBypass" rules={[{
+            validator: (_, rules: unknown[] = []) => rules.length <= MAX_BYPASS_RULES
+              ? Promise.resolve()
+              : Promise.reject(new Error(`最多配置 ${MAX_BYPASS_RULES} 条排除规则`)),
+          }]}>
+            {(fields, { add, remove }, { errors }) => <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              {fields.map(({ key, name: fieldName }, index) => <Card
+                key={key}
+                size="small"
+                type="inner"
+                title={`规则 ${index + 1}`}
+                extra={<Button danger type="text" aria-label={`删除排除规则 ${index + 1}`} icon={<DeleteOutlined />} onClick={() => remove(fieldName)}>删除</Button>}
+              >
+                <Row gutter={16}>
+                  <Col xs={24} md={12}>
+                    <Form.Item name={[fieldName, 'localSubnets']} label="客户端所在网段" rules={[{ validator: validateBypassSubnets }]} extra="任一物理网卡的 IPv4 地址属于这些网段，即匹配本条规则。">
+                      <Select mode="tags" maxCount={MAX_BYPASS_SUBNETS} tokenSeparators={[',', '，', ';', '；', ' ']} placeholder="例如 192.168.187.0/24，按回车添加" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={12}>
+                    <Form.Item name={[fieldName, 'excludedRoutes']} label="不接管的目标网段" rules={[{ validator: validateBypassSubnets }]} extra="填写在该网络中能够直接访问的网段，可添加多个。">
+                      <Select mode="tags" maxCount={MAX_BYPASS_SUBNETS} tokenSeparators={[',', '，', ';', '；', ' ']} placeholder="例如 192.168.188.0/24，按回车添加" />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              </Card>)}
+              <Form.ErrorList errors={errors} />
+              <Button type="dashed" icon={<PlusOutlined />} disabled={!data || isError || mutation.isPending || restart.isPending || fields.length >= MAX_BYPASS_RULES} onClick={() => add({ localSubnets: [], excludedRoutes: [] })}>添加排除规则（{fields.length}/{MAX_BYPASS_RULES}）</Button>
+            </Space>}
+          </Form.List>
         </Card>
 
         <Card title="内置 DNS" style={{ marginTop: 16 }}>

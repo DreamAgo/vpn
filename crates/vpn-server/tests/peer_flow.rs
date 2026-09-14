@@ -147,6 +147,7 @@ async fn full_peer_lifecycle() {
         json!("vpn.example.com:51820")
     );
     assert_eq!(body["data"]["vpn_subnet"], json!("10.8.0.0/24"));
+    assert_eq!(body["data"]["local_route_bypass"], json!([]));
     let server_pub = body["data"]["server_public_key"].as_str().unwrap();
     assert_eq!(server_pub.len(), 44);
 
@@ -173,6 +174,7 @@ async fn full_peer_lifecycle() {
     .await;
     assert_eq!(status, StatusCode::OK, "heartbeat body: {body}");
     assert_eq!(body["code"], json!(0));
+    assert_eq!(body["data"]["local_route_bypass"], json!([]));
 
     // GET config → text/plain + Content-Disposition + [Interface]
     let resp = app
