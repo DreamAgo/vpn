@@ -117,10 +117,16 @@ export interface DataPlaneSettings {
   dns: DnsNetworkSettings;
 }
 
+export interface LocalRouteBypassRule {
+  localSubnets: string[];
+  excludedRoutes: string[];
+}
+
 export interface NetworkSettingsView {
   applied: DataPlaneSettings;
   desired: DataPlaneSettings;
   serverRoutes: string[];
+  localRouteBypass: LocalRouteBypassRule[];
   restartRequired: boolean;
   pskConfigured: boolean;
 }
@@ -128,6 +134,7 @@ export interface NetworkSettingsView {
 export interface UpdateNetworkSettingsRequest {
   desired: DataPlaneSettings;
   serverRoutes: string[];
+  localRouteBypass?: LocalRouteBypassRule[];
 }
 
 export interface EmailNotificationSettings {

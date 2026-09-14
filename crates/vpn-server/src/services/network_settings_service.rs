@@ -19,9 +19,10 @@ use tokio::sync::RwLock;
 use vpn_api_types::{
     peer::ObfsMode,
     system::{
-        ClientDnsMode, DataPlaneSettings, DnsForwardRule, DnsNetworkSettings, DnsStaticRecord,
-        NetworkMtuMode, NetworkSettings, NetworkSettingsView, ObfsNetworkSettings, VpnBaseSettings,
-        DEFAULT_TUN_MTU, MAX_TUN_MTU, MIN_TUN_MTU,
+        normalize_local_route_bypass, ClientDnsMode, DataPlaneSettings, DnsForwardRule,
+        DnsNetworkSettings, DnsStaticRecord, LocalRouteBypassRule, NetworkMtuMode, NetworkSettings,
+        NetworkSettingsView, ObfsNetworkSettings, VpnBaseSettings, DEFAULT_TUN_MTU, MAX_TUN_MTU,
+        MIN_TUN_MTU,
     },
 };
 use vpn_core::{AppError, Result};
@@ -29,6 +30,7 @@ use vpn_core::{AppError, Result};
 pub const KEY_NETWORK_SETTINGS: &str = "network_settings_v1";
 const KEY_DATA_PLANE_SETTINGS_V2: &str = "network_settings_v2";
 pub const KEY_DATA_PLANE_SETTINGS: &str = "network_settings_v3";
+pub const KEY_LOCAL_ROUTE_BYPASS: &str = "local_route_bypass_v1";
 const VERSION: u8 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,6 +55,7 @@ pub struct NetworkSettingsService {
     applied: DataPlaneSettings,
     mtu: Arc<RwLock<NetworkSettings>>,
     dns: Arc<RwLock<DnsNetworkSettings>>,
+    local_route_bypass: Arc<RwLock<Vec<LocalRouteBypassRule>>>,
     psk_configured: bool,
     https_enabled: bool,
     approval_enabled: bool,
@@ -99,6 +102,16 @@ impl NetworkSettingsService {
             .map_err(AppError::Config)?;
         validate_peer_ips(&peer_repo, &settings.vpn.vpn_subnet).await?;
         load_or_seed_server_routes(&repo, seed.server_routes.as_deref()).await?;
+        repo.set_if_absent(KEY_LOCAL_ROUTE_BYPASS, "[]").await?;
+        let raw_rules = repo.get(KEY_LOCAL_ROUTE_BYPASS).await?.ok_or_else(|| {
+            AppError::Config(format!("{KEY_LOCAL_ROUTE_BYPASS} 初始化后读取失败"))
+        })?;
+        let rules: Vec<LocalRouteBypassRule> =
+            serde_json::from_str(&raw_rules).map_err(|error| {
+                AppError::Config(format!("{KEY_LOCAL_ROUTE_BYPASS} JSON 损坏：{error}"))
+            })?;
+        let rules = normalize_local_route_bypass(&rules)
+            .map_err(|error| AppError::Config(format!("{KEY_LOCAL_ROUTE_BYPASS} 损坏：{error}")))?;
         Ok(Self {
             repo,
             peer_repo,
@@ -106,6 +119,7 @@ impl NetworkSettingsService {
             applied: settings.clone(),
             mtu: Arc::new(RwLock::new(settings.mtu.clone())),
             dns: Arc::new(RwLock::new(settings.dns.clone())),
+            local_route_bypass: Arc::new(RwLock::new(rules)),
             psk_configured,
             https_enabled,
             approval_enabled,
@@ -125,6 +139,9 @@ impl NetworkSettingsService {
     pub fn shared_dns_settings(&self) -> Arc<RwLock<DnsNetworkSettings>> {
         self.dns.clone()
     }
+    pub fn shared_local_route_bypass(&self) -> Arc<RwLock<Vec<LocalRouteBypassRule>>> {
+        self.local_route_bypass.clone()
+    }
     pub fn registration_gate(&self) -> Arc<AtomicBool> {
         self.registration_blocked.clone()
     }
@@ -140,6 +157,7 @@ impl NetworkSettingsService {
             applied,
             desired,
             server_routes,
+            local_route_bypass: self.local_route_bypass.read().await.clone(),
             psk_configured: self.psk_configured,
         }
     }
@@ -161,13 +179,14 @@ impl NetworkSettingsService {
     ) -> Result<Vec<String>> {
         let lock = route_policy_lock();
         let _guard = lock.lock().await;
-        self.update_locked(desired, server_routes).await
+        self.update_locked(desired, server_routes, None).await
     }
 
     pub(crate) async fn update_locked(
         &self,
         mut desired: DataPlaneSettings,
         server_routes: &[String],
+        local_route_bypass: Option<&[LocalRouteBypassRule]>,
     ) -> Result<Vec<String>> {
         desired.dns = desired.dns.normalized().map_err(AppError::Validation)?;
         desired.validate().map_err(AppError::Validation)?;
@@ -191,6 +210,10 @@ impl NetworkSettingsService {
         )
         .map_err(AppError::Validation)?;
         let routes = normalize_subnets(server_routes)?;
+        let rules = match local_route_bypass {
+            Some(rules) => normalize_local_route_bypass(rules).map_err(AppError::Validation)?,
+            None => self.local_route_bypass.read().await.clone(),
+        };
         // 串行化完整校验、事务提交和内存快照切换，避免并发保存导致 DB/内存倒序。
         let mut current = self.desired.write().await;
         if desired.vpn.vpn_subnet != current.vpn.vpn_subnet && self.peer_repo.count_all().await? > 0
@@ -200,14 +223,18 @@ impl NetworkSettingsService {
             ));
         }
         let raw = serialize(&desired)?;
+        let raw_rules =
+            serde_json::to_string(&rules).map_err(|error| AppError::Internal(Box::new(error)))?;
         self.repo
-            .set_pair(
+            .set_many(&[
                 (KEY_DATA_PLANE_SETTINGS, &raw),
                 (KEY_SERVER_ROUTES, &routes.join(",")),
-            )
+                (KEY_LOCAL_ROUTE_BYPASS, &raw_rules),
+            ])
             .await?;
         *self.mtu.write().await = desired.mtu.clone();
         *self.dns.write().await = desired.dns.clone();
+        *self.local_route_bypass.write().await = rules;
         self.registration_blocked.store(
             desired.vpn.vpn_subnet != self.applied.vpn.vpn_subnet,
             Ordering::Release,
@@ -690,6 +717,137 @@ mod tests {
             ClientDnsMode::Global
         );
         assert!(!service.view(vec![]).await.restart_required);
+    }
+
+    fn bypass_rules() -> Vec<LocalRouteBypassRule> {
+        vec![LocalRouteBypassRule {
+            local_subnets: vec!["192.168.187.4/24".into()],
+            excluded_routes: vec!["192.168.188.111/24".into()],
+        }]
+    }
+
+    #[tokio::test]
+    async fn bypass_rules_are_hot_persist_across_restart_and_can_be_cleared() {
+        let (repo, peers) = repos().await;
+        let service = NetworkSettingsService::load_or_seed(
+            repo.clone(),
+            peers.clone(),
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let shared = service.shared_local_route_bypass();
+        assert!(shared.read().await.is_empty());
+        let rules = bypass_rules();
+        service
+            .update_locked(service.desired().await, &[], Some(&rules))
+            .await
+            .unwrap();
+        let expected = normalize_local_route_bypass(&rules).unwrap();
+        assert_eq!(*shared.read().await, expected);
+        assert!(!service.view(vec![]).await.restart_required);
+        // 老管理端保存其他参数时没有字段，必须保留规则。
+        service.update(service.desired().await, &[]).await.unwrap();
+        assert_eq!(*shared.read().await, expected);
+        let restarted = NetworkSettingsService::load_or_seed(
+            repo.clone(),
+            peers.clone(),
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted.view(vec![]).await.local_route_bypass, expected);
+        restarted
+            .update_locked(restarted.desired().await, &[], Some(&[]))
+            .await
+            .unwrap();
+        assert!(restarted
+            .shared_local_route_bypass()
+            .read()
+            .await
+            .is_empty());
+        let restarted_again = NetworkSettingsService::load_or_seed(
+            repo,
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(restarted_again
+            .view(vec![])
+            .await
+            .local_route_bypass
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_bypass_save_rolls_back_data_plane_routes_and_shared_snapshot() {
+        let (repo, peers) = repos().await;
+        let service = NetworkSettingsService::load_or_seed(
+            repo.clone(),
+            peers,
+            &seed(),
+            &NetworkSettingsSeed::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let original = service.desired().await;
+        let original_raw = repo.get(KEY_DATA_PLANE_SETTINGS).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_bypass_update BEFORE UPDATE ON system_config WHEN NEW.key = 'local_route_bypass_v1' BEGIN SELECT RAISE(FAIL, 'test policy storage failure'); END")
+            .execute(repo.pool()).await.unwrap();
+        let mut desired = original.clone();
+        desired.mtu.default_mtu = 1340;
+        assert!(service
+            .update_locked(desired, &["10.0.0.0/8".into()], Some(&bypass_rules()))
+            .await
+            .is_err());
+        assert_eq!(service.desired().await, original);
+        assert_eq!(
+            repo.get(KEY_DATA_PLANE_SETTINGS).await.unwrap(),
+            original_raw
+        );
+        assert!(service.server_routes().await.unwrap().is_empty());
+        assert!(service.shared_local_route_bypass().read().await.is_empty());
+        assert_eq!(
+            service.shared_settings().read().await.default_mtu,
+            original.mtu.default_mtu
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_persisted_bypass_rules_refuse_startup() {
+        for raw in [
+            "{bad",
+            r#"[{"local_subnets":["192.168.187.0/24"],"excluded_routes":["0.0.0.0/0"]}]"#,
+        ] {
+            let (repo, peers) = repos().await;
+            repo.set(KEY_LOCAL_ROUTE_BYPASS, raw).await.unwrap();
+            let result = NetworkSettingsService::load_or_seed(
+                repo,
+                peers,
+                &seed(),
+                &NetworkSettingsSeed::default(),
+                false,
+                false,
+            )
+            .await;
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(KEY_LOCAL_ROUTE_BYPASS));
+        }
     }
     #[tokio::test]
     async fn wide_lan_route_and_empty_peer_subnet_change_are_allowed() {

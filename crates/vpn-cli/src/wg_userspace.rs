@@ -7,8 +7,8 @@
 //! - tokio UDP：与服务端 endpoint 收发密文。
 //!
 //! 转发循环（单任务 `tokio::select!`）：
-//! - TUN 读到 IPv4 TCP → 本地 TCP Router 按连接选择内网或 VPN；
-//! - 其余 IP 包及 TCP 的 VPN 分支 → `Tunn::encapsulate` → UDP 送服务端；
+//! - 系统路由将需走 VPN 的 IP 包交给 TUN；
+//! - TUN 读到 IP 包 → `Tunn::encapsulate` → UDP 送服务端；
 //! - UDP 收到密文 → `Tunn::decapsulate` → 写回 TUN（或回送握手包）；
 //! - 定时 `Tunn::update_timers` → 维护握手 / persistent-keepalive。
 //!
@@ -32,9 +32,8 @@ use vpn_api_types::system::{obfs_transport_safe_mtu, NetworkMtuMode, NetworkSett
 use vpn_obfs::{Codec, Direction, Mode, ReplayCache};
 use zeroize::Zeroizing;
 
-use crate::daemon::{SharedState, TunnelTransport};
+use crate::daemon::{RoutePolicy, SharedState, TunnelTransport};
 use crate::error::{CliError, CliResult};
-use crate::tcp_proxy::{Event as TcpEvent, Router as TcpRouter};
 
 const IP_UDP_OVERHEAD: u16 = 28;
 const WG_OVERHEAD: u16 = 32;
@@ -257,6 +256,80 @@ fn tunnel_routes(allowed: &[String], vpn: ipnet::Ipv4Net, ifindex: u32) -> Vec<R
     networks.into_values().collect()
 }
 
+/// Rules only remove this client's VPN routes. The operating system retains
+/// control of all physical/default/third-party routes for excluded destinations.
+fn routes_for_local_addresses(
+    policy: &RoutePolicy,
+    vpn: ipnet::Ipv4Net,
+    ifindex: u32,
+    addresses: &[Ipv4Addr],
+) -> Result<(Vec<Route>, Vec<ipnet::Ipv4Net>), String> {
+    let rules = vpn_api_types::system::normalize_local_route_bypass(&policy.local_route_bypass)?;
+    let mut exclusions = std::collections::BTreeSet::new();
+    for rule in rules {
+        let matches = rule.local_subnets.iter().any(|cidr| {
+            cidr.parse::<ipnet::Ipv4Net>()
+                .is_ok_and(|network| addresses.iter().any(|address| network.contains(address)))
+        });
+        if matches {
+            for cidr in rule.excluded_routes {
+                exclusions.insert(cidr.parse::<ipnet::Ipv4Net>().map_err(|e| e.to_string())?);
+            }
+        }
+    }
+    let exclusions: Vec<_> = exclusions.into_iter().collect();
+    if exclusions.is_empty() {
+        return Ok((
+            tunnel_routes(&policy.allowed_routes, vpn, ifindex),
+            exclusions,
+        ));
+    }
+    let networks = crate::route_bypass::effective_routes(&policy.allowed_routes, vpn, &exclusions)
+        .map_err(|error| error.to_string())?;
+    Ok((
+        networks
+            .into_iter()
+            .map(|network| {
+                Route::new(network.network().into(), network.prefix_len()).with_ifindex(ifindex)
+            })
+            .collect(),
+        exclusions,
+    ))
+}
+
+fn current_tunnel_routes(
+    policy: &RoutePolicy,
+    vpn: ipnet::Ipv4Net,
+    ifindex: u32,
+) -> (Vec<Route>, Vec<ipnet::Ipv4Net>) {
+    if policy.local_route_bypass.is_empty() {
+        return (tunnel_routes(&policy.allowed_routes, vpn, ifindex), vec![]);
+    }
+    let plan = crate::local_network::physical_ipv4_addresses(ifindex)
+        .map_err(|error| error.to_string())
+        .and_then(|addresses| routes_for_local_addresses(policy, vpn, ifindex, &addresses));
+    match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            // A failed network read or oversized plan must restore the complete
+            // VPN route set, never retain exclusions from a previous network.
+            tracing::warn!(stage = "local_route_bypass", %error, "无法应用条件路由排除，本次保留完整 VPN 路由");
+            (tunnel_routes(&policy.allowed_routes, vpn, ifindex), vec![])
+        }
+    }
+}
+
+fn record_route_exclusions(active: &mut Vec<ipnet::Ipv4Net>, next: Vec<ipnet::Ipv4Net>) {
+    if *active != next {
+        tracing::info!(
+            stage = "local_route_bypass",
+            excluded_routes = ?next,
+            "匹配的路由排除策略已更新，路由操作失败时将继续重试"
+        );
+        *active = next;
+    }
+}
+
 /// 用户态隧道句柄（保留拆除所需信息）。任务在 shutdown 信号后自行清理路由并退出。
 pub struct UserspaceTunnel;
 
@@ -277,6 +350,7 @@ impl UserspaceTunnel {
         vpn_ip: Ipv4Addr,
         subnet_prefix: u8,
         allowed_routes: &[String],
+        local_route_bypass: &[vpn_api_types::system::LocalRouteBypassRule],
         keepalive_secs: u16,
         shutdown: watch::Receiver<bool>,
         // 转发循环遇致命错误(如 TUN 读失败)时广播关停,连带停掉心跳任务,避免它继续
@@ -284,9 +358,9 @@ impl UserspaceTunnel {
         shutdown_tx: watch::Sender<bool>,
         // 流量计数回写目标（前端读 bytes_rx/bytes_tx）；None 时不统计。
         traffic: Option<SharedState>,
-        // 实时路由更新：心跳检测到 allowed_routes 变化时推送新集合,转发循环据此增量
-        // 增删本地路由(P1.4);None 时不支持热更新。
-        routes_rx: Option<watch::Receiver<Vec<String>>>,
+        // 实时路由更新：心跳推送允许网段与排除规则，转发循环据此增量
+        // 增删本地路由；None 时不支持热更新。
+        routes_rx: Option<watch::Receiver<RoutePolicy>>,
     ) -> CliResult<tokio::task::JoinHandle<CliResult<()>>> {
         let bring_up_started = std::time::Instant::now();
         tracing::info!(
@@ -447,7 +521,11 @@ impl UserspaceTunnel {
             .trunc();
         let handle =
             Handle::new().map_err(|error| CliError::Other(format!("路由句柄失败: {error}")))?;
-        let desired = tunnel_routes(allowed_routes, vpn_subnet, ifindex);
+        let route_policy = RoutePolicy {
+            allowed_routes: allowed_routes.to_vec(),
+            local_route_bypass: local_route_bypass.to_vec(),
+        };
+        let (desired, _) = current_tunnel_routes(&route_policy, vpn_subnet, ifindex);
         let mut added = Vec::new();
         crate::route_reconcile::reconcile(&handle, &mut added, &desired).await;
         let route_result = if added.len() == desired.len() {
@@ -512,9 +590,8 @@ impl UserspaceTunnel {
                 routes_rx,
                 obfs,
                 dns_session,
-                allowed_routes.to_vec(),
+                route_policy,
                 vpn_subnet,
-                usize::from(mtu),
                 usize::from(mtu) + usize::from(WG_OVERHEAD) + 64,
             )
             .instrument(tracing::Span::current()),
@@ -535,12 +612,11 @@ async fn forward_loop(
     mut shutdown: watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
     traffic: Option<SharedState>,
-    mut routes_rx: Option<watch::Receiver<Vec<String>>>,
+    mut routes_rx: Option<watch::Receiver<RoutePolicy>>,
     mut obfs: Option<ObfsRuntime>,
     mut dns_session: Option<vpn_platform::DnsSession>,
-    mut allowed_routes: Vec<String>,
+    mut route_policy: RoutePolicy,
     vpn_subnet: ipnet::Ipv4Net,
-    mtu: usize,
     packet_buffer_size: usize,
 ) -> CliResult<()> {
     let loop_started = std::time::Instant::now();
@@ -554,7 +630,7 @@ async fn forward_loop(
     let mut enc_buf = vec![0u8; packet_buffer_size];
     let mut udp_read_buf = vec![0u8; 65535];
     let mut ticker = tokio::time::interval(TIMER_TICK);
-    let mut tcp = TcpRouter::start(allowed_routes.clone(), vpn_subnet, ifindex, mtu);
+    let mut active_exclusions = Vec::new();
     let mut route_retry = tokio::time::interval(Duration::from_secs(5));
     route_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -586,14 +662,11 @@ async fn forward_loop(
                 // 显式置位 true，或 sender 被 drop（通道关闭）→ 退出并在循环末尾清理路由。
                 if res.is_err() || *shutdown.borrow() { break Ok(()); }
             }
-            // 出站：TCP 交给按连接选路，其余报文直接进入 WireGuard。
+            // 出站：进入 TUN 的所有 IP 报文直接交给 WireGuard。
             r = device.recv(&mut tun_read_buf) => {
                 match r {
                     Ok(n) => {
                         if n == 0 {
-                            continue;
-                        }
-                        if tcp.try_send(tun_read_buf[..n].to_vec()) {
                             continue;
                         }
                         match encapsulate_outgoing(
@@ -678,78 +751,22 @@ async fn forward_loop(
                     }
                 }
             }
-            // 实时路由更新：心跳检测到 allowed_routes 变化 → 增量增删本地路由。
+            // 实时路由更新：心跳检测到允许网段或排除规则变化 → 增量增删本地路由。
             changed = wait_routes_change(&mut routes_rx) => {
                 if changed {
                     if let Some(rx) = routes_rx.as_ref() {
-                        allowed_routes = rx.borrow().clone();
-                        tcp.set_allowed(allowed_routes.clone());
-                        let desired = tunnel_routes(&allowed_routes, vpn_subnet, ifindex);
+                        route_policy = rx.borrow().clone();
+                        let (desired, exclusions) = current_tunnel_routes(&route_policy, vpn_subnet, ifindex);
                         crate::route_reconcile::reconcile(&handle, &mut added_routes, &desired).await;
-                    }
-                }
-            }
-            event = tcp.recv() => {
-                match event {
-                    Some(TcpEvent::ToVpn(packet)) => {
-                        // A delayed decision must use the same padding, error
-                        // handling and byte accounting as immediate VPN traffic.
-                        let size = packet.len();
-                        let Some(buffer) = tun_read_buf.get_mut(..size) else {
-                            let error = CliError::Other(format!(
-                                "TCP 选路返回的报文长度 {size} 超过缓冲区容量 {}",
-                                tun_read_buf.len()
-                            ));
-                            stop_data_plane(&traffic, &shutdown_tx, &error).await;
-                            break Err(error);
-                        };
-                        buffer.copy_from_slice(&packet);
-                        match encapsulate_outgoing(
-                            &mut tunn,
-                            &udp,
-                            obfs.as_ref(),
-                            &mut tun_read_buf,
-                            size,
-                            &mut enc_buf,
-                            &mut send_state,
-                        ).await {
-                            Ok((tx_bytes, failures)) => {
-                                tx_acc = tx_acc.saturating_add(tx_bytes);
-                                udp_send_failures = udp_send_failures.saturating_add(failures);
-                            }
-                            Err(error) => {
-                                stop_data_plane(&traffic, &shutdown_tx, &error).await;
-                                break Err(error);
-                            }
-                        }
-                    }
-                    Some(TcpEvent::ToTun(packet)) => {
-                        if let Err(error) = device.send(&packet).await {
-                            let error = CliError::Other(format!("TCP 直连写入 TUN 失败: {error}"));
-                            stop_data_plane(&traffic, &shutdown_tx, &error).await;
-                            break Err(error);
-                        }
-                        rx_acc = rx_acc.saturating_add(packet.len() as u64);
-                    }
-                    Some(TcpEvent::Traffic { tx, rx }) => {
-                        // Router emits direct TX here; direct RX is counted
-                        // by ToTun above, so its corresponding Traffic.rx is 0.
-                        tx_acc = tx_acc.saturating_add(tx);
-                        rx_acc = rx_acc.saturating_add(rx);
-                    }
-                    None => {
-                        // A stopped router must not silently drop all TCP or
-                        // keep this select branch immediately ready forever.
-                        let error = CliError::Other("TCP 选路任务意外退出，数据面停止".into());
-                        stop_data_plane(&traffic, &shutdown_tx, &error).await;
-                        break Err(error);
+                        record_route_exclusions(&mut active_exclusions, exclusions);
                     }
                 }
             }
             _ = route_retry.tick() => {
                 // Retry failed OS operations even if configuration is unchanged.
-                let desired = tunnel_routes(&allowed_routes, vpn_subnet, ifindex);
+                let (desired, exclusions) = current_tunnel_routes(&route_policy, vpn_subnet, ifindex);
                 crate::route_reconcile::reconcile(&handle, &mut added_routes, &desired).await;
+                record_route_exclusions(&mut active_exclusions, exclusions);
             }
             // 定时器：握手重传 / keepalive，并顺带把累计流量刷回状态。
             _ = ticker.tick() => {
@@ -805,13 +822,7 @@ async fn forward_loop(
         }
     }
 
-    // Join the TCP router before DNS and route cleanup: all pending decisions,
-    // local streams and physical sockets must stop with this tunnel session.
     let mut cleanup_failures = 0;
-    if let Err(error) = tcp.shutdown().await {
-        cleanup_failures += 1;
-        tracing::warn!(stage = "tcp_proxy_cleanup", result = "failed", error = %error, "TCP 选路资源清理失败");
-    }
     // 清理：先恢复 DNS，再删除本任务加的路由（TUN 设备随 device drop 关闭）。
     if let Some(session) = dns_session.as_mut() {
         if let Err(error) = session.restore().await {
@@ -838,14 +849,14 @@ async fn forward_loop(
         // 清理结果比运行期错误更关键：上层需要据此决定是否
         // fail-closed 阻止重连。即使运行期也出过错，仍要返回专用清理错误。
         return Err(CliError::Cleanup(format!(
-            "VPN 路由、DNS 或 TCP 选路资源清理失败: {cleanup_failures} 项"
+            "VPN 路由或 DNS 清理失败: {cleanup_failures} 项"
         )));
     }
     outcome
 }
 
 /// 等待路由更新通道有新值;通道为 None(不支持热更新)时永不就绪——该 select 分支不触发。
-async fn wait_routes_change(rx: &mut Option<watch::Receiver<Vec<String>>>) -> bool {
+async fn wait_routes_change(rx: &mut Option<watch::Receiver<RoutePolicy>>) -> bool {
     match rx {
         Some(r) => {
             if r.changed().await.is_ok() {
@@ -864,8 +875,7 @@ async fn wait_routes_change(rx: &mut Option<watch::Receiver<Vec<String>>>) -> bo
     }
 }
 
-/// Shared by immediate TUN traffic and packets released after a TCP path
-/// decision. Count plaintext bytes only when WireGuard data is actually sent;
+/// Encapsulate TUN traffic. Count plaintext bytes only when WireGuard data is sent;
 /// keep lengths for packets queued behind a handshake in the existing ledger.
 async fn encapsulate_outgoing(
     tunn: &mut Tunn,
@@ -1049,6 +1059,116 @@ async fn send_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bypass_policy() -> RoutePolicy {
+        RoutePolicy {
+            allowed_routes: vec![
+                "10.8.0.0/24".into(),
+                "192.168.186.0/23".into(),
+                "192.168.188.0/24".into(),
+                "172.0.0.0/8".into(),
+            ],
+            local_route_bypass: vec![vpn_api_types::system::LocalRouteBypassRule {
+                local_subnets: vec!["192.168.187.0/24".into()],
+                excluded_routes: vec![
+                    "192.168.186.0/24".into(),
+                    "192.168.187.0/24".into(),
+                    "192.168.188.0/24".into(),
+                ],
+            }],
+        }
+    }
+
+    fn routes_cover(routes: &[Route], address: &str) -> bool {
+        let address: Ipv4Addr = address.parse().unwrap();
+        routes.iter().any(|route| {
+            let std::net::IpAddr::V4(network) = route.destination else {
+                return false;
+            };
+            ipnet::Ipv4Net::new(network, route.prefix)
+                .unwrap()
+                .contains(&address)
+        })
+    }
+
+    #[test]
+    fn local_rule_excludes_all_protocol_routes_only_on_matching_network() {
+        let policy = bypass_policy();
+        let vpn = "10.8.0.0/24".parse().unwrap();
+        let (local, exclusions) =
+            routes_for_local_addresses(&policy, vpn, 21, &["192.168.187.42".parse().unwrap()])
+                .unwrap();
+        assert_eq!(exclusions.len(), 3);
+        for target in ["192.168.186.1", "192.168.187.2", "192.168.188.1"] {
+            assert!(!routes_cover(&local, target), "{target}");
+        }
+        assert!(routes_cover(&local, "172.30.0.1"));
+        assert!(routes_cover(&local, "10.8.0.1"));
+        // Moving to another network restores the original VPN route set.
+        for addresses in [vec!["192.168.0.103".parse().unwrap()], vec![]] {
+            let (restored, exclusions) =
+                routes_for_local_addresses(&policy, vpn, 21, &addresses).unwrap();
+            assert!(exclusions.is_empty());
+            assert_eq!(restored, tunnel_routes(&policy.allowed_routes, vpn, 21));
+        }
+    }
+
+    #[test]
+    fn local_rules_union_matching_interfaces_and_keep_vpn_subnet() {
+        let mut policy = bypass_policy();
+        policy
+            .local_route_bypass
+            .push(vpn_api_types::system::LocalRouteBypassRule {
+                local_subnets: vec!["10.20.0.0/16".into()],
+                excluded_routes: vec!["172.0.0.0/8".into(), "10.0.0.0/8".into()],
+            });
+        let (routes, _) = routes_for_local_addresses(
+            &policy,
+            "10.8.0.0/24".parse().unwrap(),
+            21,
+            &[
+                "192.168.187.42".parse().unwrap(),
+                "10.20.3.4".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(!routes_cover(&routes, "172.30.0.1"));
+        assert!(!routes_cover(&routes, "192.168.188.1"));
+        assert!(routes_cover(&routes, "10.8.0.1"));
+        assert_eq!(routes.len(), 1);
+    }
+
+    #[test]
+    fn local_rule_subtracts_destination_from_broader_allowed_route() {
+        let mut policy = bypass_policy();
+        policy.allowed_routes = vec!["10.0.0.0/8".into()];
+        policy.local_route_bypass[0].excluded_routes = vec!["10.1.0.0/16".into()];
+        let (routes, _) = routes_for_local_addresses(
+            &policy,
+            "10.8.0.0/24".parse().unwrap(),
+            21,
+            &["192.168.187.42".parse().unwrap()],
+        )
+        .unwrap();
+        assert!(!routes_cover(&routes, "10.1.2.3"));
+        assert!(routes_cover(&routes, "10.2.2.3"));
+        assert!(routes_cover(&routes, "10.8.0.1"));
+    }
+
+    #[test]
+    fn invalid_local_rule_never_returns_partial_route_exclusions() {
+        let mut policy = bypass_policy();
+        policy.local_route_bypass[0]
+            .excluded_routes
+            .push("not-a-cidr".into());
+        assert!(routes_for_local_addresses(
+            &policy,
+            "10.8.0.0/24".parse().unwrap(),
+            21,
+            &["192.168.187.42".parse().unwrap(),]
+        )
+        .is_err());
+    }
 
     #[test]
     fn tunnel_routes_preserve_configured_boundaries_and_vpn_subnet() {
@@ -1280,33 +1400,38 @@ mod tests {
             .await
             .unwrap();
         let (mut client, mut server) = establish_tunn_pair();
-        let original = ipv4_packet_84_bytes();
-        let mut plaintext = [0xa5; 128];
-        plaintext[..original.len()].copy_from_slice(&original);
-        let mut encrypted = [0; 2048];
-        let mut send_state = SendState::default();
+        // TCP, UDP and ICMP all retain their original bytes through the same
+        // WireGuard path, including its padding and traffic accounting.
+        for protocol in [6, 17, 1] {
+            let mut original = ipv4_packet_84_bytes();
+            original[9] = protocol;
+            let mut plaintext = [0xa5; 128];
+            plaintext[..original.len()].copy_from_slice(&original);
+            let mut encrypted = [0; 2048];
+            let mut send_state = SendState::default();
 
-        let (bytes, failures) = encapsulate_outgoing(
-            &mut client,
-            &sender,
-            None,
-            &mut plaintext,
-            original.len(),
-            &mut encrypted,
-            &mut send_state,
-        )
-        .await
-        .unwrap();
-        assert_eq!((bytes, failures), (original.len() as u64, 0));
-        assert!(send_state.pending_tx_lengths.is_empty());
-        let mut received = [0; 2048];
-        let size = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut received))
+            let (bytes, failures) = encapsulate_outgoing(
+                &mut client,
+                &sender,
+                None,
+                &mut plaintext,
+                original.len(),
+                &mut encrypted,
+                &mut send_state,
+            )
             .await
-            .unwrap()
             .unwrap();
-        match server.decapsulate(None, &received[..size], &mut encrypted) {
-            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(&*packet, original.as_slice()),
-            result => panic!("expected original VPN packet, got {result:?}"),
+            assert_eq!((bytes, failures), (original.len() as u64, 0));
+            assert!(send_state.pending_tx_lengths.is_empty());
+            let mut received = [0; 2048];
+            let size = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            match server.decapsulate(None, &received[..size], &mut encrypted) {
+                TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(&*packet, original.as_slice()),
+                result => panic!("expected original VPN packet, got {result:?}"),
+            }
         }
     }
 

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::system::{ClientDnsMode, NetworkSettings};
+use crate::system::{ClientDnsMode, LocalRouteBypassRule, NetworkSettings};
 
 /// 服务端下发给客户端的 DNS 配置；不包含内部上游和静态记录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +87,8 @@ pub struct PeerRegisterResponse {
     /// 客户端据此实现分隧道（只把这些网段导入 VPN，普通上网走本地）。
     #[serde(default)]
     pub allowed_routes: Vec<String>,
+    #[serde(default)]
+    pub local_route_bypass: Vec<LocalRouteBypassRule>,
     /// 可选上层混淆传输；缺省时保持原生 WireGuard。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<ObfsTransport>,
@@ -124,6 +126,9 @@ pub struct PeerHeartbeatRequest {
 pub struct PeerHeartbeatResponse {
     #[serde(default)]
     pub allowed_routes: Vec<String>,
+    /// 老服务端未下发时保留当前策略；Some([]) 表示显式清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_route_bypass: Option<Vec<LocalRouteBypassRule>>,
 }
 
 /// admin 后台展示的节点视图。
@@ -227,8 +232,8 @@ pub struct AdminPeerQuery {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientDnsMode, ClientDnsSettings, ObfsMode, ObfsTransport, PeerRegisterRequest,
-        PeerRegisterResponse,
+        ClientDnsMode, ClientDnsSettings, ObfsMode, ObfsTransport, PeerHeartbeatResponse,
+        PeerRegisterRequest, PeerRegisterResponse,
     };
     use zeroize::Zeroizing;
 
@@ -302,5 +307,24 @@ mod tests {
         .unwrap();
         assert!(response.network_settings.is_none());
         assert!(response.dns.is_none());
+        assert!(response.local_route_bypass.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_distinguishes_legacy_omission_from_explicit_policy_clear() {
+        let legacy: PeerHeartbeatResponse =
+            serde_json::from_str(r#"{"allowed_routes":[]}"#).unwrap();
+        assert!(legacy.local_route_bypass.is_none());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("local_route_bypass")
+            .is_none());
+        let clear: PeerHeartbeatResponse =
+            serde_json::from_str(r#"{"allowed_routes":[],"local_route_bypass":[]}"#).unwrap();
+        assert_eq!(clear.local_route_bypass, Some(vec![]));
+        assert_eq!(
+            serde_json::to_value(clear).unwrap()["local_route_bypass"],
+            serde_json::json!([])
+        );
     }
 }

@@ -121,6 +121,7 @@ async fn register_peer_succeeds_with_bearer() {
                 server_endpoint: "vpn.example.com:51820".into(),
                 vpn_subnet: "10.8.0.0/24".into(),
                 allowed_routes: vec!["10.8.0.0/24".into()],
+                local_route_bypass: vec![],
                 transport: None,
                 network_settings: None,
                 dns: None,
@@ -192,6 +193,7 @@ async fn expired_access_token_triggers_refresh_and_retry() {
                 server_endpoint: "ep:51820".into(),
                 vpn_subnet: "10.8.0.0/24".into(),
                 allowed_routes: vec!["10.8.0.0/24".into()],
+                local_route_bypass: vec![],
                 transport: None,
                 network_settings: None,
                 dns: None,
@@ -240,6 +242,7 @@ async fn heartbeat_posts_endpoint() {
         .and(path("/api/v1/peers/heartbeat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(
             vpn_api_types::peer::PeerHeartbeatResponse {
+                local_route_bypass: None,
                 allowed_routes: vec!["10.8.0.0/24".into(), "172.31.100.0/24".into()],
             },
         )))
@@ -311,6 +314,7 @@ async fn heartbeat_unauthorized_refreshes_and_retries() {
         .and(body_json(serde_json::json!({})))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(
             vpn_api_types::peer::PeerHeartbeatResponse {
+                local_route_bypass: None,
                 allowed_routes: vec!["10.8.0.0/24".into()],
             },
         )))

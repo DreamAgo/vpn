@@ -148,7 +148,11 @@ pub async fn update_network_settings(
     let lock = route_policy_lock();
     let _guard = lock.lock().await;
     let routes = service
-        .update_locked(body.desired, &body.server_routes)
+        .update_locked(
+            body.desired,
+            &body.server_routes,
+            body.local_route_bypass.as_deref(),
+        )
         .await?;
     if let Some(peer_service) = &state.peer_service {
         peer_service.apply_server_routes(routes.clone()).await;

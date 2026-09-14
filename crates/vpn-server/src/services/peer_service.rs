@@ -19,7 +19,9 @@ use vpn_api_types::peer::{
     ClientDnsSettings, ObfsMode, ObfsTransport, PeerHeartbeatRequest, PeerRegisterRequest,
     PeerRegisterResponse,
 };
-use vpn_api_types::system::{ClientDnsMode, DnsNetworkSettings, NetworkSettings};
+use vpn_api_types::system::{
+    ClientDnsMode, DnsNetworkSettings, LocalRouteBypassRule, NetworkSettings,
+};
 use vpn_core::{AppError, Result};
 use vpn_wireguard::{
     generate_keypair, public_key_from_private, render_client_config, IpPool,
@@ -70,6 +72,7 @@ pub struct GatewayOfflineNotice {
 #[derive(Debug, Clone)]
 pub struct HeartbeatResult {
     pub allowed_routes: Vec<String>,
+    pub local_route_bypass: Vec<LocalRouteBypassRule>,
     pub recovered_gateway: Option<GatewayOfflineNotice>,
 }
 
@@ -188,6 +191,7 @@ pub struct PeerService {
     obfs_transport: Option<ObfsTransportSecret>,
     network_settings: Arc<RwLock<NetworkSettings>>,
     dns_settings: Arc<RwLock<DnsNetworkSettings>>,
+    local_route_bypass: Arc<RwLock<Vec<LocalRouteBypassRule>>>,
     registration_blocked: Arc<AtomicBool>,
 }
 
@@ -241,6 +245,7 @@ impl PeerService {
             obfs_transport: None,
             network_settings: Arc::new(RwLock::new(NetworkSettings::default())),
             dns_settings: Arc::new(RwLock::new(DnsNetworkSettings::default())),
+            local_route_bypass: Arc::new(RwLock::new(Vec::new())),
             registration_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -253,6 +258,14 @@ impl PeerService {
 
     pub fn with_dns_settings(mut self, settings: Arc<RwLock<DnsNetworkSettings>>) -> Self {
         self.dns_settings = settings;
+        self
+    }
+
+    pub fn with_local_route_bypass(
+        mut self,
+        rules: Arc<RwLock<Vec<LocalRouteBypassRule>>>,
+    ) -> Self {
+        self.local_route_bypass = rules;
         self
     }
 
@@ -552,6 +565,7 @@ impl PeerService {
                 .await?,
             transport: self.obfs_transport.as_ref().map(ObfsTransportSecret::dto),
             network_settings: Some(self.network_settings.read().await.clone()),
+            local_route_bypass: self.local_route_bypass.read().await.clone(),
             dns,
         })
     }
@@ -911,6 +925,8 @@ impl PeerService {
         req: &PeerHeartbeatRequest,
         now_ms: i64,
     ) -> Result<HeartbeatResult> {
+        // 与管理员热更新共用锁，避免一条响应混用保存前后的路由和排除规则。
+        let _guard = self.peer_route_lock.lock().await;
         let endpoint = req.endpoint.as_deref();
         if let Some(pk) = req.wg_public_key.as_deref() {
             let peer = self
@@ -945,6 +961,7 @@ impl PeerService {
             let recovered_gateway = gateway_recovered_notice(&peer);
             return Ok(HeartbeatResult {
                 allowed_routes,
+                local_route_bypass: self.local_route_bypass.read().await.clone(),
                 recovered_gateway,
             });
         }
@@ -971,6 +988,7 @@ impl PeerService {
             .await?;
         Ok(HeartbeatResult {
             allowed_routes,
+            local_route_bypass: self.local_route_bypass.read().await.clone(),
             recovered_gateway,
         })
     }
@@ -1430,6 +1448,33 @@ mod tests {
             reconnected.network_settings.as_ref().unwrap().default_mtu,
             1360
         );
+    }
+
+    #[tokio::test]
+    async fn bypass_rules_reach_registration_and_both_heartbeat_variants_with_hot_clear() {
+        let rules = vec![LocalRouteBypassRule {
+            local_subnets: vec!["192.168.187.0/24".into()],
+            excluded_routes: vec!["192.168.188.0/24".into()],
+        }];
+        let shared = Arc::new(RwLock::new(rules.clone()));
+        let svc = service(setup_pool().await).with_local_route_bypass(shared.clone());
+        let registered = svc.register("user-1", &reg("PK-LAN-1")).await.unwrap();
+        assert_eq!(registered.local_route_bypass, rules);
+        for public_key in [Some("PK-LAN-1"), None] {
+            let heartbeat = svc
+                .heartbeat_checked_with_notice("user-1", &hb(public_key, None), 100)
+                .await
+                .unwrap();
+            assert_eq!(heartbeat.local_route_bypass, rules);
+        }
+        shared.write().await.clear();
+        let heartbeat = svc
+            .heartbeat_checked_with_notice("user-1", &hb(Some("PK-LAN-1"), None), 200)
+            .await
+            .unwrap();
+        assert!(heartbeat.local_route_bypass.is_empty());
+        let reconnected = svc.register("user-1", &reg("PK-LAN-1")).await.unwrap();
+        assert!(reconnected.local_route_bypass.is_empty());
     }
 
     #[tokio::test]

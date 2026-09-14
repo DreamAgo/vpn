@@ -228,13 +228,13 @@ impl VpnManager {
         // 2) 数据面:用户态 boringtun 隧道(本进程内开 TUN + 加路由 + 转发循环)。
         let (tx, rx) = watch::channel(false);
         // 实时路由通道(P1.4):心跳检测到 allowed_routes 变化 → 转发循环增量更新路由。
-        let init_routes = daemon::effective_allowed_ips(&params);
+        let init_routes = daemon::RoutePolicy::from_params(&params);
         let (routes_tx, routes_rx) = watch::channel(init_routes.clone());
         let data_plane_started = Instant::now();
         tracing::info!(
             stage = "data_plane",
             result = "started",
-            routes = init_routes.len(),
+            routes = init_routes.allowed_routes.len(),
             "开始准备 VPN 数据面"
         );
         let forward = match daemon::bring_up_tunnel(
@@ -297,7 +297,7 @@ impl VpnManager {
         self.shared
             .set_state(ConnState::Connected, now_unix())
             .await;
-        tracing::info!(stage = "data_plane", result = "ready", elapsed_ms = data_plane_started.elapsed().as_millis(), vpn_ip = %params.vpn_ip, iface = %self.iface, routes = init_routes.len(), "VPN 数据面任务已启动（尚未确认 WireGuard 握手）");
+        tracing::info!(stage = "data_plane", result = "ready", elapsed_ms = data_plane_started.elapsed().as_millis(), vpn_ip = %params.vpn_ip, iface = %self.iface, routes = init_routes.allowed_routes.len(), "VPN 数据面任务已启动（尚未确认 WireGuard 握手）");
 
         // 3) 心跳:每 30s 上报,**韧性重连**。网络抖动不拆隧道——run_heartbeat 内部标记
         //    Reconnecting 并重试,boringtun 自动重握手,恢复后回 Connected。只有被管理员

@@ -96,6 +96,64 @@ pub struct DnsNetworkSettings {
     pub static_records: Vec<DnsStaticRecord>,
 }
 
+/// 本机物理 IPv4 地址命中 local_subnets 时，从 VPN 路由中排除 excluded_routes。
+/// 这是一条管理员声明的路由策略，不代表客户端已经探测到目标可达。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalRouteBypassRule {
+    pub local_subnets: Vec<String>,
+    pub excluded_routes: Vec<String>,
+}
+
+/// 校验并规整热更新的局域网路由排除规则。VPN 自身地址段由客户端始终保留。
+pub fn normalize_local_route_bypass(
+    rules: &[LocalRouteBypassRule],
+) -> Result<Vec<LocalRouteBypassRule>, String> {
+    if rules.len() > 32 {
+        return Err("内网直连规则最多 32 条".into());
+    }
+    fn normalize_list(values: &[String], field: &str) -> Result<Vec<String>, String> {
+        if values.is_empty() || values.len() > 32 {
+            return Err(format!("{field} 必须包含 1..=32 个 IPv4 CIDR"));
+        }
+        let blocked = [
+            ipnet::Ipv4Net::new(Ipv4Addr::new(0, 0, 0, 0), 8).unwrap(),
+            ipnet::Ipv4Net::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            ipnet::Ipv4Net::new(Ipv4Addr::new(169, 254, 0, 0), 16).unwrap(),
+            ipnet::Ipv4Net::new(Ipv4Addr::new(224, 0, 0, 0), 3).unwrap(),
+        ];
+        let mut normalized = std::collections::BTreeSet::new();
+        for value in values {
+            let net = value
+                .trim()
+                .parse::<ipnet::Ipv4Net>()
+                .map_err(|_| format!("{field} 必须是合法 IPv4 CIDR：{value}"))?
+                .trunc();
+            if net.prefix_len() == 0
+                || blocked.iter().any(|reserved| {
+                    reserved.contains(&net.network()) || net.contains(&reserved.network())
+                })
+            {
+                return Err(format!(
+                    "{field} 不允许默认路由、未指定、回环、链路本地、组播或保留地址：{value}"
+                ));
+            }
+            normalized.insert(net.to_string());
+        }
+        Ok(normalized.into_iter().collect())
+    }
+    let mut normalized = Vec::new();
+    for rule in rules {
+        let rule = LocalRouteBypassRule {
+            local_subnets: normalize_list(&rule.local_subnets, "local_subnets")?,
+            excluded_routes: normalize_list(&rule.excluded_routes, "excluded_routes")?,
+        };
+        if !normalized.contains(&rule) {
+            normalized.push(rule);
+        }
+    }
+    Ok(normalized)
+}
+
 /// 数据库持久化的数据面配置；秘密始终不进入此结构。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPlaneSettings {
@@ -112,6 +170,8 @@ pub struct NetworkSettingsView {
     pub applied: DataPlaneSettings,
     pub desired: DataPlaneSettings,
     pub server_routes: Vec<String>,
+    #[serde(default)]
+    pub local_route_bypass: Vec<LocalRouteBypassRule>,
     pub restart_required: bool,
     pub psk_configured: bool,
 }
@@ -148,6 +208,9 @@ impl NetworkSettings {
 pub struct UpdateNetworkSettingsRequest {
     pub desired: DataPlaneSettings,
     pub server_routes: Vec<String>,
+    /// 缺省保留旧策略；空列表明确清空，兼容尚未认识此字段的管理端。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_route_bypass: Option<Vec<LocalRouteBypassRule>>,
 }
 
 impl VpnBaseSettings {
@@ -550,6 +613,53 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_route_bypass_normalizes_configured_cidrs_without_private_only_restriction() {
+        let rule = LocalRouteBypassRule {
+            local_subnets: vec![" 192.168.187.4/24 ".into(), "192.168.187.0/24".into()],
+            excluded_routes: vec!["172.1.2.3/8".into(), "192.168.188.111/24".into()],
+        };
+        let normalized = normalize_local_route_bypass(&[rule.clone(), rule]).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].local_subnets, ["192.168.187.0/24"]);
+        assert_eq!(
+            normalized[0].excluded_routes,
+            ["172.0.0.0/8", "192.168.188.0/24"]
+        );
+        assert!(normalize_local_route_bypass(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_route_bypass_rejects_invalid_or_unbounded_rules() {
+        let valid = LocalRouteBypassRule {
+            local_subnets: vec!["192.168.187.0/24".into()],
+            excluded_routes: vec!["192.168.188.0/24".into()],
+        };
+        for value in [
+            "0.0.0.0/0",
+            "::/0",
+            "192.168.1.1",
+            "invalid",
+            "0.0.0.1/32",
+            "127.0.0.1/32",
+            "169.254.0.0/16",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+            "128.0.0.0/1",
+        ] {
+            let mut invalid = valid.clone();
+            invalid.excluded_routes = vec![value.into()];
+            assert!(normalize_local_route_bypass(&[invalid]).is_err(), "{value}");
+        }
+        assert!(normalize_local_route_bypass(&vec![valid.clone(); 33]).is_err());
+        let mut invalid = valid.clone();
+        invalid.local_subnets.clear();
+        assert!(normalize_local_route_bypass(&[invalid]).is_err());
+        let mut invalid = valid;
+        invalid.excluded_routes = vec!["10.0.0.0/8".into(); 33];
+        assert!(normalize_local_route_bypass(&[invalid]).is_err());
+    }
 
     #[test]
     fn legacy_split_dns_is_global_and_removed_fields_are_ignored() {

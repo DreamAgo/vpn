@@ -172,6 +172,8 @@ pub struct TunnelParams {
     pub client_private_key: String,
     /// 应导入隧道的网段（AllowedIPs）：VPN 子网 + 各站点 LAN。
     pub allowed_routes: Vec<String>,
+    /// 根据客户端物理网络决定哪些目标不由 VPN 接管。
+    pub local_route_bypass: Vec<vpn_api_types::system::LocalRouteBypassRule>,
     /// 可选 Rust 原生 UDP 混淆配置。
     pub transport: Option<TunnelTransport>,
     /// 服务端下发的隧道 MTU 策略；旧服务端缺省时使用兼容默认值。
@@ -210,6 +212,40 @@ pub fn effective_allowed_ips(params: &TunnelParams) -> Vec<String> {
         vec![params.vpn_subnet.clone()]
     } else {
         params.allowed_routes.clone()
+    }
+}
+
+/// 路由与本地排除规则使用同一快照，避免心跳更新时短暂混用两版策略。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutePolicy {
+    pub allowed_routes: Vec<String>,
+    pub local_route_bypass: Vec<vpn_api_types::system::LocalRouteBypassRule>,
+}
+
+impl RoutePolicy {
+    pub fn from_params(params: &TunnelParams) -> Self {
+        Self {
+            allowed_routes: effective_allowed_ips(params),
+            local_route_bypass: params.local_route_bypass.clone(),
+        }
+    }
+
+    fn with_heartbeat(
+        &self,
+        response: vpn_api_types::peer::PeerHeartbeatResponse,
+    ) -> Result<Self, String> {
+        let mut next = self.clone();
+        // 旧服务端可能没有回带 allowed_routes；空值不撤销当前路由。
+        if !response.allowed_routes.is_empty() {
+            next.allowed_routes = response.allowed_routes;
+        }
+        // 缺省与显式 [] 不同：缺省兼容旧服务端，[] 撤销全部排除规则。
+        if let Some(rules) = response.local_route_bypass {
+            next.local_route_bypass = vpn_api_types::system::normalize_local_route_bypass(&rules)?;
+        }
+        next.allowed_routes.sort();
+        next.allowed_routes.dedup();
+        Ok(next)
     }
 }
 
@@ -364,6 +400,10 @@ pub async fn connect_once(
         server_endpoint,
         client_private_key: keypair.private_key.clone(),
         allowed_routes: resp.allowed_routes.clone(),
+        local_route_bypass: vpn_api_types::system::normalize_local_route_bypass(
+            &resp.local_route_bypass,
+        )
+        .map_err(|error| CliError::Invalid(format!("服务端下发的路由排除规则非法：{error}")))?,
         transport,
         network_settings,
         dns: resp.dns,
@@ -385,7 +425,7 @@ pub async fn bring_up_tunnel(
     // 流量计数回写目标（前端读 bytes_rx/bytes_tx）；None 时不统计。
     traffic: Option<SharedState>,
     // 实时路由更新接收端(P1.4);None 时不支持热更新。
-    routes_rx: Option<tokio::sync::watch::Receiver<Vec<String>>>,
+    routes_rx: Option<tokio::sync::watch::Receiver<RoutePolicy>>,
 ) -> CliResult<tokio::task::JoinHandle<CliResult<()>>> {
     let vpn_ip: std::net::Ipv4Addr = params
         .vpn_ip
@@ -409,6 +449,7 @@ pub async fn bring_up_tunnel(
         vpn_ip,
         prefix,
         &allowed,
+        &params.local_route_bypass,
         PERSISTENT_KEEPALIVE_SECS,
         shutdown,
         shutdown_tx,
@@ -444,8 +485,8 @@ pub async fn run_heartbeat(
     wg_public_key: Option<String>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     state: Option<SharedState>,
-    initial_routes: Vec<String>,
-    routes_tx: Option<tokio::sync::watch::Sender<Vec<String>>>,
+    initial_routes: RoutePolicy,
+    routes_tx: Option<tokio::sync::watch::Sender<RoutePolicy>>,
 ) -> CliResult<()> {
     let loop_started = Instant::now();
     tracing::info!(
@@ -461,11 +502,9 @@ pub async fn run_heartbeat(
     let mut samples: std::collections::VecDeque<bool> =
         std::collections::VecDeque::with_capacity(HEARTBEAT_LOSS_WINDOW);
     // 当前已应用的 allowed_routes(排序后,用于顺序无关比对)。
-    let mut current_sorted = {
-        let mut v = initial_routes;
-        v.sort();
-        v
-    };
+    let mut current_policy = initial_routes;
+    current_policy.allowed_routes.sort();
+    current_policy.allowed_routes.dedup();
     loop {
         tokio::select! {
             res = shutdown.changed() => {
@@ -505,20 +544,23 @@ pub async fn run_heartbeat(
                             "VPN 心跳成功"
                         );
                         // P1.4:检测 allowed_routes 变化 → 下发实时路由更新。
-                        let mut next_sorted = resp.allowed_routes.clone();
-                        next_sorted.sort();
-                        // 空集视为“服务端未回带路由信息”（旧服务端 data:null → 解析为默认空）：
-                        // 跳过下发，避免把本地路由全删成黑洞。新服务端的 allowed_routes 恒含
-                        // VPN 子网，不会为空。
-                        if !resp.allowed_routes.is_empty() && next_sorted != current_sorted {
-                            tracing::info!(
-                                routes = ?resp.allowed_routes,
-                                "检测到 allowed_routes 变更,下发实时路由更新"
-                            );
-                            current_sorted = next_sorted;
-                            if let Some(tx) = &routes_tx {
-                                let _ = tx.send(resp.allowed_routes);
+                        match current_policy.with_heartbeat(resp) {
+                            Ok(next) if next != current_policy => {
+                                tracing::info!(
+                                    routes = ?next.allowed_routes,
+                                    bypass_rules = next.local_route_bypass.len(),
+                                    "检测到路由策略变更，下发实时更新"
+                                );
+                                current_policy = next;
+                                if let Some(tx) = &routes_tx {
+                                    let _ = tx.send(current_policy.clone());
+                                }
                             }
+                            Err(error) => tracing::warn!(
+                                error = %error,
+                                "心跳路由排除规则非法，保留上一份完整策略"
+                            ),
+                            _ => {}
                         }
                         // 抖动后恢复:从 Reconnecting 标回 Connected。
                         if failures > 0 {
@@ -787,7 +829,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         // 关停信号：隧道转发任务与心跳任务共用，Disconnect 一并停止。
                         let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
                         // 实时路由通道(P1.4):心跳→转发循环下发新 allowed_routes。
-                        let init_routes = effective_allowed_ips(&params);
+                        let init_routes = RoutePolicy::from_params(&params);
                         let (routes_tx, routes_rx) =
                             tokio::sync::watch::channel(init_routes.clone());
                         match bring_up_tunnel(
@@ -970,10 +1012,66 @@ mod tests {
             server_endpoint: "1.2.3.4:51820".into(),
             client_private_key: "priv".into(),
             allowed_routes: allowed,
+            local_route_bypass: vec![],
             transport: None,
             network_settings: NetworkSettings::default(),
             dns: None,
         }
+    }
+
+    #[test]
+    fn heartbeat_updates_bypass_without_changing_routes_and_can_clear_it() {
+        use vpn_api_types::peer::PeerHeartbeatResponse;
+        use vpn_api_types::system::LocalRouteBypassRule;
+        let initial = RoutePolicy::from_params(&sample_params(vec!["10.8.0.0/24".into()]));
+        let rule = LocalRouteBypassRule {
+            local_subnets: vec!["192.168.187.12/24".into()],
+            excluded_routes: vec!["192.168.188.111/24".into()],
+        };
+        let active = initial
+            .with_heartbeat(PeerHeartbeatResponse {
+                allowed_routes: initial.allowed_routes.clone(),
+                local_route_bypass: Some(vec![rule]),
+            })
+            .unwrap();
+        assert_eq!(active.allowed_routes, initial.allowed_routes);
+        assert_eq!(
+            active.local_route_bypass[0].local_subnets,
+            ["192.168.187.0/24"]
+        );
+        assert_eq!(
+            active.local_route_bypass[0].excluded_routes,
+            ["192.168.188.0/24"]
+        );
+        // A legacy heartbeat carries neither field and must keep the policy.
+        assert_eq!(
+            active
+                .with_heartbeat(PeerHeartbeatResponse::default())
+                .unwrap(),
+            active
+        );
+        let cleared = active
+            .with_heartbeat(PeerHeartbeatResponse {
+                allowed_routes: vec![],
+                local_route_bypass: Some(vec![]),
+            })
+            .unwrap();
+        assert_eq!(cleared, initial);
+    }
+
+    #[test]
+    fn heartbeat_rejects_invalid_bypass_as_one_complete_policy() {
+        let initial = RoutePolicy::from_params(&sample_params(vec!["10.8.0.0/24".into()]));
+        let result = initial.with_heartbeat(vpn_api_types::peer::PeerHeartbeatResponse {
+            allowed_routes: vec!["172.0.0.0/8".into()],
+            local_route_bypass: Some(vec![vpn_api_types::system::LocalRouteBypassRule {
+                local_subnets: vec!["0.0.0.0/0".into()],
+                excluded_routes: vec!["10.0.0.0/8".into()],
+            }]),
+        });
+        assert!(result.is_err());
+        assert_eq!(initial.allowed_routes, ["10.8.0.0/24"]);
+        assert!(initial.local_route_bypass.is_empty());
     }
 
     #[test]

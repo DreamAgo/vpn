@@ -733,6 +733,23 @@ pub async fn disconnect() -> Result<(), String> {
     response_result(request(&HelperRequest::Disconnect).await?)
 }
 
+/// 退出只断开隧道，保留登录凭证；未运行 helper 时无需安装或提权。
+pub async fn disconnect_before_exit() -> Result<(), String> {
+    match request(&HelperRequest::Disconnect).await {
+        Ok(response) => response_result(response),
+        Err(error) => {
+            let running = tokio::task::spawn_blocking(helper_job_is_running)
+                .await
+                .map_err(|join_error| format!("检查 helper 状态失败: {join_error}"))?;
+            if running {
+                Err(format!("无法确认 VPN 已断开: {error}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 pub async fn disconnect_before_logout() -> Result<(), String> {
     if !Path::new(HELPER_PATH).exists() && !Path::new(SOCKET_PATH).exists() {
         return Ok(());

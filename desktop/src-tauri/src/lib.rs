@@ -11,7 +11,10 @@ mod macos_helper;
 mod manager;
 mod observability;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use manager::VpnManager;
 #[cfg(target_os = "macos")]
@@ -26,6 +29,68 @@ struct TrayUi {
     tray: TrayIcon<tauri::Wry>,
     connect: MenuItem<tauri::Wry>,
     disconnect: MenuItem<tauri::Wry>,
+}
+
+#[derive(Default)]
+struct ExitState {
+    pending: AtomicBool,
+    ready: AtomicBool,
+    connect: tokio::sync::Mutex<()>,
+}
+
+pub(crate) async fn connect_vpn(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<ExitState>();
+    let _guard = state.connect.lock().await;
+    if state.pending.load(Ordering::Acquire) {
+        return Err("正在退出易链，请稍后再连接".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_helper::connect().await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app.state::<Arc<VpnManager>>().connect().await
+    }
+}
+
+fn disconnect_and_exit(app: &tauri::AppHandle, code: i32) {
+    if app
+        .state::<ExitState>()
+        .pending
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<ExitState>();
+        // 等待包含 helper 安装在内的建连请求结束，防止断开后迟到建连。
+        let _guard = state.connect.lock().await;
+        #[cfg(target_os = "macos")]
+        let result = macos_helper::disconnect_before_exit().await;
+        #[cfg(not(target_os = "macos"))]
+        let result = app.state::<Arc<VpnManager>>().disconnect().await;
+        match result {
+            Ok(()) => {
+                state.ready.store(true, Ordering::Release);
+                app.exit(code);
+            }
+            Err(error) => {
+                use tauri_plugin_notification::NotificationExt;
+                let error = vpn_cli::error::redact_sensitive(&error);
+                tracing::error!(%error, "退出前断开 VPN 失败，保留客户端以便重试");
+                state.pending.store(false, Ordering::Release);
+                show_window(&app);
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("退出失败")
+                    .body(format!("无法确认 VPN 已断开，请重试：{error}"))
+                    .show();
+            }
+        }
+    });
 }
 
 /// Show + focus the main popover window(健壮版:取消最小化 + 置顶一次 + 聚焦)。
@@ -43,7 +108,7 @@ fn hide_window(window: tauri::Window) {
     let _ = window.hide();
 }
 
-/// 退出整个 App(窗口内"退出"按钮调用)。菜单栏 App 无程序坞图标,这是保底退出入口。
+/// 请求退出整个 App；ExitRequested 统一负责先断开 VPN。
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
@@ -75,25 +140,12 @@ fn sync_tray_state(app: tauri::AppHandle, state: String) {
 
 /// 从托盘菜单触发连接(进程内库调用,fire-and-forget;结果反映在状态轮询里)。
 fn spawn_connect(app: &tauri::AppHandle) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app;
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = macos_helper::connect().await {
-                tracing::warn!(error = %vpn_cli::error::redact_sensitive(&error), "托盘连接操作失败");
-            }
-        });
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mgr = app.state::<Arc<VpnManager>>().inner().clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = mgr.connect().await {
-                let error = vpn_cli::error::redact_sensitive(&error);
-                tracing::warn!(%error, "托盘连接操作失败");
-            }
-        });
-    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = connect_vpn(&app).await {
+            tracing::warn!(error = %vpn_cli::error::redact_sensitive(&error), "托盘连接操作失败");
+        }
+    });
 }
 
 /// 从托盘菜单触发断开。
@@ -170,6 +222,7 @@ pub fn run() {
             Some(vec![]),
         ))
         .manage(Arc::new(VpnManager::new()))
+        .manage(ExitState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::connect,
@@ -313,6 +366,18 @@ pub fn run() {
     };
 
     app.run(|_app_handle, _event| {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = &_event {
+            // Tauri 的更新重启不能被 prevent_exit 拦截，保持其原有行为。
+            if *code != Some(tauri::RESTART_EXIT_CODE)
+                && !_app_handle
+                    .state::<ExitState>()
+                    .ready
+                    .load(Ordering::Acquire)
+            {
+                api.prevent_exit();
+                disconnect_and_exit(_app_handle, code.unwrap_or(0));
+            }
+        }
         // 点击程序坞图标时（窗口可能已隐藏）重新唤出窗口。
         // RunEvent::Reopen 仅 macOS 存在（dock 点击），其它平台无此变体，需 cfg 隔离。
         #[cfg(target_os = "macos")]

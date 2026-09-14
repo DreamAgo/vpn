@@ -12,6 +12,16 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  updater-manifest:
+    name: Updater manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s desktop/scripts -p 'test_*.py'
+
   # ============================================================
   # Rust: 格式 + Clippy + 测试（三平台矩阵）
   # ============================================================
