@@ -38,7 +38,7 @@
 ## Feishu approval network access — later phases
 
 - 审批表单单次选择多个用户组：首版每个审批只接受一个 `user_group.id`，需要多组时分别提交审批；后续扩展多选解析与逐组到期展示。
-- 自动调用飞书 `approval/v4/approvals/{approval_code}/subscribe` 并监控订阅状态：首版由部署人员按文档执行一次订阅，避免把订阅生命周期并入事件处理事务。
+- 自动调用飞书 `approval/v4/approvals/{approval_code}/subscribe` 并监控订阅状态：现已提供管理员手动订阅按钮与本地成功记录；自动订阅和远端状态监控仍未实现，避免把订阅生命周期并入事件处理事务。
 - 管理后台展示审批授权明细、按组到期时间及操作历史：首版已在 SQLite 逐组记录 `expires_at` 和审计数据，但不新增管理 UI。
 - ACL 跨后端/跨发行版支持：首版只交付当前生产的 Linux kernel WireGuard + Docker + `CAP_NET_ADMIN`；后续补 userspace/auto、systemd 裸机、iptables-nft/legacy 组合与完整真机矩阵。
 - 多服务副本 worker fencing：首版是单 Docker 服务、单 worker；横向扩容前应为 inbox claim 增加 claim token/版本及条件完成写，避免超时旧 worker 覆盖新 worker 状态。

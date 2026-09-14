@@ -77,6 +77,39 @@ impl ReqwestFeishuApprovalApi {
         })
     }
 
+    pub async fn subscribe(&self, approval_code: &str) -> Result<()> {
+        let token = self
+            .tenant_token()
+            .await
+            .map_err(|_| AppError::Config("飞书应用鉴权失败，请检查配置和网络".into()))?;
+        let mut url =
+            reqwest::Url::parse("https://open.feishu.cn/open-apis/approval/v4/approvals/")
+                .map_err(|_| AppError::Config("飞书订阅地址配置错误".into()))?;
+        url.path_segments_mut()
+            .map_err(|_| AppError::Config("飞书订阅地址配置错误".into()))?
+            .pop_if_empty()
+            .push(approval_code)
+            .push("subscribe");
+        #[derive(Deserialize)]
+        struct Response {
+            code: i64,
+        }
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|_| AppError::Config("飞书订阅请求失败，请检查网络后重试".into()))?;
+        let status = response.status();
+        let response = response
+            .json::<Response>()
+            .await
+            .map_err(|_| AppError::Config("飞书订阅响应格式异常".into()))?;
+        ensure_subscription_success(status, response.code)
+    }
+
     async fn tenant_token(&self) -> Result<String> {
         #[derive(Serialize)]
         struct Request<'a> {
@@ -712,6 +745,16 @@ fn error_class(error: &AppError) -> &'static str {
     }
 }
 
+fn ensure_subscription_success(status: reqwest::StatusCode, code: i64) -> Result<()> {
+    if code != 0 {
+        return Err(AppError::Config(format!("飞书订阅失败（错误码 {code}）")));
+    }
+    if !status.is_success() {
+        return Err(AppError::Config("飞书订阅请求返回异常状态".into()));
+    }
+    Ok(())
+}
+
 fn internal(error: reqwest::Error) -> AppError {
     AppError::Internal(Box::new(error))
 }
@@ -746,6 +789,16 @@ fn parse_event_meta(value: &Value) -> Result<EventMeta> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscription_only_accepts_confirmed_success() {
+        use reqwest::StatusCode;
+        assert!(super::ensure_subscription_success(StatusCode::OK, 0).is_ok());
+        assert!(super::ensure_subscription_success(StatusCode::BAD_REQUEST, 0).is_err());
+        for status in [StatusCode::OK, StatusCode::BAD_REQUEST] {
+            let error = super::ensure_subscription_success(status, 1390007).unwrap_err();
+            assert!(error.to_string().contains("1390007"));
+        }
+    }
     use super::*;
     use cbc::cipher::{BlockEncryptMut, KeyIvInit};
     use serde_json::json;

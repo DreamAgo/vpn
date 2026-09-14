@@ -6,7 +6,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use uuid::Uuid;
 use vpn_api_types::{
-    user::{CreateUserResponse, ListUsersQuery, UserDto},
+    user::{CreateUserResponse, ListUsersQuery, UserApprovalGrantDto, UserDto},
     Page,
 };
 use vpn_core::{service::PasswordHasher, AppError, Result};
@@ -58,6 +58,28 @@ impl UserService {
         }
     }
 
+    async fn populate_approval_grants(&self, users: &mut [UserDto]) -> Result<()> {
+        let ids: Vec<&str> = users.iter().map(|user| user.id.as_str()).collect();
+        let grants = self.user_repo.approval_expiries(&ids).await?;
+        for (user_id, group_id, group_name, expires_at) in grants {
+            if let Some(user) = users.iter_mut().find(|user| user.id == user_id) {
+                user.approval_grants.push(UserApprovalGrantDto {
+                    group_id,
+                    group_name,
+                    expires_at,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn user_dto(&self, row: UserRow) -> Result<UserDto> {
+        let mut dto = user_row_to_dto(row);
+        self.populate_approval_grants(std::slice::from_mut(&mut dto))
+            .await?;
+        Ok(dto)
+    }
+
     /// Story 3.1：创建普通用户。
     ///
     /// password 为 None 时生成 12 位强密码；明文一次性返回。
@@ -86,7 +108,7 @@ impl UserService {
             .insert(&user_id, username, email, &hash, "user", true, max_devices)
             .await?;
         Ok(CreateUserResponse {
-            user: user_row_to_dto(row),
+            user: self.user_dto(row).await?,
             initial_password: plaintext,
         })
     }
@@ -107,13 +129,14 @@ impl UserService {
         };
 
         let total = self.user_repo.count(&filter).await? as u64;
-        let items = self
+        let mut items: Vec<UserDto> = self
             .user_repo
             .list(&filter)
             .await?
             .into_iter()
             .map(user_row_to_dto)
             .collect();
+        self.populate_approval_grants(&mut items).await?;
         Ok(Page::new(items, total, page, page_size))
     }
 
@@ -134,7 +157,7 @@ impl UserService {
             .find_by_id(user_id)
             .await?
             .ok_or(AppError::UserNotFound)?;
-        Ok(user_row_to_dto(row))
+        self.user_dto(row).await
     }
 
     /// 多终端模式：更新用户的终端数量上限。
@@ -154,7 +177,7 @@ impl UserService {
             .find_by_id(user_id)
             .await?
             .ok_or(AppError::UserNotFound)?;
-        Ok(user_row_to_dto(row))
+        self.user_dto(row).await
     }
 
     /// Story 3.4：重置用户密码。生成新强密码 + must_change_password + 撤销所有 session。
@@ -208,6 +231,8 @@ fn user_row_to_dto(row: UserRow) -> UserDto {
         last_login_at: row.last_login_at,
         group_ids: row.group_ids,
         max_devices: row.max_devices,
+        access_mode: row.access_mode,
+        approval_grants: Vec::new(),
         created_at: row.created_at,
     }
 }
@@ -268,6 +293,73 @@ mod tests {
             SqliteSessionRepository::new(pool),
             Arc::new(Argon2Hasher::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn user_list_exposes_group_expiries_without_changing_manual_membership() {
+        let pool = setup_pool().await;
+        let svc = service(pool.clone());
+        let user = svc
+            .create_user("approval-user", "approval@example.com", None, None)
+            .await
+            .unwrap()
+            .user;
+        let legacy = svc
+            .create_user("legacy-user", "legacy@example.com", None, None)
+            .await
+            .unwrap()
+            .user;
+        assert_eq!(legacy.access_mode, "legacy");
+        assert!(legacy.approval_grants.is_empty());
+        sqlx::query("UPDATE users SET access_mode='approval_required' WHERE id=?1")
+            .bind(&user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in ["manual", "approved", "expired"] {
+            sqlx::query("INSERT INTO user_groups(id,name,routes,created_at,updated_at) VALUES(?1,?1,'',0,0)")
+                .bind(id).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO user_group_members(user_id,group_id) VALUES(?1,'manual')")
+            .bind(&user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        for (id, group, expiry) in [
+            ("old", "approved", 1),
+            ("renewal", "approved", future),
+            ("past", "expired", 2),
+        ] {
+            sqlx::query("INSERT INTO access_grants(id,approval_instance_code,user_id,group_id,expires_at,created_at,updated_at) VALUES(?1,?1,?2,?3,?4,0,0)")
+                .bind(id).bind(&user.id).bind(group).bind(expiry).execute(&pool).await.unwrap();
+        }
+        let query: ListUsersQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        let page = svc.list_users(&query).await.unwrap();
+        let json = serde_json::to_value(&page).unwrap();
+        // Verify the actual list response, including users without grants.
+        let dto = page.items.iter().find(|u| u.id == user.id).unwrap();
+        assert_eq!(dto.access_mode, "approval_required");
+        assert_eq!(dto.group_ids, vec!["manual"]);
+        assert_eq!(dto.approval_grants.len(), 2);
+        assert_eq!(dto.approval_grants[0].group_name, "approved");
+        assert_eq!(dto.approval_grants[0].expires_at, future);
+        assert_eq!(dto.approval_grants[1].expires_at, 2);
+        assert!(page
+            .items
+            .iter()
+            .find(|u| u.id == legacy.id)
+            .unwrap()
+            .approval_grants
+            .is_empty());
+        assert!(!json.to_string().contains("password_hash"));
+        let updated = svc.update_max_devices(&user.id, 2).await.unwrap();
+        assert_eq!(updated.approval_grants.len(), 2);
+        let filtered: ListUsersQuery =
+            serde_json::from_value(serde_json::json!({"search":"legacy-user"})).unwrap();
+        let page = svc.list_users(&filtered).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].approval_grants.is_empty());
     }
 
     #[test]

@@ -4,10 +4,10 @@ use axum::extract::{rejection::JsonRejection, Query};
 use axum::{extract::State, Json};
 use vpn_api_types::{
     system::{
-        EmailNotificationSettings, IntegrationSettingsView, NetworkSettingsView,
-        NotificationEventQuery, NotificationEventView, SystemInfo, TestEmailNotificationRequest,
-        UpdateEmailNotificationSettingsRequest, UpdateIntegrationSettingsRequest,
-        UpdateNetworkSettingsRequest, UpdateServerRoutesRequest,
+        EmailNotificationSettings, FeishuApprovalSubscriptionView, IntegrationSettingsView,
+        NetworkSettingsView, NotificationEventQuery, NotificationEventView, SystemInfo,
+        TestEmailNotificationRequest, UpdateEmailNotificationSettingsRequest,
+        UpdateIntegrationSettingsRequest, UpdateNetworkSettingsRequest, UpdateServerRoutesRequest,
     },
     ApiResponse,
 };
@@ -55,6 +55,39 @@ pub async fn integration_settings(
     Ok(Json(ApiResponse::success(
         settings,
         "n/a".to_string(),
+        state.clock.now_unix_ms(),
+    )))
+}
+
+/// 读取当前已应用身份的本地订阅成功记录。
+#[tracing::instrument(skip(state))]
+pub async fn approval_subscription(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+) -> Result<Json<ApiResponse<FeishuApprovalSubscriptionView>>, ApiError> {
+    let status = state
+        .integration_settings_service()?
+        .approval_subscription()
+        .await?;
+    Ok(Json(ApiResponse::success(
+        status,
+        "n/a".into(),
+        state.clock.now_unix_ms(),
+    )))
+}
+
+#[tracing::instrument(skip(state))]
+pub async fn subscribe_approval(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+) -> Result<Json<ApiResponse<FeishuApprovalSubscriptionView>>, ApiError> {
+    let status = state
+        .integration_settings_service()?
+        .subscribe_approval()
+        .await?;
+    Ok(Json(ApiResponse::success(
+        status,
+        "n/a".into(),
         state.clock.now_unix_ms(),
     )))
 }

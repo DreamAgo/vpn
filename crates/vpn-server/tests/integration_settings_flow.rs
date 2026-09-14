@@ -193,6 +193,20 @@ async fn admin_update_is_redacted_and_invalid_update_is_atomic() {
     )
     .await;
     let member = login["data"]["access_token"].as_str().unwrap();
+    for method in ["GET", "POST"] {
+        let uri = "/api/v1/admin/integrations/feishu/approval-subscription";
+        let (status, _) = request(&app, method, uri, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = request(&app, method, uri, None, Some(member)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let subscription_uri = "/api/v1/admin/integrations/feishu/approval-subscription";
+    let (status, subscription) = request(&app, "GET", subscription_uri, None, Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(subscription["data"]["can_subscribe"], false);
+    assert!(subscription["data"]["last_success_at"].is_null());
+    let (status, _) = request(&app, "POST", subscription_uri, None, Some(&admin)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = request(
         &app,
         "GET",
@@ -222,6 +236,12 @@ async fn admin_update_is_redacted_and_invalid_update_is_atomic() {
     assert_eq!(updated["data"]["applied"]["feishu_login"]["enabled"], false);
     assert!(!updated.to_string().contains("never-return-this"));
     assert_eq!(updated["data"]["restart_required"], true);
+
+    let (status, _) = request(&app, "POST", subscription_uri, None, Some(&admin)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, subscription) = request(&app, "GET", subscription_uri, None, Some(&admin)).await;
+    assert_eq!(subscription["data"]["can_subscribe"], false);
+    assert!(subscription["data"]["last_success_at"].is_null());
 
     let (status, _) = request(
         &app,

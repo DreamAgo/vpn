@@ -204,6 +204,25 @@ pub async fn openapi_json() -> Json<Value> {
                     }
                 }
             },
+            "/api/v1/admin/integrations/feishu/approval-subscription": {
+                "get": {
+                    "tags": ["Integrations"],
+                    "summary": "管理员查询当前已应用配置的审批订阅执行记录",
+                    "description": "返回 app_id、approval_code、last_success_at（Unix 毫秒或 null）及 can_subscribe。本系统历史成功记录不代表飞书实时订阅状态；无记录也不代表未在其他地方订阅。",
+                    "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+                },
+                "post": {
+                    "tags": ["Integrations"],
+                    "summary": "管理员手动订阅飞书审批定义",
+                    "description": "使用当前已应用的配置调用飞书，成功后持久化执行时间。配置未启用或待重启时拒绝执行。可重复执行，不根据历史记录跳过请求。",
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/Envelope" },
+                        "400": { "$ref": "#/components/responses/Envelope" },
+                        "401": { "$ref": "#/components/responses/Envelope" },
+                        "403": { "$ref": "#/components/responses/Envelope" }
+                    }
+                }
+            },
             "/api/v1/admin/users": {
                 "get": {
                     "tags": ["Users"],

@@ -70,6 +70,33 @@ export function IntegrationSettingsPage() {
     queryKey: ['integration-settings'],
     queryFn: systemApi.getIntegrationSettings,
   });
+  const subscriptionQueryKey = [
+    'feishu-approval-subscription',
+    query.data?.applied.feishuLogin.appId,
+    query.data?.applied.feishuApproval.approvalCode,
+    query.data?.applied.feishuLogin.enabled,
+    query.data?.applied.feishuApproval.enabled,
+    query.data?.restartRequired,
+  ];
+  const subscriptionQuery = useQuery({
+    queryKey: subscriptionQueryKey,
+    queryFn: systemApi.getFeishuApprovalSubscription,
+    enabled: Boolean(query.data),
+  });
+  const subscriptionMutation = useMutation({
+    mutationFn: systemApi.subscribeFeishuApproval,
+    onMutate: async () => {
+      await queryClient.cancelQueries({ queryKey: ['feishu-approval-subscription'] });
+    },
+    onSuccess: (view) => {
+      queryClient.setQueryData(subscriptionQueryKey, view);
+      message.success('审批事件订阅成功，已记录执行时间');
+    },
+    onError: (error: Error) => message.error(error.message || '审批事件订阅失败'),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['feishu-approval-subscription'] });
+    },
+  });
 
   useEffect(() => {
     // 后台刷新或迟到响应不得覆盖管理员尚未保存的输入。
@@ -87,6 +114,7 @@ export function IntegrationSettingsPage() {
       form.resetFields();
       form.setFieldsValue(valuesFrom(view));
       queryClient.setQueryData(['integration-settings'], view);
+      void queryClient.invalidateQueries({ queryKey: ['feishu-approval-subscription'] });
       message.success('集成设置已保存，重启服务端后生效');
     },
     onError: (error: Error) => message.error(error.message || '保存失败'),
@@ -157,7 +185,7 @@ export function IntegrationSettingsPage() {
         </Typography.Text>
       </div>
       {query.data?.restartRequired && (
-        <Alert type="warning" showIcon message="配置已保存但尚未应用，请重启服务端" />
+        <Alert type="warning" showIcon message="配置已保存但尚未应用，请点击右上角“重启服务端”" />
       )}
       {query.isError && (
         <Alert type="error" showIcon message="加载集成设置失败" description={(query.error as Error).message} />
@@ -171,7 +199,7 @@ export function IntegrationSettingsPage() {
       )}
       <Form
         form={form}
-        disabled={mutation.isPending || query.isLoading || query.isError || !query.data}
+        disabled={mutation.isPending || subscriptionMutation.isPending || query.isLoading || query.isError || !query.data}
         layout="vertical"
         onValuesChange={() => {
           dirtyRef.current = true;
@@ -208,6 +236,48 @@ export function IntegrationSettingsPage() {
           <Form.Item name="reasonControlId" label="申请原因控件 ID"><Input /></Form.Item>
           <SecretField formName="verificationToken" clearName="clearVerificationToken" label="Verification Token" isSet={desired?.feishuApproval.verificationTokenSet} />
           <SecretField formName="encryptKey" clearName="clearEncryptKey" label="Encrypt Key" isSet={desired?.feishuApproval.encryptKeySet} />
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Typography.Text strong>审批事件订阅</Typography.Text>
+            <Typography.Text type="secondary">
+              请先保存配置并重启服务端，再为当前生效的应用和审批 Code 执行订阅。同一应用和审批 Code 通常只需成功执行一次。
+            </Typography.Text>
+            {subscriptionQuery.isError ? (
+              <Alert type="error" showIcon message="加载订阅执行记录失败" description={(subscriptionQuery.error as Error).message} />
+            ) : subscriptionQuery.data ? (
+              <>
+                <Typography.Text>
+                  当前生效：App ID {subscriptionQuery.data.appId || '未配置'}；审批 Code {subscriptionQuery.data.approvalCode || '未配置'}
+                </Typography.Text>
+                <Typography.Text>
+                  {subscriptionQuery.data.lastSuccessAt != null
+                    ? `本系统上次订阅成功：${new Date(subscriptionQuery.data.lastSuccessAt).toLocaleString()}`
+                    : '本系统尚无此应用和审批 Code 的成功订阅记录'}
+                </Typography.Text>
+              </>
+            ) : (
+              <Typography.Text type="secondary">正在加载订阅执行记录…</Typography.Text>
+            )}
+            <Typography.Text type="secondary">
+              此处显示本系统记录的成功执行时间，不代表飞书实时订阅状态；无记录也可能已通过其他方式订阅。记录会在服务重启后保留。
+            </Typography.Text>
+            <Space>
+              <Button
+                loading={subscriptionMutation.isPending}
+                disabled={dirty || mutation.isPending || query.isError || !query.data || query.data.restartRequired || subscriptionQuery.isFetching || subscriptionQuery.isError || !subscriptionQuery.data?.canSubscribe}
+                onClick={() => subscriptionMutation.mutate()}
+              >{subscriptionQuery.data?.lastSuccessAt != null ? '重新执行订阅' : '订阅审批事件'}</Button>
+              <Button
+                loading={subscriptionQuery.isFetching}
+                disabled={mutation.isPending || subscriptionMutation.isPending || !query.data}
+                onClick={() => { void subscriptionQuery.refetch(); }}
+              >刷新记录</Button>
+            </Space>
+            {(dirty || query.data?.restartRequired || (subscriptionQuery.data && !subscriptionQuery.data.canSubscribe)) && (
+              <Typography.Text type="warning">
+                {dirty ? '有未保存的修改，请先保存配置。' : query.data?.restartRequired ? '配置尚未生效，请先重启服务端。' : '请先启用并完整配置飞书审批，保存后重启服务端。'}
+              </Typography.Text>
+            )}
+          </Space>
         </Card>
 
         <Card title="审批外部选项" style={{ marginTop: 16 }}>
@@ -220,10 +290,10 @@ export function IntegrationSettingsPage() {
             type="primary"
             htmlType="submit"
             loading={mutation.isPending}
-            disabled={query.isLoading || query.isError || !query.data}
+            disabled={subscriptionMutation.isPending || query.isLoading || query.isError || !query.data}
           >保存</Button>
           <Button
-            disabled={!dirty}
+            disabled={subscriptionMutation.isPending || !dirty}
             onClick={() => {
               dirtyRef.current = false;
               setDirty(false);

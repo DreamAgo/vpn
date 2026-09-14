@@ -454,6 +454,15 @@ pub struct SecretUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeishuApprovalSubscriptionView {
+    pub app_id: Option<String>,
+    pub approval_code: Option<String>,
+    /// 本系统最后一次确认订阅成功的时间，不代表飞书实时状态。
+    pub last_success_at: Option<i64>,
+    pub can_subscribe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeishuLoginSettingsView {
     pub enabled: bool,
     pub app_id: Option<String>,

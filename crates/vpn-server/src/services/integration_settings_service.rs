@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use vpn_api_types::system::{
-    FeishuApprovalSettingsView, FeishuExternalOptionsSettingsView, FeishuLoginSettingsView,
-    IntegrationSettingsSnapshotView, IntegrationSettingsView, SecretUpdate,
-    UpdateIntegrationSettingsRequest,
+    FeishuApprovalSettingsView, FeishuApprovalSubscriptionView, FeishuExternalOptionsSettingsView,
+    FeishuLoginSettingsView, IntegrationSettingsSnapshotView, IntegrationSettingsView,
+    SecretUpdate, UpdateIntegrationSettingsRequest,
 };
 use vpn_core::{AppError, Result};
 
@@ -63,6 +64,85 @@ pub struct IntegrationSettingsService {
 }
 
 impl IntegrationSettingsService {
+    fn subscription_key(&self) -> Option<String> {
+        let identity = serde_json::to_vec(&(
+            self.applied.feishu_login.app_id.as_ref()?,
+            self.applied.feishu_approval.approval_code.as_ref()?,
+        ))
+        .ok()?;
+        Some(format!(
+            "feishu_approval_subscription_v1_{:x}",
+            Sha256::digest(identity)
+        ))
+    }
+
+    pub async fn approval_subscription(&self) -> Result<FeishuApprovalSubscriptionView> {
+        let desired = self.desired().await?;
+        let last_success_at = match self.subscription_key() {
+            Some(key) => self
+                .repo
+                .get(&key)
+                .await?
+                .map(|value| value.parse::<i64>())
+                .transpose()
+                .map_err(|_| AppError::Config("飞书订阅记录格式异常".into()))?,
+            None => None,
+        };
+        Ok(FeishuApprovalSubscriptionView {
+            app_id: self.applied.feishu_login.app_id.clone(),
+            approval_code: self.applied.feishu_approval.approval_code.clone(),
+            last_success_at,
+            can_subscribe: desired == *self.applied
+                && self.applied.feishu_login.enabled
+                && self.applied.feishu_approval.enabled,
+        })
+    }
+
+    pub async fn subscribe_approval(&self) -> Result<FeishuApprovalSubscriptionView> {
+        self.subscribe_approval_with(|config, code| async move {
+            super::feishu_approval_service::ReqwestFeishuApprovalApi::new(config)?
+                .subscribe(&code)
+                .await
+        })
+        .await
+    }
+
+    async fn subscribe_approval_with<F, Fut>(
+        &self,
+        subscribe: F,
+    ) -> Result<FeishuApprovalSubscriptionView>
+    where
+        F: FnOnce(FeishuConfig, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let _guard = self.update_lock.try_lock().map_err(|_| {
+            AppError::Validation("集成设置正在更新或订阅正在执行，请稍后重试".into())
+        })?;
+        let status = self.approval_subscription().await?;
+        if !status.can_subscribe {
+            return Err(AppError::Validation(
+                "请启用并完整保存飞书登录与审批配置，重启生效后再订阅".into(),
+            ));
+        }
+        let code = status
+            .approval_code
+            .ok_or_else(|| AppError::Config("飞书审批定义未配置".into()))?;
+        let key = self
+            .subscription_key()
+            .ok_or_else(|| AppError::Config("飞书应用未配置".into()))?;
+        // 记录仅表示历史成功；即使有记录也再次请求，以支持远端取消后的恢复。
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            subscribe(self.applied.runtime().0, code),
+        )
+        .await
+        .map_err(|_| AppError::Config("飞书订阅请求超时，请重试".into()))??;
+        self.repo
+            .set(&key, &chrono::Utc::now().timestamp_millis().to_string())
+            .await?;
+        self.approval_subscription().await
+    }
+
     pub async fn load_or_seed(
         repo: SqliteSystemConfigRepository,
         pool: SqlitePool,
@@ -566,6 +646,102 @@ mod tests {
             },
         };
         request
+    }
+
+    async fn restart(service: &IntegrationSettingsService) -> IntegrationSettingsService {
+        IntegrationSettingsService::load_or_seed(
+            service.repo.clone(),
+            service.pool.clone(),
+            &FeishuConfig::default(),
+            &FeishuApprovalConfig::default(),
+            &FeishuApprovalOptionsConfig::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn subscription_requires_applied_config_and_persists_success_per_identity() {
+        let (service, _) = setup().await;
+        assert!(!service.approval_subscription().await.unwrap().can_subscribe);
+        service.update(approval_request(), "kernel").await.unwrap();
+        assert!(service
+            .subscribe_approval_with(|_, _| async { panic!("pending config must not call API") })
+            .await
+            .is_err());
+        let service = restart(&service).await;
+        let status = service
+            .subscribe_approval_with(|config, code| async move {
+                assert_eq!(config.app_id.as_deref(), Some("cli_test"));
+                assert_eq!(code, "code");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(status.last_success_at.is_some());
+        let service = restart(&service).await;
+        assert_eq!(service.approval_subscription().await.unwrap(), status);
+        // Failure after prior success preserves historical success, but is returned to caller.
+        assert!(service
+            .subscribe_approval_with(|_, _| async { Err(AppError::Config("mock failure".into())) })
+            .await
+            .is_err());
+        assert_eq!(
+            service
+                .approval_subscription()
+                .await
+                .unwrap()
+                .last_success_at,
+            status.last_success_at
+        );
+        let mut changed = approval_request();
+        changed.feishu_approval.approval_code = Some("another-code".into());
+        service.update(changed, "kernel").await.unwrap();
+        assert!(!service.approval_subscription().await.unwrap().can_subscribe);
+        let service = restart(&service).await;
+        assert_eq!(
+            service
+                .approval_subscription()
+                .await
+                .unwrap()
+                .last_success_at,
+            None
+        );
+        assert!(service
+            .subscribe_approval_with(|_, _| async { Err(AppError::Config("mock failure".into())) })
+            .await
+            .is_err());
+        assert_eq!(
+            service
+                .approval_subscription()
+                .await
+                .unwrap()
+                .last_success_at,
+            None
+        );
+        service.update(approval_request(), "kernel").await.unwrap();
+        let service = restart(&service).await;
+        assert_eq!(
+            service
+                .approval_subscription()
+                .await
+                .unwrap()
+                .last_success_at,
+            status.last_success_at
+        );
+        // Same definition under another application must have its own record.
+        let mut changed = approval_request();
+        changed.feishu_login.app_id = Some("cli_other".into());
+        service.update(changed, "kernel").await.unwrap();
+        let service = restart(&service).await;
+        assert_eq!(
+            service
+                .approval_subscription()
+                .await
+                .unwrap()
+                .last_success_at,
+            None
+        );
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ import {
 } from '@ant-design/icons';
 
 import { useAuthStore } from '@/stores/authStore';
+import { RestartServerButton } from '@/components/RestartServerButton';
 import { EventNotifications } from '@/components/EventNotifications';
 import { systemApi } from '@/services/auth';
 import {
@@ -237,6 +238,7 @@ export function AppLayout({
         ) : null
       }
       actionsRender={() => [
+        role === 'admin' ? <RestartServerButton key="restart-server" /> : null,
         role === 'admin' ? <EventNotifications key="events" /> : null,
         <ThemeModeToggle
           key="theme-mode"
