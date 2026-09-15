@@ -282,6 +282,22 @@ async fn run(
     } else {
         None
     };
+    let feishu_directory_service = if config.feishu.enabled() {
+        let service = Arc::new(vpn_server::services::FeishuDirectoryService::new(
+            pool.clone(),
+            config.feishu.app_id.clone().expect("enabled app ID"),
+            config.feishu_approval.clone(),
+            Arc::new(vpn_server::services::ReqwestDirectoryApi::new(
+                config.feishu.clone(),
+            )?),
+            Some(peer_service.clone()),
+            network_acl_service.clone(),
+        ));
+        service.clone().spawn();
+        Some(service)
+    } else {
+        None
+    };
     let feishu_approval_service = if config.feishu_approval.enabled() {
         let mut service = FeishuApprovalService::new(
             config.feishu_approval.clone(),
@@ -291,6 +307,9 @@ async fn run(
         );
         if let Some(network_acl) = &network_acl_service {
             service = service.with_network_acl(network_acl.clone());
+        }
+        if let Some(directory) = &feishu_directory_service {
+            service = service.with_directory(directory.clone());
         }
         let service = Arc::new(service);
         service.spawn_worker();
@@ -339,6 +358,9 @@ async fn run(
         .with_db_pool(pool.clone());
     if let Some(service) = network_acl_service {
         state = state.with_network_acl_service(service);
+    }
+    if let Some(service) = feishu_directory_service {
+        state = state.with_feishu_directory_service(service);
     }
     if let Some(service) = feishu_auth_service {
         state = state.with_feishu_auth_service(service);

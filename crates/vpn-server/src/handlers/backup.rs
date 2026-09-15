@@ -12,9 +12,14 @@ use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use vpn_api_types::ApiResponse;
 use vpn_core::AppError;
 
-use crate::{auth::RequireAdmin, error::ApiError, state::AppState};
+use crate::{
+    auth::RequireAdmin,
+    error::ApiError,
+    services::feishu_directory_service::{ContactEvent, DirectoryStateRow},
+    state::AppState,
+};
 
-const BACKUP_FORMAT_VERSION: u32 = 2;
+const BACKUP_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupArchive {
@@ -41,6 +46,10 @@ pub struct BackupTables {
     access_grants: Vec<AccessGrantRow>,
     #[serde(default)]
     feishu_approval_inbox: Vec<ApprovalInboxRow>,
+    #[serde(default)]
+    feishu_user_states: Vec<DirectoryStateRow>,
+    #[serde(default)]
+    feishu_contact_inbox: Vec<ContactEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -225,7 +234,7 @@ pub async fn restore_backup(
 ) -> Result<Json<ApiResponse<RestoreResponse>>, ApiError> {
     // v1 备份没有审批字段，serde default 会按 legacy/空授权安全恢复；新版导出使用 v2，
     // 让旧版服务端明确拒绝而不是忽略授权字段后把账号静默降级。
-    if !matches!(archive.format_version, 1 | BACKUP_FORMAT_VERSION) {
+    if !matches!(archive.format_version, 1 | 2 | BACKUP_FORMAT_VERSION) {
         return Err(
             AppError::Validation(format!("不支持的备份版本: {}", archive.format_version)).into(),
         );
@@ -237,6 +246,10 @@ pub async fn restore_backup(
     let pool = state.db_pool()?;
     // 恢复期间暂停审批任务的认领和提交，避免旧快照与新授权交叉写入。
     let _approval_pause = match &state.feishu_approval_service {
+        Some(service) => Some(service.pause_worker().await),
+        None => None,
+    };
+    let _directory_pause = match &state.feishu_directory_service {
         Some(service) => Some(service.pause_worker().await),
         None => None,
     };
@@ -265,6 +278,10 @@ async fn create_backup(pool: &SqlitePool) -> Result<BackupArchive, AppError> {
         .await
         .map_err(|error| AppError::Database(Box::new(error)))?;
     let tables = BackupTables {
+        feishu_user_states: sqlx::query_as::<_, DirectoryStateRow>("SELECT * FROM feishu_user_states ORDER BY subject")
+            .fetch_all(&mut *tx).await.map_err(|e|AppError::Database(Box::new(e)))?,
+        feishu_contact_inbox: sqlx::query_as::<_, ContactEvent>("SELECT * FROM feishu_contact_inbox ORDER BY event_id")
+            .fetch_all(&mut *tx).await.map_err(|e|AppError::Database(Box::new(e)))?,
         users: sqlx::query_as::<_, UserRow>(
             "SELECT id, username, email, password_hash, role, status, must_change_password,
                     last_login_at, created_at, updated_at, group_id, access_mode FROM users ORDER BY created_at",
@@ -363,6 +380,8 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
 
     for table in [
         "feishu_approval_inbox",
+        "feishu_contact_inbox",
+        "feishu_user_states",
         "access_grants",
         "external_identities",
         "audit_logs",
@@ -388,6 +407,17 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
     insert_user_group_members(&mut tx, &archive.tables.user_group_members).await?;
     insert_access_grants(&mut tx, &archive.tables.access_grants).await?;
     insert_approval_inbox(&mut tx, &archive.tables.feishu_approval_inbox).await?;
+    for row in &archive.tables.feishu_user_states {
+        sqlx::query("INSERT INTO feishu_user_states(subject,app_id,open_id,directory_user_id,name,email,status,blocked,synced_at,attempted_at,last_error,last_event_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")
+            .bind(&row.subject).bind(&row.app_id).bind(&row.open_id).bind(&row.directory_user_id).bind(&row.name).bind(&row.email)
+            .bind(&row.status).bind(row.blocked).bind(row.synced_at).bind(row.attempted_at).bind(&row.last_error).bind(row.last_event_at)
+            .execute(&mut *tx).await.map_err(|e|AppError::Database(Box::new(e)))?;
+    }
+    for row in &archive.tables.feishu_contact_inbox {
+        sqlx::query("INSERT INTO feishu_contact_inbox(event_id,app_id,user_id,id_type,event_type,event_at,payload_hash,done,attempted_at,last_error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")
+            .bind(&row.event_id).bind(&row.app_id).bind(&row.user_id).bind(&row.id_type).bind(&row.event_type).bind(row.event_at).bind(&row.payload_hash)
+            .bind(row.done).bind(row.attempted_at).bind(&row.last_error).execute(&mut *tx).await.map_err(|e|AppError::Database(Box::new(e)))?;
+    }
     insert_subnets(&mut tx, &archive.tables.subnets).await?;
     insert_peers(&mut tx, &archive.tables.peers).await?;
     insert_system_config(&mut tx, &archive.tables.system_config).await?;
@@ -657,4 +687,45 @@ async fn insert_api_keys(
         .map_err(|e| AppError::Database(Box::new(e)))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod directory_backup_tests {
+    use super::*;
+    #[tokio::test]
+    async fn backup_roundtrip_preserves_independent_feishu_restrictions_and_events() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,role,status,must_change_password,created_at,updated_at) VALUES('u1','alice','a@example.com','hash','user','active',0,0,0)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO external_identities VALUES('feishu','union1','u1',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO feishu_user_states(subject,app_id,status,blocked,last_event_at) VALUES('union1','app','frozen',1,100)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO feishu_contact_inbox(event_id,app_id,user_id,id_type,event_type,event_at,payload_hash) VALUES('e1','app','union1','union_id','contact.user.updated_v3',100,'hash')").execute(&pool).await.unwrap();
+        let archive = create_backup(&pool).await.unwrap();
+        assert_eq!(archive.format_version, 3);
+        let encoded = serde_json::to_vec(&archive).unwrap();
+        let archive: BackupArchive = serde_json::from_slice(&encoded).unwrap();
+        restore_archive(&pool, &archive).await.unwrap();
+        let user = crate::repositories::SqliteUserRepository::new(pool.clone());
+        assert_eq!(
+            user.find_by_id("u1").await.unwrap().unwrap().status,
+            "active"
+        );
+        assert!(matches!(
+            user.ensure_available("u1").await,
+            Err(AppError::AccountDisabled)
+        ));
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feishu_contact_inbox WHERE done=0")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 1);
+    }
 }

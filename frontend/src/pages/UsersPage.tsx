@@ -25,6 +25,8 @@ import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import 'dayjs/locale/zh-cn';
 
+import { GrantExpiryButton } from '@/components/GrantExpiryButton';
+import { FeishuBindingModal, feishuStatusLabels } from '@/components/FeishuBindingModal';
 import { usersApi } from '@/services/users';
 import { groupsApi } from '@/services/groups';
 import { ApiError } from '@/services/http';
@@ -61,7 +63,7 @@ const expiryFormatter = new Intl.DateTimeFormat('zh-CN', {
   hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
 });
 
-function ApprovalAccess({ user }: { user: UserDto }) {
+function ApprovalAccess({ user, onSaved }: { user: UserDto; onSaved: () => void }) {
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -86,6 +88,8 @@ function ApprovalAccess({ user }: { user: UserDto }) {
           </div>
           <Typography.Text type="secondary">
             {expiryFormatter.format(grant.expiresAt)} 到期
+            <GrantExpiryButton userId={user.id} groupId={grant.groupId} groupName={grant.groupName}
+              expiresAt={grant.expiresAt} onSaved={onSaved} />
           </Typography.Text>
         </div>
       ))}
@@ -128,12 +132,27 @@ export function UsersPage() {
   const [searchInput, setSearchInput] = useState('');
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const [feishuUser, setFeishuUser] = useState<UserDto | null>(null);
+  const [feishuSyncing, setFeishuSyncing] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [resetPwd, setResetPwd] = useState<string | null>(null);
   const [assignUser, setAssignUser] = useState<UserDto | null>(null);
   const [maxDevUser, setMaxDevUser] = useState<UserDto | null>(null);
 
   const reload = useCallback(() => actionRef.current?.reload(), []);
+
+  const syncFeishu = async (user: UserDto) => {
+    setFeishuSyncing(true);
+    try { await usersApi.syncFeishu(user.id); message.success('飞书状态已同步'); }
+    catch (error) { message.error(describeError(error, '同步失败')); }
+    finally { setFeishuSyncing(false); reload(); }
+  };
+  const syncAllFeishu = async () => {
+    setFeishuSyncing(true);
+    try { const count = await usersApi.syncAllFeishu(); message.success(`已安排 ${count} 个飞书身份后台同步，请稍后刷新`); }
+    catch (error) { message.error(describeError(error, '同步失败')); }
+    finally { setFeishuSyncing(false); reload(); }
+  };
 
   const handleSearchChange = (value: string) => {
     setSearchInput(value);
@@ -181,6 +200,10 @@ export function UsersPage() {
     }
   };
 
+  const userFeishuAction = (user: UserDto) => user.feishuBindings?.length
+    ? <span onClick={() => void syncFeishu(user)}>同步飞书状态</span>
+    : <span onClick={() => setFeishuUser(user)}>绑定飞书用户</span>;
+
   // 是否处于"有筛选条件"状态（决定空态变体）。
   const hasFilter = search.length > 0 || statusFilter !== undefined;
 
@@ -208,6 +231,17 @@ export function UsersPage() {
           ),
       },
       {
+        title: '飞书账号 / 状态', key: 'feishu', width: 240,
+        render: (_, user) => user.feishuBindings?.length ? <Space direction="vertical" size={4}>
+          {user.feishuBindings.map(binding => <div key={binding.unionId}>
+            <div>{binding.name || '已绑定'} <Tag color={binding.blocked ? 'error' : binding.status === 'active' ? 'success' : 'default'}>{feishuStatusLabels[binding.status] || binding.status}</Tag></div>
+            <Typography.Text type="secondary">{binding.email}</Typography.Text>
+            <div><Typography.Text type="secondary">{binding.syncedAt ? `同步于 ${dayjs(binding.syncedAt).format('MM-DD HH:mm:ss')}` : '尚未同步'}</Typography.Text></div>
+            {binding.lastError && <Typography.Text type="danger">{binding.lastError}</Typography.Text>}
+          </div>)}
+        </Space> : <Typography.Text type="secondary">未绑定</Typography.Text>,
+      },
+      {
         title: '人工分组',
         dataIndex: 'groupIds',
         width: 160,
@@ -217,7 +251,7 @@ export function UsersPage() {
         title: '审批授权 / 到期时间（上海）',
         key: 'approvalAccess',
         width: 280,
-        render: (_, record) => <ApprovalAccess user={record} />,
+        render: (_, record) => <ApprovalAccess user={record} onSaved={reload} />,
       },
       {
         title: '终端上限',
@@ -278,6 +312,10 @@ export function UsersPage() {
                     ),
                   },
                   {
+                    key: 'feishu',
+                    label: userFeishuAction(record),
+                  },
+                  {
                     key: 'assign-group',
                     label: <span onClick={() => setAssignUser(record)}>分配用户组</span>,
                   },
@@ -329,11 +367,13 @@ export function UsersPage() {
         用户管理
       </Title>
 
+      <Button onClick={syncAllFeishu} loading={feishuSyncing} style={{ marginBottom: 12 }}>同步所有已绑定飞书用户</Button>
+      {feishuUser && <FeishuBindingModal key={feishuUser.id} user={feishuUser} onClose={() => setFeishuUser(null)} onSuccess={reload} />}
       <ProTable<UserDto>
         actionRef={actionRef}
         rowKey="id"
         columns={columns}
-        scroll={{ x: 1200 }}
+        scroll={{ x: 1500 }}
         search={false}
         options={{ reload: true, density: false, setting: false }}
         pagination={{ defaultPageSize: 10, showSizeChanger: true }}

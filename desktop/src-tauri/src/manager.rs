@@ -294,13 +294,11 @@ impl VpnManager {
             return Err("连接已被断开操作取消".to_string());
         }
         self.shared.set_vpn_ip(Some(params.vpn_ip.clone())).await;
-        self.shared
-            .set_state(ConnState::Connected, now_unix())
-            .await;
+        self.shared.set_channel_health(false, false).await;
         tracing::info!(stage = "data_plane", result = "ready", elapsed_ms = data_plane_started.elapsed().as_millis(), vpn_ip = %params.vpn_ip, iface = %self.iface, routes = init_routes.allowed_routes.len(), "VPN 数据面任务已启动（尚未确认 WireGuard 握手）");
 
-        // 3) 心跳:每 30s 上报,**韧性重连**。网络抖动不拆隧道——run_heartbeat 内部标记
-        //    Reconnecting 并重试,boringtun 自动重握手,恢复后回 Connected。只有被管理员
+        // 3) 管理心跳每 30s 上报；只有心跳与数据面认证握手均健康才回 Connected。
+        //    数据面独立限频恢复 UDP 和握手，不因 HTTP 恢复覆盖隧道故障。只有被管理员
         //    强制下线(token 彻底失效)才返回 Err → 拆隧道 + 写错误状态,前端据此回登录页。
         let api_hb = api.clone();
         let shared = self.shared.clone();

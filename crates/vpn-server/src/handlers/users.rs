@@ -146,3 +146,23 @@ pub async fn delete_user(
     state.refresh_network_acl().await?;
     Ok(success(&state, ()))
 }
+
+pub async fn update_grant_expiry(
+    State(state): State<AppState>,
+    RequireAdmin(admin): RequireAdmin,
+    Path((id, group_id)): Path<(String, String)>,
+    Json(body): Json<vpn_api_types::user::UpdateGrantExpiryRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .user_service()?
+        .update_grant_expiry(
+            &admin.user_id,
+            &id,
+            &group_id,
+            body.expires_at,
+            body.expected_expires_at,
+        )
+        .await?;
+    state.refresh_network_acl().await?;
+    Ok(success(&state, ()))
+}

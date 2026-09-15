@@ -42,6 +42,7 @@ pub async fn require_auth(
 
         let svc = state.auth_service()?;
         let (user_id, role) = svc.issuer.verify_access(token).await?;
+        svc.user_repo.ensure_available(&user_id).await?;
         request
             .extensions_mut()
             .insert(CurrentUser { user_id, role });

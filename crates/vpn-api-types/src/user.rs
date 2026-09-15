@@ -29,6 +29,8 @@ pub struct UserDto {
     pub access_mode: String,
     /// 按用户组汇总的审批期限（同组取最晚期限，包含已到期授权）。
     pub approval_grants: Vec<UserApprovalGrantDto>,
+    #[serde(default)]
+    pub feishu_bindings: Vec<FeishuBindingDto>,
     pub created_at: i64,
 }
 
@@ -98,4 +100,30 @@ pub struct UpdateUserRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResetPasswordResponse {
     pub new_password: String,
+}
+
+/// 飞书身份状态独立于本地用户 status；未知/同步失败不会伪装成离职。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuBindingDto {
+    pub union_id: String,
+    pub name: String,
+    pub email: String,
+    pub status: String,
+    pub blocked: bool,
+    pub synced_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuLookupRequest {
+    pub user_id: String,
+    /// open_id / user_id / union_id
+    pub id_type: String,
+}
+
+/// 按组修改已有授权；期望值用于拒绝过时页面覆盖新审批。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateGrantExpiryRequest {
+    pub expires_at: i64,
+    pub expected_expires_at: i64,
 }

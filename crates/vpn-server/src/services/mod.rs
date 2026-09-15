@@ -50,3 +50,5 @@ pub use user_group_service::UserGroupService;
 pub use user_service::UserService;
 
 pub mod client_update_service;
+pub mod feishu_directory_service;
+pub use feishu_directory_service::{FeishuDirectoryService, ReqwestDirectoryApi};

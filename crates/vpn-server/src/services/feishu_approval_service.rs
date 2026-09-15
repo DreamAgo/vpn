@@ -110,7 +110,7 @@ impl ReqwestFeishuApprovalApi {
         ensure_subscription_success(status, response.code)
     }
 
-    async fn tenant_token(&self) -> Result<String> {
+    pub(crate) async fn tenant_token(&self) -> Result<String> {
         #[derive(Serialize)]
         struct Request<'a> {
             app_id: &'a str,
@@ -208,6 +208,7 @@ pub struct FeishuApprovalService {
     api: Arc<dyn FeishuApprovalApi>,
     hasher: Arc<dyn PasswordHasher>,
     network_acl: Option<Arc<NetworkAclService>>,
+    directory: Option<Arc<super::FeishuDirectoryService>>,
     maintenance: Arc<RwLock<()>>,
 }
 
@@ -224,8 +225,14 @@ impl FeishuApprovalService {
             api,
             hasher,
             network_acl: None,
+            directory: None,
             maintenance: Arc::new(RwLock::new(())),
         }
+    }
+
+    pub fn with_directory(mut self, service: Arc<super::FeishuDirectoryService>) -> Self {
+        self.directory = Some(service);
+        self
     }
 
     pub fn with_network_acl(mut self, network_acl: Arc<NetworkAclService>) -> Self {
@@ -284,6 +291,17 @@ impl FeishuApprovalService {
             return Err(AppError::Validation(
                 "飞书审批事件缺少完整 X-Lark 签名头".into(),
             ));
+        }
+
+        if string_at(&event, &["header.event_type"])
+            .is_some_and(|kind| kind.starts_with("contact."))
+        {
+            let directory = self
+                .directory
+                .as_ref()
+                .ok_or_else(|| AppError::Config("飞书用户状态同步未配置".into()))?;
+            directory.enqueue_event(&event).await?;
+            return Ok(ApprovalWebhookReply::Ack);
         }
 
         let meta = parse_event_meta(&event)?;
@@ -617,7 +635,7 @@ fn parse_instance(value: &Value) -> Result<ApprovalInstance> {
     })
 }
 
-fn verify_timestamp(timestamp: &str) -> Result<()> {
+pub(crate) fn verify_timestamp(timestamp: &str) -> Result<()> {
     let timestamp = timestamp
         .parse::<i64>()
         .map_err(|_| AppError::Validation("飞书事件时间戳非法".into()))?;
@@ -627,7 +645,7 @@ fn verify_timestamp(timestamp: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_signature(
+pub(crate) fn verify_signature(
     headers: &ApprovalEventHeaders<'_>,
     encrypt_key: &str,
     raw_body: &[u8],
@@ -653,7 +671,7 @@ fn verify_signature(
     Ok(())
 }
 
-fn decrypt_event(encrypt_key: &str, encrypted: &str) -> Result<Vec<u8>> {
+pub(crate) fn decrypt_event(encrypt_key: &str, encrypted: &str) -> Result<Vec<u8>> {
     type Decryptor = cbc::Decryptor<Aes256>;
     let mut ciphertext = STANDARD
         .decode(encrypted)
@@ -671,7 +689,7 @@ fn decrypt_event(encrypt_key: &str, encrypted: &str) -> Result<Vec<u8>> {
     Ok(plain.to_vec())
 }
 
-fn verify_token(value: &Value, expected: &str) -> Result<()> {
+pub(crate) fn verify_token(value: &Value, expected: &str) -> Result<()> {
     let supplied = string_at(value, &["token", "header.token"])
         .ok_or_else(|| AppError::Validation("飞书事件缺少 verification token".into()))?;
     if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
@@ -682,7 +700,7 @@ fn verify_token(value: &Value, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn string_at(value: &Value, paths: &[&str]) -> Option<String> {
+pub(crate) fn string_at(value: &Value, paths: &[&str]) -> Option<String> {
     for path in paths {
         let mut current = value;
         let mut found = true;

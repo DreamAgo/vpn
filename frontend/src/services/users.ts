@@ -12,9 +12,26 @@ import type {
   ResetPasswordResponse,
   UpdateUserRequest,
   UserDto,
+  FeishuBindingDto,
+  FeishuLookupRequest,
 } from '@/types/api';
 
 export const usersApi = {
+  async updateGrantExpiry(id: string, groupId: string, expiresAt: number, expectedExpiresAt: number): Promise<void> {
+    await http.patch(`/admin/users/${id}/approval-grants/${groupId}`, { expiresAt, expectedExpiresAt });
+  },
+  async lookupFeishu(req: FeishuLookupRequest): Promise<FeishuBindingDto> {
+    return (await http.post<FeishuBindingDto>('/admin/integrations/feishu/users/lookup', req)).data;
+  },
+  async bindFeishu(id: string, req: FeishuLookupRequest): Promise<FeishuBindingDto[]> {
+    return (await http.post<FeishuBindingDto[]>(`/admin/users/${id}/feishu-binding`, req)).data;
+  },
+  async syncFeishu(id: string): Promise<FeishuBindingDto[]> {
+    return (await http.post<FeishuBindingDto[]>(`/admin/users/${id}/feishu-sync`)).data;
+  },
+  async syncAllFeishu(): Promise<number> {
+    return (await http.post<number>('/admin/integrations/feishu/users/sync')).data;
+  },
   async createUser(req: CreateUserRequest): Promise<CreateUserResponse> {
     const res = await http.post<CreateUserResponse>('/admin/users', req);
     return res.data;

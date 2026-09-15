@@ -263,6 +263,13 @@ impl SqliteAccessGrantRepository {
                 .map_err(db)?;
                 grant.identity.new_user_id.to_string()
             };
+            let other: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM external_identities WHERE provider='feishu' AND user_id=?1 AND subject!=?2)")
+                .bind(&id).bind(grant.identity.subject).fetch_one(&mut *tx).await.map_err(db)?;
+            if other {
+                return Err(AppError::DuplicateResource(
+                    "该账号已绑定其他飞书身份".into(),
+                ));
+            }
             sqlx::query(
                 "INSERT INTO external_identities(provider,subject,user_id,created_at) VALUES('feishu',?1,?2,?3)",
             )

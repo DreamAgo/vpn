@@ -470,7 +470,12 @@ impl StoredIntegrationSettings {
                 encrypt_key: self.feishu_approval.encrypt_key.clone(),
             }
         } else {
-            FeishuApprovalConfig::default()
+            // 通讯录回调与审批共用事件凭据，停用审批不应清空凭据。
+            FeishuApprovalConfig {
+                verification_token: self.feishu_approval.verification_token.clone(),
+                encrypt_key: self.feishu_approval.encrypt_key.clone(),
+                ..FeishuApprovalConfig::default()
+            }
         };
         let options = FeishuApprovalOptionsConfig {
             token: self.external_options.token.clone(),
@@ -576,6 +581,26 @@ mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+
+    #[test]
+    fn contact_event_credentials_survive_disabled_approval() {
+        let stored = StoredIntegrationSettings::from_environment(
+            &FeishuConfig::default(),
+            &FeishuApprovalConfig {
+                verification_token: Some("verification-token".into()),
+                encrypt_key: Some("encrypt-key".into()),
+                ..Default::default()
+            },
+            &FeishuApprovalOptionsConfig::default(),
+        );
+        let (_, approval, _) = stored.runtime();
+        assert!(!approval.enabled());
+        assert_eq!(
+            approval.verification_token.as_deref(),
+            Some("verification-token")
+        );
+        assert_eq!(approval.encrypt_key.as_deref(), Some("encrypt-key"));
+    }
 
     async fn setup() -> (IntegrationSettingsService, SqliteSystemConfigRepository) {
         let url = format!(

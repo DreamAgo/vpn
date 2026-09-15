@@ -358,6 +358,7 @@ impl PeerService {
         user_id: &str,
         req: &PeerRegisterRequest,
     ) -> Result<PeerRegisterResponse> {
+        self.user_repo.ensure_available(user_id).await?;
         if self.obfs_transport.is_some() && !req.capabilities.iter().any(|value| value == "obfs-v1")
         {
             return Err(AppError::Validation(
@@ -365,6 +366,7 @@ impl PeerService {
             ));
         }
         let _route_guard = self.peer_route_lock.lock().await;
+        self.user_repo.ensure_available(user_id).await?;
         if self.registration_blocked.load(Ordering::Acquire) {
             return Err(AppError::Validation(
                 "VPN 虚拟子网已修改并等待服务端重启，重启完成前暂停节点注册".to_string(),
@@ -925,6 +927,7 @@ impl PeerService {
         req: &PeerHeartbeatRequest,
         now_ms: i64,
     ) -> Result<HeartbeatResult> {
+        self.user_repo.ensure_available(user_id).await?;
         // 与管理员热更新共用锁，避免一条响应混用保存前后的路由和排除规则。
         let _guard = self.peer_route_lock.lock().await;
         let endpoint = req.endpoint.as_deref();
@@ -1058,6 +1061,19 @@ impl PeerService {
 
     /// 用户被**禁用**时联动踢隧道:摘除 WireGuard peer + 标记 force_removed(保留记录与 IP)。
     /// 重新启用并重连后 force_removed 会被清除而恢复。无活跃 peer 则静默成功。
+    /// 飞书状态限制需要可重试摘除，并与注册共用锁，避免刚摘除又被并发注册恢复。
+    pub async fn force_remove_for_identity(&self, user_id: &str) -> Result<()> {
+        let _guard = self.peer_route_lock.lock().await;
+        for peer in self.peer_repo.list_active_by_user(user_id).await? {
+            if peer.status == "force_removed" {
+                continue;
+            }
+            self.control.remove_peer(&peer.wg_public_key).await?;
+            self.peer_repo.mark_force_removed(&peer.id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn force_remove_by_user(&self, user_id: &str) -> Result<()> {
         for peer in self.peer_repo.list_active_by_user(user_id).await? {
             // best-effort 摘除：用户已在 update_status 中被禁用并吊销会话，WireGuard 摘除
@@ -1394,6 +1410,44 @@ mod tests {
             "vpn.example.com:51820".to_string(),
             Vec::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn feishu_blocking_removes_bound_peer_but_preserves_unbound_manual_peer() {
+        let pool = setup_pool().await;
+        let svc = service(pool.clone());
+        svc.register("user-1", &reg("PK1")).await.unwrap();
+        svc.register("user-2", &reg("PK2")).await.unwrap();
+        sqlx::query("INSERT INTO external_identities VALUES('feishu','union1','user-1',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO feishu_user_states(subject,app_id,status,blocked) VALUES('union1','app','frozen',1)").execute(&pool).await.unwrap();
+        assert!(matches!(
+            svc.register("user-1", &reg("PK1")).await,
+            Err(AppError::AccountDisabled)
+        ));
+        assert!(matches!(
+            svc.heartbeat_checked_with_notice("user-1", &hb(Some("PK1"), None), 1)
+                .await,
+            Err(AppError::AccountDisabled)
+        ));
+        svc.force_remove_for_identity("user-1").await.unwrap();
+        assert_eq!(
+            svc.peer_repo.list_active_by_user("user-1").await.unwrap()[0].status,
+            "force_removed"
+        );
+        assert_ne!(
+            svc.peer_repo.list_active_by_user("user-2").await.unwrap()[0].status,
+            "force_removed"
+        );
+        svc.register("user-2", &reg("PK2")).await.unwrap();
+        svc.heartbeat_checked_with_notice("user-2", &hb(Some("PK2"), None), 1)
+            .await
+            .unwrap();
+        let keys = svc.peer_repo.list_active_peer_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "PK2");
     }
 
     fn service_with_server_routes(pool: SqlitePool, routes: Vec<String>) -> PeerService {
