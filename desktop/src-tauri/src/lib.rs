@@ -6,6 +6,7 @@
 //! Disconnect / Quit。所有 VPN 工作进程内完成（库调用 `vpn-cli`），见 `manager.rs`。
 
 mod commands;
+mod updates;
 #[cfg(target_os = "macos")]
 mod macos_helper;
 mod manager;
@@ -224,6 +225,8 @@ pub fn run() {
         .manage(Arc::new(VpnManager::new()))
         .manage(ExitState::default())
         .invoke_handler(tauri::generate_handler![
+            updates::update_source,
+            updates::check_server_update,
             commands::get_status,
             commands::connect,
             commands::disconnect,

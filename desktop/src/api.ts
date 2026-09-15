@@ -12,7 +12,7 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
-import { check, Update, type DownloadEvent } from "@tauri-apps/plugin-updater";
+import { Update, type DownloadEvent } from "@tauri-apps/plugin-updater";
 
 export type ConnState =
   | "disconnected"
@@ -57,6 +57,19 @@ export interface LogSnapshot {
 }
 
 let pendingUpdate: Update | null = null;
+let pendingUpdateSource: string | null = null;
+
+async function checkServerUpdate(): Promise<Update | null> {
+  const previous = pendingUpdate;
+  pendingUpdate = null;
+  pendingUpdateSource = null;
+  if (previous) await previous.close();
+  const metadata = await invoke<(ConstructorParameters<typeof Update>[0] & { source: string }) | null>("check_server_update");
+  if (!metadata) return null;
+  pendingUpdateSource = metadata.source;
+  pendingUpdate = new Update(metadata);
+  return pendingUpdate;
+}
 const PREVIEW_AUTOSTART_KEY = "yilian-preview-autostart";
 
 function isTauriRuntime(): boolean {
@@ -226,7 +239,7 @@ export async function checkForUpdate(): Promise<UpdateInfo> {
     };
   }
 
-  const update = await check({ timeout: 10_000 });
+  const update = await checkServerUpdate();
   pendingUpdate = update;
   if (!update) {
     return {
@@ -256,7 +269,14 @@ export async function installPendingUpdate(
     return;
   }
 
-  const update = pendingUpdate ?? (await check({ timeout: 10_000 }));
+  const source = await invoke<string>("update_source");
+  if (pendingUpdate && source !== pendingUpdateSource) {
+    await pendingUpdate.close();
+    pendingUpdate = null;
+    pendingUpdateSource = null;
+    throw new Error("服务端已切换，请重新检查更新");
+  }
+  const update = pendingUpdate ?? (await checkServerUpdate());
   if (!update) throw new Error("当前没有可用更新");
 
   let downloaded = 0;
@@ -275,6 +295,7 @@ export async function installPendingUpdate(
   };
 
   await update.downloadAndInstall(handleEvent);
+  pendingUpdateSource = null;
   pendingUpdate = null;
   await relaunch();
 }

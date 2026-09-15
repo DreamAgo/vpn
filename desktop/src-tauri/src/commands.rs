@@ -56,7 +56,7 @@ impl Drop for FeishuAuthWindowGuard {
 }
 
 /// Open a file-backed credential repo (most reliable, no keyring prompts).
-fn repo() -> Result<CredentialRepo, String> {
+pub(crate) fn repo() -> Result<CredentialRepo, String> {
     CredentialRepo::file().map_err(|e| e.to_string())
 }
 
