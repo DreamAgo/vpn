@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
+import { createPortal } from "react-dom";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -66,7 +67,7 @@ function formatVersion(version: string | null | undefined): string | null {
 function dragWindowFromHeader(event: MouseEvent<HTMLDivElement>) {
   if (!isTauri() || event.button !== 0 || !(event.target instanceof Element)) return;
   if (event.target.closest(
-    "button, a, input, textarea, select, [role='button'], [contenteditable='true'], [data-no-window-drag], .settings-panel, .logs-panel, .modal",
+    "button, a, input, textarea, select, [role='button'], [contenteditable='true'], [data-no-window-drag], dialog, .settings-panel, .logs-panel, .modal",
   )) return;
 
   const shell = event.currentTarget;
@@ -93,6 +94,8 @@ export default function App() {
   const [showLogs, setShowLogs] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("connection");
   const [showChangePwd, setShowChangePwd] = useState(false);
+  const [showUpdatePrompt, setShowUpdatePrompt] = useState(false);
+  const updateOperationRef = useRef(false);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
   const [updateBody, setUpdateBody] = useState<string | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -227,6 +230,8 @@ export default function App() {
   }, []);
 
   const checkUpdates = useCallback(async (manual = false) => {
+    if (updateOperationRef.current) return;
+    updateOperationRef.current = true;
     setUpdateBusy(true);
     setUpdateMessage(null);
     setUpdateProgress(null);
@@ -236,7 +241,11 @@ export default function App() {
         setUpdateVersion(result.version);
         setUpdateBody(result.body);
         setUpdateMessage(`发现新版本 ${result.version}`);
-        if (!manual) void notify("发现新版本", `易链 ${result.version} 可更新。`);
+        setShowUpdatePrompt(true);
+        if (isTauri()) {
+          const appWindow = getCurrentWindow();
+          await appWindow.show().then(() => appWindow.setFocus()).catch(console.warn);
+        }
       } else {
         setUpdateVersion(null);
         setUpdateBody(null);
@@ -246,16 +255,18 @@ export default function App() {
     } catch (e) {
       setUpdateMessage(`检查更新失败: ${String(e)}`);
     } finally {
+      updateOperationRef.current = false;
       setUpdateBusy(false);
     }
   }, []);
 
   useEffect(() => {
+    if (!loggedIn) return;
     const timer = window.setTimeout(() => {
       void checkUpdates(false);
     }, 3500);
     return () => window.clearTimeout(timer);
-  }, [checkUpdates]);
+  }, [checkUpdates, loggedIn, server]);
 
   void tick;
 
@@ -352,7 +363,11 @@ export default function App() {
   };
 
   const onInstallUpdate = async () => {
+    if (updateOperationRef.current) return;
+    updateOperationRef.current = true;
+    setShowUpdatePrompt(true);
     setUpdateBusy(true);
+    setUpdateProgress(null);
     setUpdateMessage("正在下载更新...");
     try {
       await installPendingUpdate(({ downloaded, total }) => {
@@ -362,18 +377,34 @@ export default function App() {
           setUpdateProgress(formatBytes(downloaded));
         }
       });
+      setUpdateMessage("更新已安装，正在重启客户端…");
     } catch (e) {
       setUpdateMessage(`安装更新失败: ${String(e)}`);
+    } finally {
+      updateOperationRef.current = false;
       setUpdateBusy(false);
     }
   };
 
+  const updatePrompt = showUpdatePrompt && updateVersion ? (
+    <UpdatePrompt
+      version={updateVersion}
+      body={updateBody}
+      busy={updateBusy}
+      message={updateMessage}
+      progress={updateProgress}
+      onConfirm={() => void onInstallUpdate()}
+      onCancel={() => setShowUpdatePrompt(false)}
+    />
+  ) : null;
+
   if (loggedIn === null) {
-    return <BootView />;
+    return <><BootView />{updatePrompt}</>;
   }
 
   if (!loggedIn) {
     return (
+      <>
       <LoginView
         appVersion={diagnostics?.app_version ?? null}
         onLoggedIn={() => {
@@ -383,6 +414,8 @@ export default function App() {
           refresh();
         }}
       />
+      {updatePrompt}
+      </>
     );
   }
 
@@ -520,8 +553,41 @@ export default function App() {
         />
       )}
 
+      {updatePrompt}
       {toast && <div className="toast">{toast}</div>}
     </div>
+  );
+}
+
+function UpdatePrompt({ version, body, busy, message, progress, onConfirm, onCancel }: {
+  version: string;
+  body: string | null;
+  busy: boolean;
+  message: string | null;
+  progress: string | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+  return createPortal(
+    <dialog ref={dialogRef} className="update-dialog" aria-labelledby="update-prompt-title"
+      onCancel={(event) => { event.preventDefault(); if (!busy) onCancel(); }}>
+      <h2 id="update-prompt-title">发现新版本 {version}</h2>
+      <p>确认后将下载并安装更新，完成后自动重启客户端。</p>
+      {body && <div className="update-dialog-notes">{body}</div>}
+      <p role="status" aria-live="polite">{message}{progress ? ` ${progress}` : ""}</p>
+      <div className="update-dialog-actions">
+        <button className="text-button" disabled={busy} onClick={onCancel}>取消</button>
+        <button className="text-button" disabled={busy} onClick={onConfirm}>
+          {busy ? "正在更新…" : "确认更新"}
+        </button>
+      </div>
+    </dialog>, document.body,
   );
 }
 
