@@ -1012,15 +1012,10 @@ button:disabled {
   animation: spin 0.7s linear infinite;
 }
 
-[data-tauri-drag-region] {
+.appbar {
   cursor: default;
   -webkit-user-select: none;
   user-select: none;
-}
-
-[data-tauri-drag-region="false"],
-[data-tauri-drag-region="false"] * {
-  -webkit-app-region: no-drag;
 }
 
 @keyframes spin {

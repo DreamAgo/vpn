@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
+import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ConnState,
   DiagnosticsInfo,
@@ -57,6 +59,27 @@ function formatVersion(version: string | null | undefined): string | null {
   const value = version?.trim();
   if (!value) return null;
   return value.startsWith("v") ? value : `v${value}`;
+}
+
+// Handle the whole header band, including its padding and modal backdrop.
+// A single handler avoids relying on the exact child element under the pointer.
+function dragWindowFromHeader(event: MouseEvent<HTMLDivElement>) {
+  if (!isTauri() || event.button !== 0 || !(event.target instanceof Element)) return;
+  if (event.target.closest(
+    "button, a, input, textarea, select, [role='button'], [contenteditable='true'], [data-no-window-drag], .settings-panel, .logs-panel, .modal",
+  )) return;
+
+  const shell = event.currentTarget;
+  const header = shell.querySelector<HTMLElement>(":scope > .appbar");
+  const top = shell.getBoundingClientRect().top;
+  const bottom = header?.getBoundingClientRect().bottom ?? top + 52;
+  if (event.clientY < top || event.clientY > bottom) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  void getCurrentWindow().startDragging().catch((error) => {
+    console.warn("无法拖动窗口", error);
+  });
 }
 
 export default function App() {
@@ -372,10 +395,10 @@ export default function App() {
   const connecting = actualState === "connecting";
 
   return (
-    <div className="app-shell" data-state={state} data-tauri-drag-region>
-      <header className="appbar" data-tauri-drag-region>
+    <div className="app-shell" data-state={state} onMouseDownCapture={dragWindowFromHeader}>
+      <header className="appbar">
         <Brand version={diagnostics?.app_version ?? null} />
-        <div className="top-actions" data-tauri-drag-region="false">
+        <div className="top-actions" data-no-window-drag>
           <IconButton
             title="设置"
             onClick={() => setShowSettings(true)}
@@ -505,14 +528,14 @@ export default function App() {
 function Brand({ version }: { version?: string | null }) {
   const displayVersion = formatVersion(version);
   return (
-    <div className="brand" data-tauri-drag-region>
-      <div className="brand-mark" data-tauri-drag-region>易</div>
-      <div className="brand-copy" data-tauri-drag-region>
-        <div className="brand-title" data-tauri-drag-region>
-          <div className="brand-name" data-tauri-drag-region>易链</div>
-          {displayVersion && <span className="brand-version" title={displayVersion} data-tauri-drag-region>{displayVersion}</span>}
+    <div className="brand">
+      <div className="brand-mark">易</div>
+      <div className="brand-copy">
+        <div className="brand-title">
+          <div className="brand-name">易链</div>
+          {displayVersion && <span className="brand-version" title={displayVersion}>{displayVersion}</span>}
         </div>
-        <div className="brand-sub" data-tauri-drag-region>安全接入中枢</div>
+        <div className="brand-sub">安全接入中枢</div>
       </div>
     </div>
   );
@@ -520,8 +543,8 @@ function Brand({ version }: { version?: string | null }) {
 
 function BootView() {
   return (
-    <div className="app-shell boot" data-state="disconnected" data-tauri-drag-region>
-      <div className="boot-controls" data-tauri-drag-region="false">
+    <div className="app-shell boot" data-state="disconnected" onMouseDownCapture={dragWindowFromHeader}>
+      <div className="boot-controls" data-no-window-drag>
         <WindowControls />
       </div>
       <div className="boot-card">
@@ -538,7 +561,7 @@ function WindowControls() {
   };
 
   return (
-    <div className="window-controls" data-tauri-drag-region="false">
+    <div className="window-controls" data-no-window-drag>
       <IconButton title="最小化到托盘" onClick={hideToTray}>
         <MinimizeIcon />
       </IconButton>
@@ -1156,8 +1179,8 @@ function LoginView({
   };
 
   return (
-    <div className="app-shell auth-shell" data-state="disconnected" data-tauri-drag-region>
-      <header className="appbar" data-tauri-drag-region>
+    <div className="app-shell auth-shell" data-state="disconnected" onMouseDownCapture={dragWindowFromHeader}>
+      <header className="appbar">
         <Brand version={appVersion} />
         <WindowControls />
       </header>
