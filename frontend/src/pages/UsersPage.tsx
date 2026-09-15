@@ -73,13 +73,13 @@ function ApprovalAccess({ user, onSaved }: { user: UserDto; onSaved: () => void 
     return <Typography.Text type="secondary">服务端未提供授权信息</Typography.Text>;
   }
   return (
-    <Space direction="vertical" size={4}>
+    <Space direction="vertical" size={8} className="approval-access-cell">
       <Tag>{user.accessMode === 'approval_required' ? '审批管控' : '历史权限规则'}</Tag>
       {user.approvalGrants.length === 0 && (
         <Typography.Text type="secondary">暂无审批授权</Typography.Text>
       )}
       {user.approvalGrants.map((grant) => (
-        <div key={grant.groupId}>
+        <div key={grant.groupId} className="approval-grant">
           <div>
             <Tag color={grant.expiresAt > now ? 'success' : 'error'}>
               {grant.expiresAt > now ? '有效' : '已到期'}
@@ -210,19 +210,18 @@ export function UsersPage() {
   const columns = useMemo<ProColumns<UserDto>[]>(
     () => [
       {
-        title: '用户名',
+        title: '用户 / 邮箱',
         dataIndex: 'username',
-        ellipsis: true,
-      },
-      {
-        title: '邮箱',
-        dataIndex: 'email',
-        ellipsis: true,
+        width: 200,
+        render: (_, user) => <div className="user-identity-cell">
+          <Typography.Text strong>{user.username}</Typography.Text>
+          <Typography.Text type="secondary">{user.email}</Typography.Text>
+        </div>,
       },
       {
         title: '状态',
         dataIndex: 'status',
-        width: 100,
+        width: 80,
         render: (_, record) =>
           record.status === 'active' ? (
             <Tag color="success">正常</Tag>
@@ -231,26 +230,26 @@ export function UsersPage() {
           ),
       },
       {
-        title: '飞书账号 / 状态', key: 'feishu', width: 240,
+        title: '飞书账号 / 状态', key: 'feishu', width: 210,
         render: (_, user) => user.feishuBindings?.length ? <Space direction="vertical" size={4}>
           {user.feishuBindings.map(binding => <div key={binding.unionId}>
             <div>{binding.name || '已绑定'} <Tag color={binding.blocked ? 'error' : binding.status === 'active' ? 'success' : 'default'}>{feishuStatusLabels[binding.status] || binding.status}</Tag></div>
             <Typography.Text type="secondary">{binding.email}</Typography.Text>
             <div><Typography.Text type="secondary">{binding.syncedAt ? `同步于 ${dayjs(binding.syncedAt).format('MM-DD HH:mm:ss')}` : '尚未同步'}</Typography.Text></div>
-            {binding.lastError && <Typography.Text type="danger">{binding.lastError}</Typography.Text>}
+            {binding.lastError && <Typography.Paragraph type="danger" style={{ marginBottom: 0, fontSize: 12 }} ellipsis={{ rows: 2, tooltip: binding.lastError }}>{binding.lastError}</Typography.Paragraph>}
           </div>)}
         </Space> : <Typography.Text type="secondary">未绑定</Typography.Text>,
       },
       {
         title: '人工分组',
         dataIndex: 'groupIds',
-        width: 160,
+        width: 130,
         render: (_, record) => <GroupTags groupIds={record.groupIds} />,
       },
       {
-        title: '审批授权 / 到期时间（上海）',
+        title: '审批授权 · 北京时间',
         key: 'approvalAccess',
-        width: 280,
+        width: 310,
         render: (_, record) => <ApprovalAccess user={record} onSaved={reload} />,
       },
       {
@@ -264,7 +263,8 @@ export function UsersPage() {
       {
         title: '最后登录',
         dataIndex: 'lastLoginAt',
-        width: 140,
+        width: 110,
+        responsive: ['xl'],
         render: (_, record) =>
           record.lastLoginAt ? (
             <span title={dayjs(record.lastLoginAt).format('YYYY-MM-DD HH:mm:ss')}>
@@ -277,7 +277,8 @@ export function UsersPage() {
       {
         title: '操作',
         key: 'action',
-        width: 160,
+        width: 104,
+        fixed: 'right',
         render: (_, record) => (
           <Space size="small">
             <Button
@@ -351,7 +352,7 @@ export function UsersPage() {
                 ],
               }}
             >
-              <Button type="text" size="small" icon={<MoreOutlined />} />
+              <Button type="text" size="small" aria-label={`更多操作：${record.username}`} icon={<MoreOutlined />} />
             </Dropdown>
           </Space>
         ),
@@ -363,17 +364,17 @@ export function UsersPage() {
 
   return (
     <div>
-      <Title level={4} style={{ marginBottom: 16 }}>
-        用户管理
-      </Title>
-
-      <Button onClick={syncAllFeishu} loading={feishuSyncing} style={{ marginBottom: 12 }}>同步所有已绑定飞书用户</Button>
+      <div className="page-heading">
+        <div><Title level={4} style={{ margin: 0 }}>用户管理</Title>
+          <Typography.Text type="secondary">管理账号、飞书身份和网络访问授权</Typography.Text></div>
+        <Button onClick={syncAllFeishu} loading={feishuSyncing}>同步飞书用户</Button>
+      </div>
       {feishuUser && <FeishuBindingModal key={feishuUser.id} user={feishuUser} onClose={() => setFeishuUser(null)} onSuccess={reload} />}
       <ProTable<UserDto>
         actionRef={actionRef}
         rowKey="id"
         columns={columns}
-        scroll={{ x: 1500 }}
+        scroll={{ x: 1234 }}
         search={false}
         options={{ reload: true, density: false, setting: false }}
         pagination={{ defaultPageSize: 10, showSizeChanger: true }}

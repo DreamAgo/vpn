@@ -138,6 +138,7 @@ export interface UpdateNetworkSettingsRequest {
 }
 
 export interface EmailNotificationSettings {
+  approvalEmailTemplate: { subject: string; body: string };
   enabled: boolean;
   smtpHost: string | null;
   smtpPort: number;
@@ -154,6 +155,7 @@ export interface EmailNotificationSettings {
 }
 
 export interface UpdateEmailNotificationSettingsRequest {
+  approvalEmailTemplate?: { subject: string; body: string };
   enabled: boolean;
   smtpHost?: string | null;
   smtpPort: number;

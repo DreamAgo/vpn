@@ -179,6 +179,7 @@ export function ApiKeysPage() {
 
         <Card>
           <Table<ApiKeyDto>
+        scroll={{ x: 760 }}
             rowKey="id"
             loading={isLoading}
             columns={columns}

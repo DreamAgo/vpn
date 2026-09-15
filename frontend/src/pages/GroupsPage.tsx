@@ -145,6 +145,8 @@ export function GroupsPage() {
   return (
     <div>
       <Space
+        wrap
+        className="page-heading"
         align="center"
         style={{ width: '100%', justifyContent: 'space-between', marginBottom: 16 }}
       >
@@ -162,6 +164,7 @@ export function GroupsPage() {
       </Space>
 
       <Table<UserGroupDto>
+        scroll={{ x: 740 }}
         rowKey="id"
         loading={isLoading}
         columns={columns}

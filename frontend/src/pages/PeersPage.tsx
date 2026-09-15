@@ -222,6 +222,7 @@ export function PeersPage() {
       </Title>
 
       <ProTable<AdminPeerView>
+        scroll={{ x: 1100 }}
         actionRef={actionRef}
         rowKey="id"
         columns={columns}

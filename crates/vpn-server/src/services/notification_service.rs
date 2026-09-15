@@ -3,8 +3,9 @@
 use reqwest::Url;
 use uuid::Uuid;
 use vpn_api_types::system::{
-    EmailNotificationSettings, HttpNotificationChannelSettings, NotificationEventQuery,
-    NotificationEventView, TestEmailNotificationRequest, UpdateEmailNotificationSettingsRequest,
+    ApprovalEmailTemplate, EmailNotificationSettings, HttpNotificationChannelSettings,
+    NotificationEventQuery, NotificationEventView, TestEmailNotificationRequest,
+    UpdateEmailNotificationSettingsRequest,
 };
 use vpn_core::{AppError, Result};
 
@@ -20,6 +21,7 @@ use crate::{
     },
 };
 
+const KEY_APPROVAL_TEMPLATE: &str = "notify_approval_email_template";
 const KEY_NOTIFY_EMAIL_ENABLED: &str = "notify_email_enabled";
 const KEY_NOTIFY_SMTP_HOST: &str = "notify_smtp_host";
 const KEY_NOTIFY_SMTP_PORT: &str = "notify_smtp_port";
@@ -93,7 +95,9 @@ impl NotificationService {
         let config = self.effective_config().await?;
         let rules = self.rules().await?;
         let channels = self.http_channels().await?;
-        Ok(config_to_settings(&config, rules, channels))
+        let mut settings = config_to_settings(&config, rules, channels);
+        settings.approval_email_template = self.approval_template().await?;
+        Ok(settings)
     }
 
     pub async fn update_email_settings(
@@ -104,6 +108,9 @@ impl NotificationService {
             .config_service
             .as_ref()
             .ok_or_else(|| AppError::Config("config_service 未初始化".to_string()))?;
+        if let Some(template) = &req.approval_email_template {
+            validate_approval_template(template)?;
+        }
         let current = self.effective_config().await?;
         let smtp_host = clean_opt(req.smtp_host);
         let smtp_username = clean_opt(req.smtp_username);
@@ -193,10 +200,70 @@ impl NotificationService {
         )
         .await?;
 
+        if let Some(template) = &req.approval_email_template {
+            let json =
+                serde_json::to_string(template).map_err(|e| AppError::Internal(Box::new(e)))?;
+            config_store
+                .set_string(KEY_APPROVAL_TEMPLATE, Some(&json))
+                .await?;
+        }
         let updated = self.effective_config().await?;
         let rules = self.rules().await?;
         let channels = self.http_channels().await?;
-        Ok(config_to_settings(&updated, rules, channels))
+        let mut settings = config_to_settings(&updated, rules, channels);
+        settings.approval_email_template = self.approval_template().await?;
+        Ok(settings)
+    }
+
+    async fn approval_template(&self) -> Result<ApprovalEmailTemplate> {
+        if let Some(store) = &self.config_service {
+            if let Some(json) = store.get_string(KEY_APPROVAL_TEMPLATE).await? {
+                return serde_json::from_str(&json)
+                    .map_err(|e| AppError::Config(format!("审批邮件模板配置无效：{e}")));
+            }
+        }
+        Ok(ApprovalEmailTemplate::default())
+    }
+
+    pub async fn notify_approval_approved(
+        &self,
+        mail: &crate::repositories::access_grant_repo_sqlite::ApprovalMailRow,
+    ) -> Result<()> {
+        let event = "approval_approved";
+        let template = self.approval_template().await?;
+        let context: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&mail.body).map_err(|e| AppError::Internal(Box::new(e)))?;
+        let subject =
+            render_approval_template(&template.subject, &context)?.replace(['\r', '\n'], " ");
+        let body = render_approval_template(&template.body, &context)?;
+        let key = format!("approval_approved:{}", mail.instance_code);
+        let metadata = serde_json::json!({"instance_code": mail.instance_code}).to_string();
+        let config = self.effective_config().await?;
+        if !config.email_enabled || mail.expires_at <= chrono::Utc::now().timestamp_millis() {
+            return self
+                .record_event(
+                    event,
+                    CHANNEL_EMAIL,
+                    &mail.recipient,
+                    "skipped",
+                    &subject,
+                    Some("邮件通知已关闭或授权已到期"),
+                    Some(&metadata),
+                    &key,
+                    None,
+                )
+                .await;
+        }
+        self.send_email_and_record(
+            event,
+            &mail.recipient,
+            &subject,
+            &body,
+            &key,
+            Some(&metadata),
+            true,
+        )
+        .await
     }
 
     pub async fn notify_gateway_offline(&self, gateways: &[GatewayOfflineNotice]) -> Result<()> {
@@ -533,15 +600,17 @@ impl NotificationService {
         }
         let notifier = EmailNotifier::from_config(&config)
             .ok_or_else(|| AppError::Validation("SMTP 配置不完整".to_string()))?;
-        let result = notifier
-            .send(&NotificationMessage {
-                event_type: event_type.to_string(),
-                target: target.to_string(),
-                subject: subject.to_string(),
-                body: body.to_string(),
-                metadata: metadata.map(str::to_string),
-            })
-            .await;
+        let message = NotificationMessage {
+            event_type: event_type.to_string(),
+            target: target.to_string(),
+            subject: subject.to_string(),
+            body: body.to_string(),
+            metadata: metadata.map(str::to_string),
+        };
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(45), notifier.send(&message))
+                .await
+                .unwrap_or_else(|_| Err(AppError::Config("SMTP 发送超时".into())));
 
         match result {
             Ok(()) => {
@@ -691,6 +760,7 @@ fn config_to_settings(
     channels: HttpChannels,
 ) -> EmailNotificationSettings {
     EmailNotificationSettings {
+        approval_email_template: ApprovalEmailTemplate::default(),
         enabled: config.email_enabled,
         smtp_host: config.smtp_host.clone(),
         smtp_port: config.smtp_port,
@@ -791,4 +861,197 @@ fn gateway_metadata(gateway: &GatewayOfflineNotice) -> String {
         "last_seen_at": gateway.last_seen_at,
     })
     .to_string()
+}
+
+const APPROVAL_VARIABLES: [&str; 5] = [
+    "username",
+    "applicant_email",
+    "user_groups",
+    "expires_at",
+    "instance_code",
+];
+
+fn render_approval_template(
+    template: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    let mut rest = template;
+    let mut output = String::new();
+    while let Some(start) = rest.find("{{") {
+        let literal = &rest[..start];
+        if literal.contains("}}") {
+            return Err(AppError::Validation("邮件模板变量括号不匹配".into()));
+        }
+        output.push_str(literal);
+        rest = &rest[start + 2..];
+        let end = rest
+            .find("}}")
+            .ok_or_else(|| AppError::Validation("邮件模板变量括号不匹配".into()))?;
+        let name = rest[..end].trim();
+        if !APPROVAL_VARIABLES.contains(&name) {
+            return Err(AppError::Validation(format!(
+                "不支持的邮件模板变量：{name}"
+            )));
+        }
+        output.push_str(
+            values
+                .get(name)
+                .ok_or_else(|| AppError::Validation(format!("邮件模板变量缺失：{name}")))?,
+        );
+        rest = &rest[end + 2..];
+    }
+    if rest.contains("}}") {
+        return Err(AppError::Validation("邮件模板变量括号不匹配".into()));
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn validate_approval_template(template: &ApprovalEmailTemplate) -> Result<()> {
+    if template.subject.trim().is_empty()
+        || template.subject.chars().count() > 200
+        || template.subject.contains(['\r', '\n'])
+    {
+        return Err(AppError::Validation(
+            "邮件主题须为 1–200 字且不能包含换行".into(),
+        ));
+    }
+    if template.body.trim().is_empty() || template.body.chars().count() > 20_000 {
+        return Err(AppError::Validation("邮件正文须为 1–20000 字".into()));
+    }
+    let values = APPROVAL_VARIABLES
+        .iter()
+        .map(|name| (name.to_string(), String::new()))
+        .collect();
+    render_approval_template(&template.subject, &values)?;
+    render_approval_template(&template.body, &values)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod approval_mail_tests {
+    use super::*;
+
+    #[test]
+    fn templates_validate_and_replace_values_without_recursive_expansion() {
+        validate_approval_template(&ApprovalEmailTemplate::default()).unwrap();
+        let values = std::collections::BTreeMap::from([
+            ("username".into(), "alice {{instance_code}}".into()),
+            ("user_groups".into(), "研发、运维".into()),
+        ]);
+        assert_eq!(
+            render_approval_template("你好 {{ username }}，授权 {{user_groups}}", &values).unwrap(),
+            "你好 alice {{instance_code}}，授权 研发、运维"
+        );
+        for value in ["{{password}}", "{{username", "username}}", "{{{{username}}"] {
+            assert!(render_approval_template(value, &values).is_err());
+        }
+        assert!(validate_approval_template(&ApprovalEmailTemplate {
+            subject: "x\r\nBcc: other@example.com".into(),
+            body: "ok".into()
+        })
+        .is_err());
+        assert!(validate_approval_template(&ApprovalEmailTemplate {
+            subject: "ok".into(),
+            body: " ".into()
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_or_expired_mail_is_skipped_and_missing_smtp_is_recorded_as_failed() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        let mut service = NotificationService::new(NotificationConfig {
+            email_enabled: false,
+            smtp_host: None,
+            smtp_port: 25,
+            smtp_username: None,
+            smtp_password: None,
+            email_from: None,
+            email_to: vec!["admin@example.com".into()],
+        });
+        service.event_repo = Some(SqliteNotificationEventRepository::new(pool.clone()));
+        service.config_service = Some(ConfigService::new(
+            crate::repositories::SqliteSystemConfigRepository::new(pool.clone()),
+        ));
+        let settings = service.email_settings().await.unwrap();
+        let mut request: UpdateEmailNotificationSettingsRequest =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        request.approval_email_template = Some(ApprovalEmailTemplate {
+            subject: "通过：{{username}}".into(),
+            body: "授权：{{user_groups}}".into(),
+        });
+        service
+            .update_email_settings(request.clone())
+            .await
+            .unwrap();
+        request.approval_email_template = None;
+        let saved = service
+            .update_email_settings(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(saved.approval_email_template.subject, "通过：{{username}}");
+        request.approval_email_template = Some(ApprovalEmailTemplate {
+            subject: "{{password}}".into(),
+            body: "invalid".into(),
+        });
+        assert!(service.update_email_settings(request).await.is_err());
+        assert_eq!(
+            service
+                .email_settings()
+                .await
+                .unwrap()
+                .approval_email_template
+                .subject,
+            "通过：{{username}}"
+        );
+        // The rest of this test controls defaults directly, without runtime overrides.
+        service.config_service = None;
+        let mut mail = crate::repositories::access_grant_repo_sqlite::ApprovalMailRow {
+            instance_code: "instance".into(), recipient: "applicant@example.com".into(),
+            body: serde_json::json!({"username":"alice","applicant_email":"applicant@example.com","user_groups":"研发","expires_at":"明日","instance_code":"instance"}).to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 86_400_000,
+            done: false, attempts: 1, next_attempt_at: 0, last_error: None,
+        };
+        service.notify_approval_approved(&mail).await.unwrap();
+        service.defaults.email_enabled = true;
+        assert!(service.notify_approval_approved(&mail).await.is_err());
+        mail.expires_at = 0;
+        service.notify_approval_approved(&mail).await.unwrap();
+        let rows = service
+            .event_repo()
+            .unwrap()
+            .list(Some("approval_approved"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.target == "applicant@example.com"));
+        assert_eq!(rows.iter().filter(|r| r.status == "skipped").count(), 2);
+        assert_eq!(rows.iter().filter(|r| r.status == "failed").count(), 1);
+        assert_eq!(
+            service
+                .event_repo()
+                .unwrap()
+                .list(None, Some("failed"), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .event_repo()
+                .unwrap()
+                .list(Some("approval_approved"), Some("skipped"), 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

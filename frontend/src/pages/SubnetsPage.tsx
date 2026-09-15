@@ -160,6 +160,8 @@ export function SubnetsPage() {
   return (
     <div>
       <Space
+        wrap
+        className="page-heading"
         align="center"
         style={{ width: '100%', justifyContent: 'space-between', marginBottom: 16 }}
       >
@@ -175,6 +177,7 @@ export function SubnetsPage() {
       </Space>
 
       <Table<SubnetDto>
+        scroll={{ x: 760 }}
         rowKey="id"
         loading={isLoading}
         columns={columns}

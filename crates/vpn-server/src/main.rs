@@ -298,13 +298,20 @@ async fn run(
     } else {
         None
     };
+    let notification_service = Arc::new(NotificationService::new_with_config_service(
+        config.notifications.clone(),
+        config_service.as_ref().clone(),
+        SqliteNotificationEventRepository::new(pool.clone()),
+    ));
+
     let feishu_approval_service = if config.feishu_approval.enabled() {
         let mut service = FeishuApprovalService::new(
             config.feishu_approval.clone(),
             SqliteAccessGrantRepository::new(pool.clone()),
             Arc::new(ReqwestFeishuApprovalApi::new(config.feishu.clone())?),
             hasher,
-        );
+        )
+        .with_notifications(notification_service.clone());
         if let Some(network_acl) = &network_acl_service {
             service = service.with_network_acl(network_acl.clone());
         }
@@ -324,11 +331,6 @@ async fn run(
     let domain_event_service = Arc::new(DomainEventService::new(SqliteDomainEventRepository::new(
         pool.clone(),
     )));
-    let notification_service = Arc::new(NotificationService::new_with_config_service(
-        config.notifications.clone(),
-        config_service.as_ref().clone(),
-        SqliteNotificationEventRepository::new(pool.clone()),
-    ));
 
     // Story 4.6：后台离线检测任务（每 30s 扫描；panic/错误不影响主进程）
     spawn_offline_scanner(

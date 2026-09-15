@@ -19,7 +19,7 @@ use crate::{
     state::AppState,
 };
 
-const BACKUP_FORMAT_VERSION: u32 = 3;
+const BACKUP_FORMAT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupArchive {
@@ -31,6 +31,8 @@ pub struct BackupArchive {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackupTables {
+    #[serde(default)]
+    approval_mail_outbox: Vec<crate::repositories::access_grant_repo_sqlite::ApprovalMailRow>,
     users: Vec<UserRow>,
     user_groups: Vec<UserGroupRow>,
     user_group_members: Vec<UserGroupMemberRow>,
@@ -234,7 +236,7 @@ pub async fn restore_backup(
 ) -> Result<Json<ApiResponse<RestoreResponse>>, ApiError> {
     // v1 备份没有审批字段，serde default 会按 legacy/空授权安全恢复；新版导出使用 v2，
     // 让旧版服务端明确拒绝而不是忽略授权字段后把账号静默降级。
-    if !matches!(archive.format_version, 1 | 2 | BACKUP_FORMAT_VERSION) {
+    if !matches!(archive.format_version, 1 | 2 | 3 | BACKUP_FORMAT_VERSION) {
         return Err(
             AppError::Validation(format!("不支持的备份版本: {}", archive.format_version)).into(),
         );
@@ -348,6 +350,8 @@ async fn create_backup(pool: &SqlitePool) -> Result<BackupArchive, AppError> {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?,
+        approval_mail_outbox: sqlx::query_as("SELECT * FROM approval_mail_outbox ORDER BY instance_code")
+            .fetch_all(&mut *tx).await.map_err(|e| AppError::Database(Box::new(e)))?,
         feishu_approval_inbox: sqlx::query_as::<_, ApprovalInboxRow>(
             "SELECT event_id, instance_code, payload_hash, payload, status, attempts, next_attempt_at, last_error, created_at, updated_at FROM feishu_approval_inbox ORDER BY created_at",
         )
@@ -379,6 +383,7 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
         .map_err(|e| AppError::Database(Box::new(e)))?;
 
     for table in [
+        "approval_mail_outbox",
         "feishu_approval_inbox",
         "feishu_contact_inbox",
         "feishu_user_states",
@@ -401,6 +406,12 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
             .map_err(|e| AppError::Database(Box::new(e)))?;
     }
 
+    for row in &archive.tables.approval_mail_outbox {
+        sqlx::query("INSERT INTO approval_mail_outbox(instance_code,recipient,body,expires_at,done,attempts,next_attempt_at,last_error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")
+            .bind(&row.instance_code).bind(&row.recipient).bind(&row.body).bind(row.expires_at)
+            .bind(row.done).bind(row.attempts).bind(row.next_attempt_at).bind(&row.last_error)
+            .execute(&mut *tx).await.map_err(|e| AppError::Database(Box::new(e)))?;
+    }
     insert_users(&mut tx, &archive.tables.users).await?;
     insert_user_groups(&mut tx, &archive.tables.user_groups).await?;
     insert_external_identities(&mut tx, &archive.tables.external_identities).await?;
@@ -707,8 +718,9 @@ mod directory_backup_tests {
             .unwrap();
         sqlx::query("INSERT INTO feishu_user_states(subject,app_id,status,blocked,last_event_at) VALUES('union1','app','frozen',1,100)").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO feishu_contact_inbox(event_id,app_id,user_id,id_type,event_type,event_at,payload_hash) VALUES('e1','app','union1','union_id','contact.user.updated_v3',100,'hash')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO approval_mail_outbox(instance_code,recipient,body,expires_at,done,attempts,next_attempt_at) VALUES('mail1','a@example.com','approved',999999,1,2,100)").execute(&pool).await.unwrap();
         let archive = create_backup(&pool).await.unwrap();
-        assert_eq!(archive.format_version, 3);
+        assert_eq!(archive.format_version, 4);
         let encoded = serde_json::to_vec(&archive).unwrap();
         let archive: BackupArchive = serde_json::from_slice(&encoded).unwrap();
         restore_archive(&pool, &archive).await.unwrap();
@@ -727,5 +739,12 @@ mod directory_backup_tests {
                 .await
                 .unwrap();
         assert_eq!(pending, 1);
+        let mail: (bool, i64) = sqlx::query_as(
+            "SELECT done,attempts FROM approval_mail_outbox WHERE instance_code='mail1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mail, (true, 2));
     }
 }
