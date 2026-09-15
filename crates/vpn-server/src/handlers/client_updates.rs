@@ -26,6 +26,8 @@ pub async fn status(
 pub struct Settings {
     auto_sync: bool,
     public_base_url: String,
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 pub async fn configure(
     State(state): State<AppState>,
@@ -34,7 +36,11 @@ pub async fn configure(
     Json(settings): Json<Settings>,
 ) -> Result<Json<ApiResponse<UpdateStatus>>, ApiError> {
     service
-        .configure(settings.auto_sync, &settings.public_base_url)
+        .configure(
+            settings.auto_sync,
+            &settings.public_base_url,
+            settings.proxy_url.as_deref(),
+        )
         .await
         .map_err(AppError::Validation)?;
     Ok(Json(ApiResponse::success(
@@ -114,7 +120,7 @@ mod tests {
             .uri("/versions")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"auto_sync":true,"public_base_url":"https://vpn.example"}"#,
+                r#"{"auto_sync":true,"public_base_url":"https://vpn.example","proxy_url":"http://127.0.0.1:7897"}"#,
             ))
             .unwrap();
         request.extensions_mut().insert(CurrentUser {
@@ -126,5 +132,9 @@ mod tests {
             StatusCode::OK
         );
         assert!(service.status().await.record.auto_sync);
+        assert_eq!(
+            service.status().await.record.proxy_url,
+            "http://127.0.0.1:7897/"
+        );
     }
 }

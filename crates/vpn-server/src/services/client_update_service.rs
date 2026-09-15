@@ -49,6 +49,8 @@ pub struct SyncRecord {
     pub auto_sync: bool,
     #[serde(default)]
     pub public_base_url: String,
+    #[serde(default)]
+    pub proxy_url: String,
     pub last_checked_at: Option<i64>,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
@@ -137,8 +139,14 @@ impl ClientUpdateService {
             manifest,
         }
     }
-    pub async fn configure(&self, enabled: bool, base_url: &str) -> Result<()> {
+    pub async fn configure(
+        &self,
+        enabled: bool,
+        base_url: &str,
+        proxy_url: Option<&str>,
+    ) -> Result<()> {
         let base_url = normalize_base(base_url)?;
+        let proxy_url = proxy_url.map(normalize_proxy).transpose()?;
         let _guard = self
             .gate
             .try_lock()
@@ -150,6 +158,9 @@ impl ClientUpdateService {
         }
         next.auto_sync = enabled;
         next.public_base_url = base_url;
+        if let Some(proxy_url) = proxy_url {
+            next.proxy_url = proxy_url;
+        }
         atomic_json(&self.root.join("client-update-sync.json"), &next).await?;
         *record = next;
         Ok(())
@@ -219,19 +230,8 @@ impl ClientUpdateService {
     }
     async fn fetch_and_publish(&self, stage: &Path, base: &str) -> Result<()> {
         let base = normalize_base(base)?;
-        let client = reqwest::Client::builder()
-            .user_agent("yilian-client-update-sync")
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() < 5 && allowed_host(attempt.url()) {
-                    attempt.follow()
-                } else {
-                    attempt.error("unexpected GitHub redirect")
-                }
-            }))
-            .build()
-            .map_err(|_| "无法创建 GitHub 客户端".to_string())?;
+        let proxy_url = self.record.lock().await.proxy_url.clone();
+        let client = github_client(&proxy_url)?;
         let bytes = download(
             &client,
             &format!("https://api.github.com/repos/{REPO}/releases/latest"),
@@ -504,6 +504,46 @@ async fn download_package(client: &reqwest::Client, asset: &Asset, path: &Path) 
     drop(file);
     verify_file(path, asset).await
 }
+fn normalize_proxy(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "代理地址格式无效，请填写 http://主机:端口 或 https://主机:端口")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("代理只支持 HTTP/HTTPS 地址，不能包含路径、查询参数或片段".into());
+    }
+    Ok(url.to_string())
+}
+
+fn github_client(proxy_url: &str) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .user_agent("yilian-client-update-sync")
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() < 5 && allowed_host(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("unexpected GitHub redirect")
+            }
+        }));
+    let proxy_url = normalize_proxy(proxy_url)?;
+    if !proxy_url.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(&proxy_url).map_err(|_| "代理地址无效")?);
+    }
+    builder
+        .build()
+        .map_err(|_| "无法创建 GitHub 客户端".to_string())
+}
+
 fn allowed_host(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
         && matches!(
@@ -612,7 +652,16 @@ async fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
     let bytes = serde_json::to_vec_pretty(value).map_err(|_| "无法序列化版本信息")?;
     let result = async {
-        tokio::fs::write(&tmp, bytes).await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if path.file_name().and_then(|name| name.to_str()) == Some("client-update-sync.json") {
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        drop(file);
         tokio::fs::rename(&tmp, path).await
     }
     .await;
@@ -625,6 +674,72 @@ async fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn proxy_validation_and_old_settings() {
+        assert_eq!(normalize_proxy("  ").unwrap(), "");
+        assert_eq!(
+            normalize_proxy(" http://proxy.example:7897 ").unwrap(),
+            "http://proxy.example:7897/"
+        );
+        assert!(normalize_proxy("https://user:password@proxy.example:443").is_ok());
+        for invalid in [
+            "proxy:7897",
+            "socks5://proxy:1080",
+            "http://proxy/path",
+            "http://proxy?q=1",
+            "http://proxy/#fragment",
+        ] {
+            assert!(normalize_proxy(invalid).is_err());
+        }
+        let record: SyncRecord = serde_json::from_str(r#"{"auto_sync":false}"#).unwrap();
+        assert!(record.proxy_url.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_requests_use_configured_proxy() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let n = socket.read(&mut bytes).await.unwrap();
+                requests.push(String::from_utf8_lossy(&bytes[..n]).to_string());
+                socket
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        let client = github_client(&format!("http://{address}")).unwrap();
+        for host in [
+            "api.github.com",
+            "github.com",
+            "release-assets.githubusercontent.com",
+        ] {
+            assert!(client
+                .get(format!("https://{host}/test"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .is_err());
+        }
+        let requests = tokio::time::timeout(Duration::from_secs(3), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+        for (request, host) in requests.iter().zip([
+            "api.github.com",
+            "github.com",
+            "release-assets.githubusercontent.com",
+        ]) {
+            assert!(request.starts_with(&format!("CONNECT {host}:443 HTTP/1.1")));
+        }
+    }
+
     fn fixture() -> (Manifest, Release, Vec<(String, Vec<u8>)>) {
         let mut manifest = Manifest {
             version: "0.1.21".into(),
@@ -783,7 +898,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = Arc::new(ClientUpdateService::new(dir.path().to_owned()));
         service
-            .configure(true, "https://vpn.example")
+            .configure(true, "https://vpn.example", Some("http://127.0.0.1:7897"))
             .await
             .unwrap();
         let restored = ClientUpdateService::new(dir.path().to_owned());
@@ -792,10 +907,32 @@ mod tests {
             restored.status().await.record.public_base_url,
             "https://vpn.example"
         );
+        assert_eq!(
+            restored.status().await.record.proxy_url,
+            "http://127.0.0.1:7897/"
+        );
+        restored
+            .configure(true, "https://vpn.example", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.status().await.record.proxy_url,
+            "http://127.0.0.1:7897/"
+        );
+        restored
+            .configure(true, "https://vpn.example", Some(""))
+            .await
+            .unwrap();
+        assert!(ClientUpdateService::new(dir.path().to_owned())
+            .status()
+            .await
+            .record
+            .proxy_url
+            .is_empty());
         let _lock = service.gate.lock().await;
         assert!(service.queue().is_err());
         assert!(service
-            .configure(false, "https://vpn.example")
+            .configure(false, "https://vpn.example", None)
             .await
             .is_err());
     }
@@ -850,7 +987,7 @@ mod tests {
         let root = std::env::var("VPN_UPDATE_TEST_DIR").expect("isolated test directory required");
         let service = ClientUpdateService::new(PathBuf::from(root));
         service
-            .configure(false, "http://127.0.0.1:18081")
+            .configure(false, "http://127.0.0.1:18081", None)
             .await
             .unwrap();
         service.sync().await.unwrap();
