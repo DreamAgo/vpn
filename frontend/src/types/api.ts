@@ -325,18 +325,19 @@ export interface SubnetDto {
   id: string;
   name: string;
   cidr: string;
+  cidrs: string[];
   usageCount: number; // 被用户组/节点/服务端路由引用的次数
   createdAt: number;
 }
 
 export interface CreateSubnetRequest {
   name: string;
-  cidr: string;
+  cidrs: string[];
 }
 
 export interface UpdateSubnetRequest {
   name?: string;
-  cidr?: string;
+  cidrs?: string[];
 }
 
 export interface CreateUserRequest {

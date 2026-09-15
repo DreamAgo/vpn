@@ -31,9 +31,9 @@ impl SubnetService {
     pub async fn create(&self, name: &str, cidr: &str) -> Result<SubnetDto> {
         let name = name.trim();
         if name.is_empty() {
-            return Err(AppError::Config("网段名称不能为空".to_string()));
+            return Err(AppError::Config("网段组名称不能为空".to_string()));
         }
-        let cidr = normalize_one(cidr)?;
+        let cidr = normalize_group(cidr)?;
         let id = Uuid::now_v7().to_string();
         let row = self.repo.insert(&id, name, &cidr).await?;
         // 该 CIDR 可能此前已被手填进某些组/节点 → 体现既有引用数。
@@ -51,21 +51,21 @@ impl SubnetService {
             Some(n) => {
                 let t = n.trim();
                 if t.is_empty() {
-                    return Err(AppError::Validation("网段名称不能为空".to_string()));
+                    return Err(AppError::Validation("网段组名称不能为空".to_string()));
                 }
                 Some(t.to_string())
             }
             None => None,
         };
         let cidr_owned = match cidr {
-            Some(c) => Some(normalize_one(c)?),
+            Some(c) => Some(normalize_group(c)?),
             None => None,
         };
         let affected = self
             .repo
             .update(id, name_owned.as_deref(), cidr_owned.as_deref())
             .await?;
-        if affected == 0 {
+        if affected == 0 && (name_owned.is_some() || cidr_owned.is_some()) {
             return Err(AppError::ResourceNotFound(format!("网段不存在: {id}")));
         }
         let row = self
@@ -85,18 +85,25 @@ impl SubnetService {
     }
 }
 
-/// 校验并归一化单个 CIDR（如 192.168.1.5/24 → 192.168.1.0/24）。
-fn normalize_one(cidr: &str) -> Result<String> {
-    normalize_subnets(&[cidr.to_string()])?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Validation("网段不能为空".to_string()))
+/// 解析多行/CSV 输入，校验全部 CIDR 后归一化、去重并保存。
+fn normalize_group(cidr: &str) -> Result<String> {
+    let entries: Vec<String> = cidr
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '，')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let normalized = normalize_subnets(&entries)?;
+    if normalized.is_empty() {
+        return Err(AppError::Validation("网段组至少需要一个 CIDR".into()));
+    }
+    Ok(normalized.join(","))
 }
 
 fn row_to_dto(r: SubnetRow, usage_count: u32) -> SubnetDto {
     SubnetDto {
         id: r.id,
         name: r.name,
+        cidrs: r.cidr.split(',').map(str::to_owned).collect(),
         cidr: r.cidr,
         usage_count,
         created_at: r.created_at,
@@ -132,6 +139,34 @@ mod tests {
         assert_eq!(d.cidr, "192.168.1.0/24"); // 已归一化
         assert!(s.create("x", "bad").await.is_err());
         assert!(s.create("  ", "10.0.0.0/8").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn group_round_trip_and_invalid_update_is_atomic() {
+        let s = svc().await;
+        let input = "135.10.0.0/16\n10.196.184.7/24 10.196.163.126/32,10.196.176.0/24，10.196.153.0/24\r\n10.196.185.0/24\t10.179.195.0/24\n10.196.184.0/24";
+        let group = s.create("贵州内网", input).await.unwrap();
+        assert_eq!(group.cidrs.len(), 7);
+        assert_eq!(group.cidrs[1], "10.196.184.0/24");
+        assert_eq!(s.list().await.unwrap()[0].cidrs, group.cidrs);
+        assert!(s
+            .update(&group.id, Some("changed"), Some("10.0.0.0/8\nbad"))
+            .await
+            .is_err());
+        assert_eq!(s.list().await.unwrap()[0].name, "贵州内网");
+        assert_eq!(s.list().await.unwrap()[0].cidrs, group.cidrs);
+        for input in ["", " \n,，", "0.0.0.0/0", "::1/128"] {
+            assert!(s.create("invalid", input).await.is_err());
+        }
+        assert_eq!(
+            s.update(&group.id, None, None).await.unwrap().cidrs,
+            group.cidrs
+        );
+        let updated = s
+            .update(&group.id, None, Some("10.0.0.0/8\n172.16.0.0/12"))
+            .await
+            .unwrap();
+        assert_eq!(updated.cidrs, vec!["10.0.0.0/8", "172.16.0.0/12"]);
     }
 
     #[tokio::test]

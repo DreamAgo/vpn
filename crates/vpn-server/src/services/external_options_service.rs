@@ -55,7 +55,7 @@ impl ExternalOptionProvider for SubnetExternalOptionProvider {
             .into_iter()
             .map(|subnet| ExternalOptionItem {
                 id: subnet.id,
-                label: format!("{}（{}）", subnet.name, subnet.cidr),
+                label: format!("{}（{}）", subnet.name, subnet.cidr.replace(',', "、")),
                 is_default: false,
             })
             .collect())
