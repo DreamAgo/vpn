@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 use lettre::{
-    message::Mailbox, transport::smtp::authentication::Credentials, AsyncSmtpTransport,
-    AsyncTransport, Message, Tokio1Executor,
+    message::{Mailbox, MultiPart, SinglePart},
+    transport::smtp::authentication::Credentials,
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use vpn_core::{AppError, Result};
 
@@ -15,6 +16,7 @@ pub struct NotificationMessage {
     pub target: String,
     pub subject: String,
     pub body: String,
+    pub html_body: Option<String>,
     pub metadata: Option<String>,
 }
 
@@ -56,12 +58,7 @@ impl Notifier for EmailNotifier {
     }
 
     async fn send(&self, message: &NotificationMessage) -> Result<()> {
-        let email = Message::builder()
-            .from(parse_mailbox(&self.from)?)
-            .to(parse_mailbox(&message.target)?)
-            .subject(&message.subject)
-            .body(message.body.clone())
-            .map_err(|e| AppError::Internal(Box::new(e)))?;
+        let email = build_email(&self.from, message)?;
         self.mailer
             .send(email)
             .await
@@ -142,5 +139,58 @@ fn http_payload(
             "text": body,
             "metadata": metadata.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         }),
+    }
+}
+
+fn build_email(from: &str, message: &NotificationMessage) -> Result<Message> {
+    let builder = Message::builder()
+        .from(parse_mailbox(from)?)
+        .to(parse_mailbox(&message.target)?)
+        .subject(&message.subject);
+    if let Some(html) = &message.html_body {
+        builder.multipart(
+            MultiPart::alternative()
+                .singlepart(SinglePart::plain(message.body.clone()))
+                .singlepart(SinglePart::html(html.clone())),
+        )
+    } else {
+        builder.body(message.body.clone())
+    }
+    .map_err(|e| AppError::Internal(Box::new(e)))
+}
+
+#[cfg(test)]
+mod html_mail_tests {
+    use super::*;
+
+    #[test]
+    fn html_mail_has_plain_alternative_and_legacy_mail_stays_plain() {
+        let mut message = NotificationMessage {
+            event_type: "approval_approved".into(),
+            target: "user@example.com".into(),
+            subject: "Approved".into(),
+            body: "Approved account".into(),
+            html_body: Some("<h1>Approved account</h1>".into()),
+            metadata: None,
+        };
+        let mime = String::from_utf8(
+            build_email("vpn@example.com", &message)
+                .unwrap()
+                .formatted(),
+        )
+        .unwrap();
+        assert!(mime.contains("multipart/alternative"));
+        assert!(mime.contains("text/plain"));
+        assert!(mime.contains("text/html"));
+        assert!(mime.find("text/plain").unwrap() < mime.find("text/html").unwrap());
+        message.html_body = None;
+        let mime = String::from_utf8(
+            build_email("vpn@example.com", &message)
+                .unwrap()
+                .formatted(),
+        )
+        .unwrap();
+        assert!(!mime.contains("text/html"));
+        assert!(mime.contains("Approved account"));
     }
 }

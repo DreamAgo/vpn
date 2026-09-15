@@ -235,7 +235,20 @@ impl NotificationService {
             serde_json::from_str(&mail.body).map_err(|e| AppError::Internal(Box::new(e)))?;
         let subject =
             render_approval_template(&template.subject, &context)?.replace(['\r', '\n'], " ");
-        let body = render_approval_template(&template.body, &context)?;
+        let escaped = context
+            .iter()
+            .map(|(k, v)| (k.clone(), escape_html(v)))
+            .collect();
+        let html_body = if template.html {
+            Some(render_approval_template(&template.body, &escaped)?)
+        } else {
+            None
+        };
+        let body = if template.html {
+            render_approval_template("您的 VPN 审批已通过。\n账号：{{username}}\n企业邮箱：{{applicant_email}}\n授权用户组：{{user_groups}}\n授权截止时间（北京时间）：{{expires_at}}\n审批编号：{{instance_code}}\n请使用飞书登录易链客户端。", &context)?
+        } else {
+            render_approval_template(&template.body, &context)?
+        };
         let key = format!("approval_approved:{}", mail.instance_code);
         let metadata = serde_json::json!({"instance_code": mail.instance_code}).to_string();
         let config = self.effective_config().await?;
@@ -259,6 +272,7 @@ impl NotificationService {
             &mail.recipient,
             &subject,
             &body,
+            html_body.as_deref(),
             &key,
             Some(&metadata),
             true,
@@ -301,6 +315,7 @@ impl NotificationService {
                 &recipient,
                 &subject,
                 &body,
+                None,
                 "test_email",
                 Some(&metadata),
                 false,
@@ -406,6 +421,7 @@ impl NotificationService {
                         to,
                         &subject,
                         &body,
+                        None,
                         &dedupe_key,
                         Some(&metadata),
                         true,
@@ -573,6 +589,7 @@ impl NotificationService {
         target: &str,
         subject: &str,
         body: &str,
+        html_body: Option<&str>,
         dedupe_key: &str,
         metadata: Option<&str>,
         require_enabled: bool,
@@ -605,6 +622,7 @@ impl NotificationService {
             target: target.to_string(),
             subject: subject.to_string(),
             body: body.to_string(),
+            html_body: html_body.map(str::to_string),
             metadata: metadata.map(str::to_string),
         };
         let result =
@@ -672,6 +690,7 @@ impl NotificationService {
                 target: url.to_string(),
                 subject: subject.to_string(),
                 body: body.to_string(),
+                html_body: None,
                 metadata: metadata.map(str::to_string),
             })
             .await;
@@ -871,6 +890,15 @@ const APPROVAL_VARIABLES: [&str; 5] = [
     "instance_code",
 ];
 
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn render_approval_template(
     template: &str,
     values: &std::collections::BTreeMap<String, String>,
@@ -933,6 +961,23 @@ mod approval_mail_tests {
     use super::*;
 
     #[test]
+    fn html_variables_are_escaped_and_legacy_templates_remain_plain() {
+        let legacy: ApprovalEmailTemplate =
+            serde_json::from_str(r#"{"subject":"Approved","body":"{{username}}"}"#).unwrap();
+        assert!(!legacy.html);
+        assert!(ApprovalEmailTemplate::default().html);
+        let values = std::collections::BTreeMap::from([(
+            "username".into(),
+            escape_html("<img src=x> & \"quoted\" 'value' {{instance_code}}"),
+        )]);
+        let rendered = render_approval_template("<p>{{username}}</p>", &values).unwrap();
+        assert_eq!(
+            rendered,
+            "<p>&lt;img src=x&gt; &amp; &quot;quoted&quot; &#39;value&#39; {{instance_code}}</p>"
+        );
+    }
+
+    #[test]
     fn templates_validate_and_replace_values_without_recursive_expansion() {
         validate_approval_template(&ApprovalEmailTemplate::default()).unwrap();
         let values = std::collections::BTreeMap::from([
@@ -947,11 +992,13 @@ mod approval_mail_tests {
             assert!(render_approval_template(value, &values).is_err());
         }
         assert!(validate_approval_template(&ApprovalEmailTemplate {
+            html: false,
             subject: "x\r\nBcc: other@example.com".into(),
             body: "ok".into()
         })
         .is_err());
         assert!(validate_approval_template(&ApprovalEmailTemplate {
+            html: false,
             subject: "ok".into(),
             body: " ".into()
         })
@@ -983,6 +1030,7 @@ mod approval_mail_tests {
         let mut request: UpdateEmailNotificationSettingsRequest =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         request.approval_email_template = Some(ApprovalEmailTemplate {
+            html: false,
             subject: "通过：{{username}}".into(),
             body: "授权：{{user_groups}}".into(),
         });
@@ -997,6 +1045,7 @@ mod approval_mail_tests {
             .unwrap();
         assert_eq!(saved.approval_email_template.subject, "通过：{{username}}");
         request.approval_email_template = Some(ApprovalEmailTemplate {
+            html: false,
             subject: "{{password}}".into(),
             body: "invalid".into(),
         });

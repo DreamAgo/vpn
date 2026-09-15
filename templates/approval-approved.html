@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>VPN 审批已通过</title></head>
+<body style="margin:0;padding:24px 12px;background:#f1f5f9;color:#1e293b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td align="center">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
+<tr><td style="padding:28px 32px;background:#172554;color:#ffffff;"><div style="font-size:20px;font-weight:700;letter-spacing:2px;">易链</div><div style="margin-top:6px;font-size:12px;color:#bfdbfe;">安全接入 · 授权通知</div></td></tr>
+<tr><td style="padding:32px;">
+<div style="display:inline-block;padding:6px 12px;background:#dcfce7;color:#166534;border-radius:20px;font-size:12px;font-weight:600;">✓ 审批已通过</div>
+<h1 style="margin:20px 0 12px;font-size:26px;line-height:1.4;color:#0f172a;">您的 VPN 访问权限已开通</h1>
+<p style="margin:0 0 24px;font-size:14px;line-height:1.8;color:#64748b;">您好，{{username}}。您的飞书审批已通过，以下访问授权已生效。</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7;border-top:1px solid #e2e8f0;table-layout:fixed;">
+<tr><td width="90" style="padding:14px 0;color:#64748b;border-bottom:1px solid #e2e8f0;">登录账号</td><td style="padding:14px 0;border-bottom:1px solid #e2e8f0;word-break:break-all;">{{username}}</td></tr>
+<tr><td style="padding:14px 0;color:#64748b;border-bottom:1px solid #e2e8f0;">企业邮箱</td><td style="padding:14px 0;border-bottom:1px solid #e2e8f0;word-break:break-all;">{{applicant_email}}</td></tr>
+<tr><td style="padding:14px 0;color:#64748b;border-bottom:1px solid #e2e8f0;">授权用户组</td><td style="padding:14px 0;border-bottom:1px solid #e2e8f0;word-break:break-all;">{{user_groups}}</td></tr>
+</table>
+<div style="margin-top:24px;padding:18px 20px;background:#eff6ff;border-left:3px solid #2563eb;border-radius:6px;"><div style="font-size:12px;color:#1d4ed8;">授权截止时间 · 北京时间</div><div style="margin-top:6px;font-size:18px;font-weight:600;color:#1e3a8a;word-break:break-word;">{{expires_at}}</div><div style="margin-top:6px;font-size:12px;color:#64748b;">授权到此时间失效，如需继续使用，请提前申请。</div></div>
+<h2 style="margin:28px 0 8px;font-size:15px;color:#0f172a;">开始使用</h2>
+<p style="margin:0;font-size:14px;line-height:1.8;color:#475569;">打开易链客户端，使用飞书登录后连接 VPN，即可访问已授权的网络。</p>
+</td></tr>
+<tr><td style="padding:20px 32px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:11px;line-height:1.8;color:#64748b;word-break:break-all;">审批编号：{{instance_code}}<br>此邮件由易链自动发送。如有疑问，请联系管理员。</td></tr>
+</table>
+</td></tr></table>
+</body></html>

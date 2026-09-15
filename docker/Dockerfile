@@ -33,6 +33,7 @@ WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+COPY templates/ /app/templates/
 RUN npm run build
 
 # ===== Stage 4: builder =====
