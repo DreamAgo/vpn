@@ -405,7 +405,7 @@ impl FeishuApprovalService {
                     .await?;
             }
             Err(error) => {
-                tracing::warn!(event_id = %item.event_id, "飞书审批任务稍后重试");
+                tracing::warn!(event_id = %item.event_id, error = ?error, "飞书审批任务稍后重试");
                 self.repo
                     .retry(&item.event_id, item.attempts, error_class(&error))
                     .await?;
