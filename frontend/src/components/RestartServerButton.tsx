@@ -56,7 +56,7 @@ export function RestartServerButton() {
   };
 
   return (
-    <Button icon={<ReloadOutlined />} loading={restart.isPending} onClick={confirm}>
+    <Button className="restart-server-button" title="重启服务端" aria-label="重启服务端" icon={<ReloadOutlined />} loading={restart.isPending} onClick={confirm}>
       {restart.isPending ? '等待服务恢复' : '重启服务端'}
     </Button>
   );

@@ -37,6 +37,7 @@ import type {
 const { Title, Text, Paragraph } = Typography;
 
 interface NotificationFormValues {
+  approvalEmailTemplate: { subject: string; body: string };
   enabled: boolean;
   smtpHost?: string;
   smtpPort: number;
@@ -59,6 +60,7 @@ interface ChannelFormValues {
 
 function toFormValues(settings: EmailNotificationSettings): NotificationFormValues {
   return {
+    approvalEmailTemplate: settings.approvalEmailTemplate,
     enabled: settings.enabled,
     smtpHost: settings.smtpHost ?? undefined,
     smtpPort: settings.smtpPort || 587,
@@ -92,6 +94,15 @@ export function NotificationSettingsPage() {
   const queryClient = useQueryClient();
   const [form] = Form.useForm<NotificationFormValues>();
   const enabled = Form.useWatch('enabled', form);
+  const approvalTemplate = Form.useWatch('approvalEmailTemplate', form);
+  const previewValues: Record<string, string> = {
+    username: 'zhangsan', applicant_email: 'zhangsan@example.com',
+    user_groups: '研发组、运维组', expires_at: '2026-12-01 00:00:00（北京时间）',
+    instance_code: 'example-approval-instance',
+  };
+  const previewTemplate = (text?: string) => (text ?? '').replace(
+    /\{\{\s*([a-z_]+)\s*\}\}/g, (match, name: string) => previewValues[name] ?? match
+  );
 
   const { data, isLoading } = useQuery({
     queryKey: ['email-notification-settings'],
@@ -136,6 +147,7 @@ export function NotificationSettingsPage() {
   const submit = async () => {
     const values = await form.validateFields();
     const payload: UpdateEmailNotificationSettingsRequest = {
+      approvalEmailTemplate: values.approvalEmailTemplate,
       enabled: values.enabled,
       smtpHost: clean(values.smtpHost),
       smtpPort: values.smtpPort,
@@ -228,8 +240,8 @@ export function NotificationSettingsPage() {
         <Alert
           showIcon
           type="info"
-          message="当前支持：站点网关离线、站点网关恢复、测试邮件"
-          description="普通节点离线不会发送邮件；静默期内同一网关同一事件不会重复发送，历史里会记录 skipped。"
+          message="当前支持：审批通过邮件、站点网关离线、站点网关恢复、测试邮件"
+          description="审批通过邮件发送给申请人的飞书企业邮箱，不使用下方管理员收件人。普通节点离线不会发送邮件；静默期内同一网关同一事件不会重复发送，历史里会记录 skipped。"
         />
 
         <Card loading={isLoading}>
@@ -365,6 +377,28 @@ export function NotificationSettingsPage() {
               {data?.smtpPasswordSet ? <Tag style={{ marginLeft: 8 }}>密码已保存</Tag> : null}
             </Paragraph>
 
+            <div className="settings-section-heading"><Text strong>审批通过邮件模板</Text></div>
+            <Paragraph type="secondary">
+              发送至申请人的飞书企业邮箱。修改后保存，待发送及重试邮件使用最新模板。正文为纯文本。
+            </Paragraph>
+            <Paragraph>
+              {'可用变量：{{username}} 账号、{{applicant_email}} 申请人邮箱、{{user_groups}} 用户组、{{expires_at}} 到期时间（北京时间）、{{instance_code}} 审批实例编号。'}
+            </Paragraph>
+            <Form.Item name={['approvalEmailTemplate', 'subject']} label="审批邮件主题"
+              rules={[{ required: true, message: '请输入邮件主题' }, { max: 200 }]}>
+              <Input maxLength={200} />
+            </Form.Item>
+            <Form.Item name={['approvalEmailTemplate', 'body']} label="审批邮件正文"
+              rules={[{ required: true, message: '请输入邮件正文' }, { max: 20000 }]}>
+              <Input.TextArea rows={9} showCount maxLength={20000} />
+            </Form.Item>
+
+            <details style={{ marginBottom: 24 }}>
+              <summary>模板预览（示例数据，不会发送邮件）</summary>
+              <Paragraph strong>{previewTemplate(approvalTemplate?.subject)}</Paragraph>
+              <Paragraph style={{ whiteSpace: 'pre-wrap' }}>{previewTemplate(approvalTemplate?.body)}</Paragraph>
+            </details>
+
             <div className="settings-section-heading notification-channel-heading">
               <Space>
                 <LinkOutlined />
@@ -418,6 +452,7 @@ export function NotificationSettingsPage() {
 function eventLabel(value: string): string {
   if (value === 'gateway_offline') return '网关离线';
   if (value === 'gateway_recovered') return '网关恢复';
+  if (value === 'approval_approved') return '审批通过';
   if (value === 'test_email') return '测试邮件';
   return value;
 }

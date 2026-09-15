@@ -7,7 +7,7 @@
   --card-2: #f8fafc;
   --ink: #111827;
   --ink-soft: #4b5563;
-  --ink-faint: #9ca3af;
+  --ink-faint: #6b7280;
   --line: #e8edf5;
   --line-strong: #d8dee8;
   --accent: #2563eb;
@@ -686,4 +686,78 @@ h5,
   .topology-node {
     min-height: auto;
   }
+}
+
+/* Shared workspace sizing: tables may scroll inside their card, never stretch the shell. */
+.app-content {
+  width: 100%;
+  min-width: 0;
+  max-width: 1840px;
+  margin: 0 auto;
+  padding: 24px 28px 40px;
+}
+.ant-pro-layout .ant-pro-layout-content {
+  min-width: 0;
+  padding: 0;
+}
+.ant-pro-layout-container, .ant-layout-content, .ant-pro-table,
+.app-content > *, .app-content .ant-card, .app-content .ant-card-body {
+  min-width: 0;
+}
+.page-heading { flex-wrap: wrap; }
+.app-content > div > h4.ant-typography { margin-top: 0; }
+.app-content .ant-table-cell { overflow-wrap: anywhere; }
+.app-content .ant-table-thead > tr > th { white-space: nowrap; }
+.app-content .ant-table-cell .ant-typography-secondary { font-size: 12px; }
+.app-content .ant-pro-table-list-toolbar-container { flex-wrap: wrap; gap: 12px; }
+.app-content .ant-pro-table-list-toolbar-left,
+.app-content .ant-pro-table-list-toolbar-right { min-width: 0; flex-wrap: wrap; gap: 12px; }
+.app-content .ant-pro-table-list-toolbar-search { max-width: 100%; }
+.app-content .ant-pro-table-list-toolbar-search > .ant-space { flex-wrap: wrap; }
+.app-content .ant-pagination { flex-wrap: wrap; row-gap: 8px; }
+.user-identity-cell { display: flex; flex-direction: column; gap: 4px; }
+.approval-access-cell { width: 100%; }
+.approval-grant { padding-left: 10px; border-left: 2px solid var(--line-strong); }
+.approval-grant > .ant-typography { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.app-content .ant-form-item-label > label { font-weight: 500; }
+.app-content .ant-input-textarea-show-count { margin-bottom: 8px; }
+.app-content details { border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; background: var(--card-2); }
+.app-content summary { cursor: pointer; font-weight: 500; }
+.app-content details[open] summary { margin-bottom: 12px; }
+.app-content details .ant-typography { overflow-wrap: anywhere; }
+@media (max-width: 1100px) {
+  .app-content { padding: 20px; }
+}
+@media (max-width: 600px) {
+  .app-content { padding: 16px 12px 28px; }
+  .page-heading { align-items: flex-start; gap: 12px; }
+  .app-content .ant-card-body { padding: 16px; }
+  .app-content .ant-pro-table-list-toolbar-search,
+  .app-content .ant-pro-table-list-toolbar-left,
+  .app-content .ant-pro-table-list-toolbar-right { width: 100%; }
+  .app-content .ant-pro-table-list-toolbar-search .ant-space-item { max-width: 100%; }
+  .app-content .ant-pro-table-list-toolbar-search .ant-input-affix-wrapper,
+  .app-content .ant-pro-table-list-toolbar-search .ant-input-group-wrapper { max-width: 100%; }
+  .app-content .ant-descriptions-item-content { overflow-wrap: anywhere; }
+  .app-content .settings-section-heading { flex-wrap: wrap; gap: 10px; }
+}
+
+.ant-pro-sider .ant-pro-sider-actions { flex-direction: column; align-items: stretch; gap: 4px; }
+.ant-pro-sider .ant-pro-sider-actions-list { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 36px 36px; gap: 4px !important; }
+.ant-pro-sider .ant-pro-sider-actions-list-item { padding: 0; }
+.ant-pro-sider-collapsed .ant-pro-sider-actions-list { grid-template-columns: 1fr; justify-items: center; }
+.ant-pro-sider-collapsed .ant-pro-sider-actions-list .ant-btn { width: 32px; padding: 0; font-size: 0; }
+.ant-pro-sider-collapsed .ant-pro-sider-actions-list .anticon { font-size: 14px; }
+.app-content .ant-table-content { max-width: 100%; overflow-x: auto; }
+
+.app-brand { white-space: nowrap; }
+@media (max-width: 600px) {
+  .ant-pro-global-header .app-brand-text { display: none; }
+  .ant-pro-global-header .restart-server-button { width: 32px; padding: 0; font-size: 0; }
+  .ant-pro-global-header .restart-server-button .anticon { font-size: 14px; }
+}
+@media (max-width: 600px) {
+  .app-content .ant-pro-table-list-toolbar-search .ant-picker { max-width: 100%; }
+  .app-content .ant-pro-table-list-toolbar-search > .ant-space { width: 100%; }
+  .app-content .ant-pro-table-list-toolbar-search .ant-picker-input { min-width: 0; }
 }

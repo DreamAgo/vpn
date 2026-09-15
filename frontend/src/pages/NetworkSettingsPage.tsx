@@ -85,7 +85,7 @@ export function NetworkSettingsPage() {
         form.setFieldsValue({ desired: result.desired, serverRoutes: result.serverRoutes, localRouteBypass: result.localRouteBypass ?? [] });
         hydratedVersion.current = version;
       }
-      message.success(result.restartRequired ? '配置已保存，点击右上角“重启服务端”即可生效' : '网络配置已保存');
+      message.success(result.restartRequired ? '配置已保存，点击全局“重启服务端”即可生效' : '网络配置已保存');
     },
     onError: (reason) => message.error(reason instanceof Error ? reason.message : '保存失败'),
   });
@@ -108,7 +108,7 @@ export function NetworkSettingsPage() {
     </div>
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {isError && <Alert showIcon type="error" message="网络参数加载失败" description={error instanceof Error ? error.message : '请稍后重试'} action={<Button onClick={() => void refetch()}>重试</Button>} />}
-      {data?.restartRequired && <Alert showIcon type="warning" message="存在待重启配置" description={`待生效：${restartChanges.join('、')}。点击右上角“重启服务端”使配置生效；若包含虚拟子网，重启前暂停节点注册。`} />}
+      {data?.restartRequired && <Alert showIcon type="warning" message="存在待重启配置" description={`待生效：${restartChanges.join('、')}。点击全局“重启服务端”使配置生效；若包含虚拟子网，重启前暂停节点注册。`} />}
       <Alert showIcon type="info" message="生效方式" description="基础 VPN 与混淆配置重启后生效；LAN 路由和 DNS 转发规则保存后生效；路由排除规则通过客户端心跳同步，无需重启；客户端 DNS 在新连接或重连时应用。环境变量只用于首次初始化。" />
       <Form form={form} layout="vertical" disabled={restarting || !data || isError || mutation.isPending} onValuesChange={() => { editVersion.current += 1; }}>
         <Card title="基础 VPN" loading={isLoading}>

@@ -38,6 +38,18 @@ pub struct ApprovedGrant<'a> {
     pub identity: ApprovalIdentity<'a>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct ApprovalMailRow {
+    pub instance_code: String,
+    pub recipient: String,
+    pub body: String,
+    pub expires_at: i64,
+    pub done: bool,
+    pub attempts: i64,
+    pub next_attempt_at: i64,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteAccessGrantRepository {
     pool: SqlitePool,
@@ -46,6 +58,21 @@ pub struct SqliteAccessGrantRepository {
 impl SqliteAccessGrantRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn claim_mail(&self) -> Result<Option<ApprovalMailRow>> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query_as("UPDATE approval_mail_outbox SET attempts=attempts+1,next_attempt_at=?1 WHERE instance_code=(SELECT instance_code FROM approval_mail_outbox WHERE done=0 AND next_attempt_at<=?2 ORDER BY next_attempt_at,instance_code LIMIT 1) RETURNING *")
+            .bind(now + 300_000).bind(now).fetch_optional(&self.pool).await.map_err(db)
+    }
+
+    pub async fn finish_mail(&self, row: &ApprovalMailRow, error: Option<&str>) -> Result<()> {
+        let delay = 30_000_i64 * (1_i64 << row.attempts.min(7));
+        sqlx::query("UPDATE approval_mail_outbox SET done=?1,last_error=?2,next_attempt_at=?3 WHERE instance_code=?4 AND attempts=?5 AND done=0")
+            .bind(error.is_none()).bind(error)
+            .bind(Utc::now().timestamp_millis() + delay.min(3_600_000))
+            .bind(&row.instance_code).bind(row.attempts).execute(&self.pool).await.map_err(db)?;
+        Ok(())
     }
 
     pub async fn enqueue(
@@ -308,6 +335,33 @@ impl SqliteAccessGrantRepository {
                     .execute(&mut *tx).await.map_err(db)?;
             }
         }
+        // Queue only a newly applied instance, in the same transaction as its grants.
+        // Replayed callbacks and mail retries cannot create another notification.
+        if prior.is_empty() {
+            let groups: Vec<String> = sqlx::query_scalar("SELECT g.name FROM access_grants a JOIN user_groups g ON g.id=a.group_id WHERE a.approval_instance_code=?1 ORDER BY g.name")
+                .bind(grant.instance_code).fetch_all(&mut *tx).await.map_err(db)?;
+            let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id=?1")
+                .bind(&user_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+            let expiry = chrono::DateTime::from_timestamp_millis(grant.expires_at)
+                .ok_or_else(|| AppError::Validation("授权到期时间非法".into()))?
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                .format("%Y-%m-%d %H:%M:%S（北京时间）")
+                .to_string();
+            let body = serde_json::json!({
+                "username": username,
+                "applicant_email": grant.identity.email,
+                "user_groups": groups.join("、"),
+                "expires_at": expiry,
+                "instance_code": grant.instance_code,
+            })
+            .to_string();
+            sqlx::query("INSERT INTO approval_mail_outbox(instance_code,recipient,body,expires_at) VALUES(?1,?2,?3,?4) ON CONFLICT(instance_code) DO NOTHING")
+                .bind(grant.instance_code).bind(grant.identity.email).bind(body).bind(grant.expires_at)
+                .execute(&mut *tx).await.map_err(db)?;
+        }
         tx.commit().await.map_err(db)?;
         Ok(user_id)
     }
@@ -377,6 +431,53 @@ mod tests {
                 password_hash: "hash",
             },
         }
+    }
+
+    #[tokio::test]
+    async fn approval_mail_is_atomic_deduplicated_and_retries_with_a_lease() {
+        let pool = setup().await;
+        let repo = SqliteAccessGrantRepository::new(pool.clone());
+        assert!(repo.apply_approved(grant("invalid", 20_000)).await.is_err());
+        assert!(repo.claim_mail().await.unwrap().is_none());
+        sqlx::query("INSERT INTO user_groups(id,name,routes,created_at,updated_at) VALUES('g1','ops','',0,0),('g2','dev','',0,0)")
+            .execute(&pool).await.unwrap();
+        let mut approved = grant("mail-instance", 20_000);
+        approved.group_ids = vec!["g1".into(), "g2".into(), "g1".into()];
+        repo.apply_approved(approved.clone()).await.unwrap();
+        repo.apply_approved(approved).await.unwrap();
+        let first = repo.claim_mail().await.unwrap().unwrap();
+        assert_eq!(first.recipient, "alice@example.com");
+        assert!(first.body.contains("dev、ops"));
+        assert!(first.body.contains("北京时间"));
+        assert!(repo.claim_mail().await.unwrap().is_none());
+        repo.finish_mail(&first, Some("SMTP unavailable"))
+            .await
+            .unwrap();
+        assert!(repo.claim_mail().await.unwrap().is_none());
+        let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(grants, 2);
+        sqlx::query("UPDATE approval_mail_outbox SET next_attempt_at=0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = repo.claim_mail().await.unwrap().unwrap();
+        assert_eq!(second.attempts, 2);
+        repo.finish_mail(&first, None).await.unwrap();
+        let done: bool = sqlx::query_scalar("SELECT done FROM approval_mail_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!done, "stale claims cannot acknowledge another attempt");
+        repo.finish_mail(&second, None).await.unwrap();
+        assert!(repo.claim_mail().await.unwrap().is_none());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_mail_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

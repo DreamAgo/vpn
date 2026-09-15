@@ -138,7 +138,8 @@ impl SqliteNotificationEventRepository {
                 " AND status = ?1"
             });
         }
-        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+        let limit_index = 1 + usize::from(event_type.is_some()) + usize::from(status.is_some());
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ?{limit_index}"));
 
         let mut query = sqlx::query_as::<_, NotificationEventTuple>(&sql);
         if let Some(v) = event_type {

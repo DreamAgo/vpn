@@ -429,7 +429,24 @@ pub struct UpdateServerRoutesRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalEmailTemplate {
+    pub subject: String,
+    pub body: String,
+}
+
+impl Default for ApprovalEmailTemplate {
+    fn default() -> Self {
+        Self {
+            subject: "易链通知：VPN 审批已通过".into(),
+            body: "您的飞书审批已通过，VPN 授权已保存。\n\n账号：{{username}}\n申请人邮箱：{{applicant_email}}\n授权用户组：{{user_groups}}\n授权截止时间：{{expires_at}}（到此时间失效）\n审批实例：{{instance_code}}\n\n请使用飞书登录易链客户端。".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailNotificationSettings {
+    #[serde(default)]
+    pub approval_email_template: ApprovalEmailTemplate,
     pub enabled: bool,
     pub smtp_host: Option<String>,
     pub smtp_port: u16,
@@ -453,6 +470,8 @@ pub struct EmailNotificationSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateEmailNotificationSettingsRequest {
+    #[serde(default)]
+    pub approval_email_template: Option<ApprovalEmailTemplate>,
     pub enabled: bool,
     pub smtp_host: Option<String>,
     pub smtp_port: u16,

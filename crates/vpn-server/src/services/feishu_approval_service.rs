@@ -210,6 +210,7 @@ pub struct FeishuApprovalService {
     network_acl: Option<Arc<NetworkAclService>>,
     directory: Option<Arc<super::FeishuDirectoryService>>,
     maintenance: Arc<RwLock<()>>,
+    notifications: Option<Arc<super::NotificationService>>,
 }
 
 impl FeishuApprovalService {
@@ -227,7 +228,35 @@ impl FeishuApprovalService {
             network_acl: None,
             directory: None,
             maintenance: Arc::new(RwLock::new(())),
+            notifications: None,
         }
+    }
+
+    pub fn with_notifications(mut self, service: Arc<super::NotificationService>) -> Self {
+        self.notifications = Some(service);
+        self
+    }
+
+    pub async fn deliver_mail_once(&self) -> Result<bool> {
+        let _maintenance = self.maintenance.read().await;
+        let Some(notifications) = &self.notifications else {
+            return Ok(false);
+        };
+        let Some(mail) = self.repo.claim_mail().await? else {
+            return Ok(false);
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            notifications.notify_approval_approved(&mail),
+        )
+        .await;
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("审批通知发送超时".to_string()),
+        };
+        self.repo.finish_mail(&mail, error.as_deref()).await?;
+        Ok(true)
     }
 
     pub fn with_directory(mut self, service: Arc<super::FeishuDirectoryService>) -> Self {
@@ -339,6 +368,16 @@ impl FeishuApprovalService {
     }
 
     pub fn spawn_worker(&self) {
+        let mail_service = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                ticker.tick().await;
+                if let Err(error) = mail_service.deliver_mail_once().await {
+                    tracing::error!(error = ?error, "审批邮件队列处理失败");
+                }
+            }
+        });
         let service = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(2));

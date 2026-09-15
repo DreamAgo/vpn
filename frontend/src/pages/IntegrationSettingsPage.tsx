@@ -179,13 +179,13 @@ export function IntegrationSettingsPage() {
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <div>
-        <Typography.Title level={2} style={{ marginBottom: 4 }}>集成设置</Typography.Title>
+        <Typography.Title level={4} style={{ margin: '0 0 4px' }}>集成设置</Typography.Title>
         <Typography.Text type="secondary">
           管理飞书登录、审批和外部选项。秘密仅显示是否已设置，不会回显。
         </Typography.Text>
       </div>
       {query.data?.restartRequired && (
-        <Alert type="warning" showIcon message="配置已保存但尚未应用，请点击右上角“重启服务端”" />
+        <Alert type="warning" showIcon message="配置已保存但尚未应用，请点击全局“重启服务端”" />
       )}
       {query.isError && (
         <Alert type="error" showIcon message="加载集成设置失败" description={(query.error as Error).message} />

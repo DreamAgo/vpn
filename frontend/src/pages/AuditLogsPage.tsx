@@ -181,6 +181,7 @@ export function AuditLogsPage() {
       </Title>
 
       <ProTable<AuditLogDto>
+        scroll={{ x: 960 }}
         actionRef={actionRef}
         rowKey="id"
         columns={columns}

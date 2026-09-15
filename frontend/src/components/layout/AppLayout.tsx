@@ -73,6 +73,7 @@ interface AppLayoutProps {
 function Brand({ collapsed, palette }: { collapsed?: boolean; palette: ThemePalette }) {
   return (
     <div
+      className="app-brand"
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -99,7 +100,7 @@ function Brand({ collapsed, palette }: { collapsed?: boolean; palette: ThemePale
         易
       </span>
       {!collapsed && (
-        <div style={{ lineHeight: 1.1 }}>
+        <div className="app-brand-text" style={{ lineHeight: 1.1 }}>
           <div
             style={{
               fontWeight: 700,
@@ -284,7 +285,7 @@ export function AppLayout({
         ),
       }}
     >
-      <main style={{ maxWidth: 1280, margin: '0 auto', width: '100%', padding: '24px 28px 40px' }}>
+      <main className="app-content">
         <Outlet />
       </main>
     </ProLayout>
