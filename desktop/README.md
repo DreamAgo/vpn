@@ -122,7 +122,7 @@ GitHub Release 默认清单中的下载地址指向该 Release。自建更新服
 
 ```sh
 python3 desktop/scripts/generate-updater-manifest.py \
-  --tag v0.1.31 --repository OWNER/REPO \
+  --tag v0.1.32 --repository OWNER/REPO \
   --assets-dir release-assets \
   --base-url https://updates.example.com/updates
 ```
