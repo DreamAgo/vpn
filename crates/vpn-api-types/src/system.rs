@@ -430,6 +430,9 @@ pub struct UpdateServerRoutesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalEmailTemplate {
+    /// Missing on legacy settings means plain text.
+    #[serde(default)]
+    pub html: bool,
     pub subject: String,
     pub body: String,
 }
@@ -438,7 +441,8 @@ impl Default for ApprovalEmailTemplate {
     fn default() -> Self {
         Self {
             subject: "易链通知：VPN 审批已通过".into(),
-            body: "您的飞书审批已通过，VPN 授权已保存。\n\n账号：{{username}}\n申请人邮箱：{{applicant_email}}\n授权用户组：{{user_groups}}\n授权截止时间：{{expires_at}}（到此时间失效）\n审批实例：{{instance_code}}\n\n请使用飞书登录易链客户端。".into(),
+            html: true,
+            body: include_str!("../../../templates/approval-approved.html").into(),
         }
     }
 }

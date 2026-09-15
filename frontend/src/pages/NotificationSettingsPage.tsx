@@ -1,3 +1,4 @@
+import defaultApprovalHtml from '../../../templates/approval-approved.html?raw';
 import { useEffect } from 'react';
 import {
   Alert,
@@ -37,7 +38,7 @@ import type {
 const { Title, Text, Paragraph } = Typography;
 
 interface NotificationFormValues {
-  approvalEmailTemplate: { subject: string; body: string };
+  approvalEmailTemplate: { subject: string; body: string; html?: boolean };
   enabled: boolean;
   smtpHost?: string;
   smtpPort: number;
@@ -379,24 +380,36 @@ export function NotificationSettingsPage() {
 
             <div className="settings-section-heading"><Text strong>审批通过邮件模板</Text></div>
             <Paragraph type="secondary">
-              发送至申请人的飞书企业邮箱。修改后保存，待发送及重试邮件使用最新模板。正文为纯文本。
+              发送至申请人的飞书企业邮箱。修改后保存，待发送及重试邮件使用最新模板。支持 HTML 样式与纯文本。HTML 建议使用行内样式，变量放在文本位置。
             </Paragraph>
             <Paragraph>
               {'可用变量：{{username}} 账号、{{applicant_email}} 申请人邮箱、{{user_groups}} 用户组、{{expires_at}} 到期时间（北京时间）、{{instance_code}} 审批实例编号。'}
             </Paragraph>
+            <Space wrap style={{ marginBottom: 16 }}>
+              <Form.Item name={['approvalEmailTemplate', 'html']} valuePropName="checked" label="HTML 邮件" style={{ marginBottom: 0 }}>
+                <Switch />
+              </Form.Item>
+              <Button onClick={() => form.setFieldValue('approvalEmailTemplate', {
+                subject: '易链通知：VPN 审批已通过', body: defaultApprovalHtml, html: true,
+              })}>使用默认 HTML 模板</Button>
+            </Space>
             <Form.Item name={['approvalEmailTemplate', 'subject']} label="审批邮件主题"
               rules={[{ required: true, message: '请输入邮件主题' }, { max: 200 }]}>
               <Input maxLength={200} />
             </Form.Item>
             <Form.Item name={['approvalEmailTemplate', 'body']} label="审批邮件正文"
               rules={[{ required: true, message: '请输入邮件正文' }, { max: 20000 }]}>
-              <Input.TextArea rows={9} showCount maxLength={20000} />
+              <Input.TextArea rows={12} showCount maxLength={20000} style={{ fontFamily: 'monospace', fontSize: 12 }} />
             </Form.Item>
 
             <details style={{ marginBottom: 24 }}>
               <summary>模板预览（示例数据，不会发送邮件）</summary>
               <Paragraph strong>{previewTemplate(approvalTemplate?.subject)}</Paragraph>
-              <Paragraph style={{ whiteSpace: 'pre-wrap' }}>{previewTemplate(approvalTemplate?.body)}</Paragraph>
+              {approvalTemplate?.html ? (
+                <iframe title="审批邮件 HTML 预览" sandbox="" referrerPolicy="no-referrer"
+                  srcDoc={'<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:;">' + previewTemplate(approvalTemplate?.body)}
+                  style={{ width: '100%', height: 780, border: '1px solid #e2e8f0', borderRadius: 12, background: '#f1f5f9' }} />
+              ) : <Paragraph style={{ whiteSpace: 'pre-wrap' }}>{previewTemplate(approvalTemplate?.body)}</Paragraph>}
             </details>
 
             <div className="settings-section-heading notification-channel-heading">
