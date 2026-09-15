@@ -36,7 +36,7 @@ const adminRoutes: NonNullable<ProLayoutProps['route']>['routes'] = [
   { path: '/dashboard', name: '仪表盘', icon: <DashboardOutlined /> },
   { path: '/users', name: '用户', icon: <UserOutlined /> },
   { path: '/groups', name: '用户组', icon: <TeamOutlined /> },
-  { path: '/subnets', name: '网段', icon: <PartitionOutlined /> },
+  { path: '/subnets', name: '网段组', icon: <PartitionOutlined /> },
   { path: '/peers', name: '节点', icon: <ApiOutlined /> },
   { path: '/audit-logs', name: '日志', icon: <FileTextOutlined /> },
   { path: '/api-keys', name: 'API Key', icon: <KeyOutlined /> },

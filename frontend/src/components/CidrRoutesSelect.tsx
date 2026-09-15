@@ -4,7 +4,7 @@
  * 组路由 / 服务端 LAN / 节点路由三处编辑弹窗共用，避免各自重复 Select 接线与 CIDR 校验。
  * 作为受控 Form.Item，由外层 Form 提供 `name` 对应字段值。
  */
-import { Form, Select } from 'antd';
+import { Form, Select, Space } from 'antd';
 import type { ReactNode } from 'react';
 
 import { useSubnetOptions } from '@/hooks/useSubnetOptions';
@@ -20,7 +20,6 @@ interface Props {
 }
 
 export function CidrRoutesSelect({ name, label, extra }: Props) {
-  const subnetOptions = useSubnetOptions();
   return (
     <Form.Item
       name={name}
@@ -37,16 +36,42 @@ export function CidrRoutesSelect({ name, label, extra }: Props) {
         },
       ]}
     >
+      <RoutesInput />
+    </Form.Item>
+  );
+}
+
+function RoutesInput({ value = [], onChange, id }: {
+  value?: string[];
+  onChange?: (value: string[]) => void;
+  id?: string;
+}) {
+  const subnetOptions = useSubnetOptions();
+  return (
+    <Space direction="vertical" style={{ width: '100%' }}>
       <Select
-        mode="tags"
-        allowClear
+        aria-label="添加网段组"
+        value={null}
         showSearch
         optionFilterProp="label"
-        placeholder="从网段目录选择，或手动输入 CIDR 后回车"
-        tokenSeparators={[',', ' ', '\n']}
+        placeholder="选择网段组，加入组内全部 CIDR"
         options={subnetOptions}
         style={{ width: '100%' }}
+        onChange={(groupId: string) => {
+          const group = subnetOptions.find((option) => option.value === groupId);
+          if (group) onChange?.([...new Set([...value, ...group.cidrs])]);
+        }}
       />
-    </Form.Item>
+      <Select
+        id={id}
+        value={value}
+        onChange={onChange}
+        mode="tags"
+        allowClear
+        placeholder="已选 CIDR，可删除或手动输入"
+        tokenSeparators={[',', '，', ' ', '\n', '\r', '\t']}
+        style={{ width: '100%' }}
+      />
+    </Space>
   );
 }

@@ -48,17 +48,17 @@ impl SqliteSubnetRepository {
     }
 
     /// 列出所有网段 + 各自被引用次数(用户组路由 + 节点路由 + 服务端 LAN 之和)。
-    /// CSV 用逗号包裹后 LIKE 精确匹配整段,避免 10.0.0.0/8 误配 10.0.0.0/80 之类。
+    /// 展开组内 CSV，以 EXISTS 精确匹配任一 CIDR，同一配置只计一次。
     pub async fn list_with_usage(&self) -> Result<Vec<(SubnetRow, i64)>> {
         let rows: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
             r#"SELECT s.id, s.name, s.cidr, s.created_at, s.updated_at,
                       (SELECT COUNT(*) FROM user_groups g
-                         WHERE (',' || g.routes || ',') LIKE ('%,' || s.cidr || ',%'))
+                         WHERE EXISTS (SELECT 1 FROM json_each('[' || replace(json_quote(s.cidr), ',', '","') || ']') part WHERE instr(',' || g.routes || ',', ',' || part.value || ',') > 0))
                     + (SELECT COUNT(*) FROM peers p
-                         WHERE (',' || p.routed_subnets || ',') LIKE ('%,' || s.cidr || ',%'))
+                         WHERE EXISTS (SELECT 1 FROM json_each('[' || replace(json_quote(s.cidr), ',', '","') || ']') part WHERE instr(',' || p.routed_subnets || ',', ',' || part.value || ',') > 0))
                     + (SELECT COUNT(*) FROM system_config c
                          WHERE c.key = 'server_routes'
-                           AND (',' || c.value || ',') LIKE ('%,' || s.cidr || ',%')) AS usage_count
+                           AND EXISTS (SELECT 1 FROM json_each('[' || replace(json_quote(s.cidr), ',', '","') || ']') part WHERE instr(',' || c.value || ',', ',' || part.value || ',') > 0)) AS usage_count
                  FROM subnets s
                  ORDER BY s.name ASC"#,
         )
@@ -82,16 +82,16 @@ impl SqliteSubnetRepository {
             .collect())
     }
 
-    /// 单个 CIDR 当前被引用的次数(同 list_with_usage 的口径)。
+    /// 网段组 CSV 当前被使用的配置数量(同 list_with_usage 的口径)。
     pub async fn usage_count(&self, cidr: &str) -> Result<i64> {
         let c: (i64,) = sqlx::query_as(
             r#"SELECT (SELECT COUNT(*) FROM user_groups g
-                         WHERE (',' || g.routes || ',') LIKE ('%,' || ?1 || ',%'))
+                         WHERE EXISTS (SELECT 1 FROM json_each('[' || replace(json_quote(?1), ',', '","') || ']') part WHERE instr(',' || g.routes || ',', ',' || part.value || ',') > 0))
                     + (SELECT COUNT(*) FROM peers p
-                         WHERE (',' || p.routed_subnets || ',') LIKE ('%,' || ?1 || ',%'))
+                         WHERE EXISTS (SELECT 1 FROM json_each('[' || replace(json_quote(?1), ',', '","') || ']') part WHERE instr(',' || p.routed_subnets || ',', ',' || part.value || ',') > 0))
                     + (SELECT COUNT(*) FROM system_config c
                          WHERE c.key = 'server_routes'
-                           AND (',' || c.value || ',') LIKE ('%,' || ?1 || ',%'))"#,
+                           AND EXISTS (SELECT 1 FROM json_each('[' || replace(json_quote(?1), ',', '","') || ']') part WHERE instr(',' || c.value || ',', ',' || part.value || ',') > 0))"#,
         )
         .bind(cidr)
         .fetch_one(&self.pool)
@@ -111,7 +111,7 @@ impl SqliteSubnetRepository {
         Ok(row.map(SubnetRow::from))
     }
 
-    /// 插入。名称或 CIDR 冲突 → DuplicateResource。
+    /// 插入。名称冲突 → DuplicateResource。
     pub async fn insert(&self, id: &str, name: &str, cidr: &str) -> Result<SubnetRow> {
         let now = Utc::now().timestamp_millis();
         let res = sqlx::query(
@@ -132,7 +132,7 @@ impl SqliteSubnetRepository {
                 updated_at: now,
             }),
             Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-                Err(AppError::DuplicateResource("网段名称或 CIDR".to_string()))
+                Err(AppError::DuplicateResource("网段组名称".to_string()))
             }
             Err(e) => Err(AppError::Database(Box::new(e))),
         }
@@ -159,7 +159,7 @@ impl SqliteSubnetRepository {
         match qb.build().execute(&self.pool).await {
             Ok(r) => Ok(r.rows_affected()),
             Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-                Err(AppError::DuplicateResource("网段名称或 CIDR".to_string()))
+                Err(AppError::DuplicateResource("网段组名称".to_string()))
             }
             Err(e) => Err(AppError::Database(Box::new(e))),
         }
@@ -230,21 +230,27 @@ mod tests {
         .unwrap();
         assert_eq!(repo.usage_count("10.0.0.0/8").await.unwrap(), 1);
         assert_eq!(repo.list_with_usage().await.unwrap()[0].1, 1);
+        assert_eq!(
+            repo.usage_count("10.0.0.0/8,192.168.1.0/24").await.unwrap(),
+            1
+        );
+        assert_eq!(repo.usage_count("10.0.0.0/80").await.unwrap(), 0);
+        repo.update("s1", None, Some("10.0.0.0/8,192.168.1.0/24"))
+            .await
+            .unwrap();
+        assert_eq!(repo.list_with_usage().await.unwrap()[0].1, 1);
         // 未被引用的不计;且不发生子串误配。
         assert_eq!(repo.usage_count("172.16.0.0/12").await.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn duplicate_name_or_cidr_rejected() {
+    async fn duplicate_name_rejected_but_shared_cidr_allowed() {
         let repo = setup().await;
         repo.insert("s1", "a", "10.0.0.0/8").await.unwrap();
         assert!(matches!(
             repo.insert("s2", "a", "10.1.0.0/16").await.unwrap_err(),
             AppError::DuplicateResource(_)
         ));
-        assert!(matches!(
-            repo.insert("s3", "b", "10.0.0.0/8").await.unwrap_err(),
-            AppError::DuplicateResource(_)
-        ));
+        repo.insert("s3", "b", "10.0.0.0/8").await.unwrap();
     }
 }

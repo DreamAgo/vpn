@@ -1,5 +1,5 @@
 /**
- * 网段管理页。
+ * 网段组管理页。
  *
  * 集中维护"命名网段"(名称 + CIDR);在用户组路由 / 服务端 LAN / 节点路由等处可直接下拉选择。
  */
@@ -24,13 +24,13 @@ import { subnetsApi } from '@/services/subnets';
 import { ApiError } from '@/services/http';
 import { ErrorCodes } from '@/types/api';
 import type { SubnetDto } from '@/types/api';
-import { isValidCidr } from '@/utils/cidr';
+import { isValidCidr, parseCidrText } from '@/utils/cidr';
 
 const { Title, Text } = Typography;
 
 function describeError(err: unknown, fallback: string): string {
   if (err instanceof ApiError) {
-    if (err.code === ErrorCodes.DuplicateResource) return '网段名称或 CIDR 已存在';
+    if (err.code === ErrorCodes.DuplicateResource) return '网段组名称已存在';
     if (err.code === ErrorCodes.NoAccess || err.code === ErrorCodes.RequireAdmin)
       return '无权限执行该操作';
     return err.message || fallback;
@@ -57,7 +57,7 @@ export function SubnetsPage() {
 
   useEffect(() => {
     if (modalOpen) {
-      form.setFieldsValue({ name: editing?.name ?? '', cidr: editing?.cidr ?? '' });
+      form.setFieldsValue({ name: editing?.name ?? '', cidr: editing ? (editing.cidrs ?? parseCidrText(editing.cidr)).join('\n') : '' });
     }
   }, [modalOpen, editing, form]);
 
@@ -74,13 +74,13 @@ export function SubnetsPage() {
     setSaving(true);
     try {
       const name = values.name.trim();
-      const cidr = values.cidr.trim();
+      const cidrs = parseCidrText(values.cidr);
       if (editing) {
-        await subnetsApi.updateSubnet(editing.id, { name, cidr });
+        await subnetsApi.updateSubnet(editing.id, { name, cidrs });
       } else {
-        await subnetsApi.createSubnet({ name, cidr });
+        await subnetsApi.createSubnet({ name, cidrs });
       }
-      message.success(editing ? '网段已更新' : '网段已新增');
+      message.success(editing ? '网段组已更新' : '网段组已新增');
       setModalOpen(false);
       refetch();
     } catch (err) {
@@ -93,7 +93,7 @@ export function SubnetsPage() {
   const handleDelete = async (s: SubnetDto) => {
     try {
       await subnetsApi.deleteSubnet(s.id);
-      message.success('已删除网段');
+      message.success('已删除网段组');
       refetch();
     } catch (err) {
       message.error(describeError(err, '删除失败'));
@@ -106,10 +106,12 @@ export function SubnetsPage() {
       title: '网段（CIDR）',
       dataIndex: 'cidr',
       key: 'cidr',
-      render: (c: string) => <Tag color="blue">{c}</Tag>,
+      render: (_: string, record: SubnetDto) => (
+        <Space wrap size={[0, 4]}>{(record.cidrs ?? parseCidrText(record.cidr)).map((c) => <Tag key={c} color="blue">{c}</Tag>)}</Space>
+      ),
     },
     {
-      title: '引用',
+      title: '路由使用',
       dataIndex: 'usageCount',
       key: 'usageCount',
       width: 80,
@@ -137,7 +139,7 @@ export function SubnetsPage() {
             编辑
           </Button>
           <Popconfirm
-            title="删除网段"
+            title="删除网段组"
             description={
               record.usageCount > 0
                 ? `该网段已被 ${record.usageCount} 处引用（用户组/节点/服务端路由）。删除仅从可选目录移除，已保存的网段值不受影响。`
@@ -166,13 +168,13 @@ export function SubnetsPage() {
         style={{ width: '100%', justifyContent: 'space-between', marginBottom: 16 }}
       >
         <Title level={4} style={{ margin: 0 }}>
-          网段管理
+          网段组管理
           <Text type="secondary" style={{ fontSize: 13, marginLeft: 12, fontWeight: 400 }}>
-            维护命名网段，供用户组 / 服务端 / 节点路由处直接选择
+            每组包含多个 CIDR，供用户组 / 服务端 / 节点路由一次选择
           </Text>
         </Title>
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
-          新增网段
+          新增网段组
         </Button>
       </Space>
 
@@ -187,7 +189,7 @@ export function SubnetsPage() {
 
       <Modal
         open={modalOpen}
-        title={editing ? '编辑网段' : '新增网段'}
+        title={editing ? '编辑网段组' : '新增网段组'}
         onCancel={() => !saving && setModalOpen(false)}
         onOk={() => form.submit()}
         confirmLoading={saving}
@@ -213,14 +215,14 @@ export function SubnetsPage() {
               { required: true, message: '请输入 CIDR' },
               {
                 validator: (_r, v: string) =>
-                  !v || isValidCidr(v)
+                  !v || (parseCidrText(v).length > 0 && parseCidrText(v).every(isValidCidr))
                     ? Promise.resolve()
-                    : Promise.reject(new Error('非法 CIDR，格式如 192.168.1.0/24')),
+                    : Promise.reject(new Error(`请每行输入一个合法 CIDR：${parseCidrText(v).filter((c) => !isValidCidr(c)).join('、') || '不能为空'}`)),
               },
             ]}
-            extra="格式示例：172.31.100.0/24、10.0.0.0/8（保存时会自动归一化为网络地址）。"
+            extra="每行一个 CIDR，也支持空格或逗号分隔；保存时归一化并去重。编辑此组不会自动修改已保存的路由。"
           >
-            <Input placeholder="192.168.1.0/24" />
+            <Input.TextArea autoSize={{ minRows: 7, maxRows: 14 }} placeholder={'135.10.0.0/16\n10.196.184.0/24\n10.196.163.126/32'} />
           </Form.Item>
         </Form>
       </Modal>

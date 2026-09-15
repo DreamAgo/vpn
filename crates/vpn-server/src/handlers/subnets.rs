@@ -40,7 +40,14 @@ pub async fn create_subnet(
     Json(body): Json<CreateSubnetRequest>,
 ) -> Result<Json<ApiResponse<SubnetDto>>, ApiError> {
     let svc = state.subnet_service()?;
-    Ok(success(&state, svc.create(&body.name, &body.cidr).await?))
+    Ok(success(
+        &state,
+        svc.create(
+            &body.name,
+            &resolve_cidrs(Some(body.cidr), body.cidrs)?.unwrap_or_default(),
+        )
+        .await?,
+    ))
 }
 
 #[tracing::instrument(skip(state, body))]
@@ -51,8 +58,9 @@ pub async fn update_subnet(
     Json(body): Json<UpdateSubnetRequest>,
 ) -> Result<Json<ApiResponse<SubnetDto>>, ApiError> {
     let svc = state.subnet_service()?;
+    let cidr = resolve_cidrs(body.cidr, body.cidrs)?;
     let dto = svc
-        .update(&id, body.name.as_deref(), body.cidr.as_deref())
+        .update(&id, body.name.as_deref(), cidr.as_deref())
         .await?;
     Ok(success(&state, dto))
 }
@@ -66,4 +74,51 @@ pub async fn delete_subnet(
     let svc = state.subnet_service()?;
     svc.delete(&id).await?;
     Ok(success(&state, ()))
+}
+
+/// 新数组字段与旧文本字段不可同时赋值，避免静默忽略输入。
+fn resolve_cidrs(
+    legacy: Option<String>,
+    cidrs: Option<Vec<String>>,
+) -> Result<Option<String>, ApiError> {
+    if let Some(cidrs) = cidrs {
+        if legacy.as_ref().is_some_and(|s| !s.is_empty()) {
+            return Err(vpn_core::AppError::Validation("cidr 与 cidrs 不能同时提供".into()).into());
+        }
+        Ok(Some(cidrs.join(",")))
+    } else {
+        Ok(legacy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_and_array_requests_without_silent_conflicts() {
+        let legacy: CreateSubnetRequest =
+            serde_json::from_str(r#"{"name":"old","cidr":"10.0.0.0/8"}"#).unwrap();
+        assert_eq!(
+            resolve_cidrs(Some(legacy.cidr), legacy.cidrs)
+                .unwrap()
+                .as_deref(),
+            Some("10.0.0.0/8")
+        );
+        let group: CreateSubnetRequest =
+            serde_json::from_str(r#"{"name":"group","cidrs":["10.0.0.0/8","172.16.0.0/12"]}"#)
+                .unwrap();
+        assert_eq!(
+            resolve_cidrs(Some(group.cidr), group.cidrs)
+                .unwrap()
+                .as_deref(),
+            Some("10.0.0.0/8,172.16.0.0/12")
+        );
+        assert!(resolve_cidrs(Some("10.0.0.0/8".into()), Some(vec![])).is_err());
+        assert_eq!(
+            resolve_cidrs(None, Some(vec![])).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(resolve_cidrs(None, None).unwrap(), None);
+    }
 }

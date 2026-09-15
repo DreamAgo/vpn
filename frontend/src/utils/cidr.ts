@@ -18,3 +18,8 @@ export function isValidCidr(cidr: string): boolean {
   const prefix = Number(m[5]);
   return prefix >= 1 && prefix <= 32;
 }
+
+/** 多行、空格或中英文逗号分隔；忽略空项并去重。 */
+export function parseCidrText(text: string): string[] {
+  return [...new Set(text.split(/[\s,，]+/u).filter(Boolean))];
+}
