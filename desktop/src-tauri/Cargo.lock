@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "pxfm"
-version = "0.1.29"
+version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
@@ -4208,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "schannel"
-version = "0.1.29"
+version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
@@ -5874,7 +5874,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpn-api-types"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "ipnet",
  "serde",
@@ -5884,7 +5884,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-cli"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5917,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-core"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5929,7 +5929,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-desktop"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
@@ -5956,7 +5956,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-obfs"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "aes",
  "chacha20poly1305",
@@ -5969,7 +5969,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-platform"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5987,7 +5987,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-wireguard"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
