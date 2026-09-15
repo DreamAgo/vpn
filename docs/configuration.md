@@ -190,3 +190,7 @@ RUST_LOG=info
 在“客户端版本 → 同步设置”填写“GitHub 下载代理”并保存，再点击“立即同步最新版本”。支持 HTTP/HTTPS 代理（例如 `http://192.168.188.10:7897`），可使用带用户名和密码的代理 URL。代理地址必须从服务端可达；`127.0.0.1` 表示服务端本身。留空显式直连，不使用进程环境中的代理。
 
 代理同时用于 GitHub 发布 API、更新清单、签名和安装包下载，包括 GitHub 资源重定向；手动和自动同步共用设置。客户端下载仍使用本服务端地址。设置持久化至 `VPN_DATA_DIR/client-update-sync.json` 的 `proxy_url` 字段；修改后下次同步生效，无需重启。旧 API 请求省略 `proxy_url` 时保留原配置，提交空字符串清除代理。
+
+### GitHub API Token
+
+“客户端版本 → 同步设置”可保存、替换或清除 GitHub Token。后台只返回 `github_token_set` 状态，不回传 Token。保存设置时不传 `github_token` 表示保留原值，空字符串表示清除。Token 仅用于固定的 GitHub 发布 API 请求，该请求不跟随重定向；安装包和签名下载不携带 Token。Token 保存在数据目录的同步配置文件中，Unix 文件权限为 `0600`。

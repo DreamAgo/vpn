@@ -12,11 +12,6 @@ ASSETS = {
     "windows-x86_64": "vpn-gui-windows-amd64-setup-{tag}.exe",
     "darwin-x86_64": "vpn-gui-macos-amd64-{tag}.app.tar.gz",
     "darwin-aarch64": "vpn-gui-macos-arm64-{tag}.app.tar.gz",
-    # Keep the generic AppImage keys for older installed clients.
-    "linux-x86_64": "vpn-gui-linux-amd64-{tag}.AppImage",
-    "linux-aarch64": "vpn-gui-linux-arm64-{tag}.AppImage",
-    "linux-x86_64-deb": "vpn-gui-linux-amd64-{tag}.deb",
-    "linux-aarch64-deb": "vpn-gui-linux-arm64-{tag}.deb",
 }
 
 

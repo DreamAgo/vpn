@@ -31,10 +31,6 @@ class ManifestTests(unittest.TestCase):
             "windows-x86_64": ".exe",
             "darwin-x86_64": ".app.tar.gz",
             "darwin-aarch64": ".app.tar.gz",
-            "linux-x86_64": ".AppImage",
-            "linux-aarch64": ".AppImage",
-            "linux-x86_64-deb": ".deb",
-            "linux-aarch64-deb": ".deb",
         }
         self.assertEqual(set(manifest["platforms"]), set(expected))
         for target, extension in expected.items():

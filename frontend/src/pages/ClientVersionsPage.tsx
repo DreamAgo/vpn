@@ -8,6 +8,7 @@ export function ClientVersionsPage() {
   const cache = useQueryClient();
   const query = useQuery({ queryKey: ['client-updates'], queryFn: clientUpdatesApi.status, refetchInterval: 3000 });
   const [base, setBase] = useState<string | null>(null);
+  const [token, setToken] = useState<string | null>(null);
   const [proxy, setProxy] = useState<string | null>(null);
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
@@ -18,9 +19,9 @@ export function ClientVersionsPage() {
   const save = async () => {
     setSaving(true);
     try {
-      const next = await clientUpdatesApi.save(auto, address, proxy ?? data?.proxyUrl ?? "");
+      const next = await clientUpdatesApi.save(auto, address, proxy ?? data?.proxyUrl ?? "", token ?? undefined);
       cache.setQueryData(['client-updates'], next);
-      setBase(null); setEnabled(null); setProxy(null);
+      setBase(null); setEnabled(null); setProxy(null); setToken(null);
       message.success('设置已保存');
     } catch (e) { message.error(e instanceof Error ? e.message : '保存失败'); }
     finally { setSaving(false); }
@@ -47,10 +48,15 @@ export function ClientVersionsPage() {
         <label htmlFor="update-proxy">GitHub 下载代理（可选）</label>
         <Input.Password id="update-proxy" value={proxy ?? data?.proxyUrl ?? ''} onChange={e => setProxy(e.target.value)} placeholder="http://代理服务器:7897" autoComplete="off" disabled={data?.syncing || saving} />
         <Typography.Text type="secondary">支持 HTTP/HTTPS 代理，手动和自动同步均生效。留空直连。请填写服务端能访问的地址；127.0.0.1 指服务端自身。</Typography.Text>
+        <label htmlFor="update-token">GitHub Token（可选）</label>
+        <Input.Password id="update-token" value={token ?? ''} onChange={e => setToken(e.target.value || null)} autoComplete="new-password" placeholder={data?.githubTokenSet ? '已保存，留空保留原 Token' : '填写 GitHub Token'} disabled={data?.syncing || saving} />
+        <Space><Typography.Text type="secondary">{token === '' ? '保存后将清除 Token' : data?.githubTokenSet ? 'Token 已配置，保存后不回显' : '用于认证 GitHub API 请求'}</Typography.Text>
+          {(data?.githubTokenSet || token) && <Button size="small" onClick={() => setToken('')} disabled={data?.syncing || saving}>清除 Token</Button>}
+        </Space>
         <Space><Switch checked={auto} onChange={setEnabled} disabled={data?.syncing} /><span>每小时自动同步（开启后一分钟内首次检查）</span></Space>
         <Space wrap>
           <Button onClick={save} loading={saving} disabled={!data || data.syncing || starting}>保存设置</Button>
-          <Button type="primary" onClick={sync} loading={starting || data?.syncing} disabled={!data?.publicBaseUrl || saving || base !== null || enabled !== null || proxy !== null}>立即同步最新版本</Button>
+          <Button type="primary" onClick={sync} loading={starting || data?.syncing} disabled={!data?.publicBaseUrl || saving || base !== null || enabled !== null || proxy !== null || token !== null}>立即同步最新版本</Button>
         </Space>
         {!data?.publicBaseUrl && <Typography.Text type="secondary">请先确认服务端地址并保存设置，再开始同步。</Typography.Text>}
       </Space>

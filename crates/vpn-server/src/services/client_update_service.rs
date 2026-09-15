@@ -44,13 +44,15 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub downloads: Vec<LocalAsset>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SyncRecord {
     pub auto_sync: bool,
     #[serde(default)]
     pub public_base_url: String,
     #[serde(default)]
     pub proxy_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub github_token: String,
     pub last_checked_at: Option<i64>,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
@@ -59,6 +61,7 @@ pub struct SyncRecord {
 pub struct UpdateStatus {
     #[serde(flatten)]
     pub record: SyncRecord,
+    pub github_token_set: bool,
     pub repository: &'static str,
     pub syncing: bool,
     pub next_check_at: Option<i64>,
@@ -131,7 +134,10 @@ impl ClientUpdateService {
                 .map(|t| t + INTERVAL_MS)
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() + 60_000)
         });
+        let github_token_set = !record.github_token.is_empty();
+        record.github_token.clear();
         UpdateStatus {
+            github_token_set,
             record,
             repository: REPO,
             syncing: self.gate.try_lock().is_err(),
@@ -144,7 +150,9 @@ impl ClientUpdateService {
         enabled: bool,
         base_url: &str,
         proxy_url: Option<&str>,
+        github_token: Option<&str>,
     ) -> Result<()> {
+        let github_token = github_token.map(normalize_token).transpose()?;
         let base_url = normalize_base(base_url)?;
         let proxy_url = proxy_url.map(normalize_proxy).transpose()?;
         let _guard = self
@@ -158,6 +166,9 @@ impl ClientUpdateService {
         }
         next.auto_sync = enabled;
         next.public_base_url = base_url;
+        if let Some(token) = github_token {
+            next.github_token = token;
+        }
         if let Some(proxy_url) = proxy_url {
             next.proxy_url = proxy_url;
         }
@@ -230,13 +241,17 @@ impl ClientUpdateService {
     }
     async fn fetch_and_publish(&self, stage: &Path, base: &str) -> Result<()> {
         let base = normalize_base(base)?;
-        let proxy_url = self.record.lock().await.proxy_url.clone();
-        let client = github_client(&proxy_url)?;
-        let bytes = download(
-            &client,
-            &format!("https://api.github.com/repos/{REPO}/releases/latest"),
-        )
-        .await?;
+        let record = self.record.lock().await.clone();
+        let client = github_client(&record.proxy_url)?;
+        // Token is attached only to the fixed GitHub API request; never follow its redirects.
+        let api_client = github_client_for(&record.proxy_url, true)?;
+        let mut request = api_client.get(format!(
+            "https://api.github.com/repos/{REPO}/releases/latest"
+        ));
+        if !record.github_token.is_empty() {
+            request = request.bearer_auth(&record.github_token);
+        }
+        let bytes = download_request(request).await?;
         let release: Release =
             serde_json::from_slice(&bytes).map_err(|_| "GitHub 发布信息格式错误".to_string())?;
         if release.draft || release.prerelease {
@@ -256,8 +271,14 @@ impl ClientUpdateService {
             return Err("GitHub 更新清单地址或大小不符合要求".into());
         }
         let bytes = download(&client, &asset.browser_download_url).await?;
-        let manifest: Manifest =
+        let mut manifest: Manifest =
             serde_json::from_slice(&bytes).map_err(|_| "更新清单 JSON 格式错误".to_string())?;
+        manifest
+            .platforms
+            .retain(|platform, _| !platform.starts_with("linux-"));
+        manifest
+            .downloads
+            .retain(|asset| !asset.name.starts_with("vpn-gui-linux-"));
         validate(&manifest, &release)?;
         let packages = package_assets(&release)?;
         if let Some(current) = self.current().await? {
@@ -401,7 +422,7 @@ fn package_assets(release: &Release) -> Result<Vec<&Asset>> {
     let assets: Vec<_> = release
         .assets
         .iter()
-        .filter(|a| a.name.starts_with("vpn-gui-"))
+        .filter(|a| a.name.starts_with("vpn-gui-") && !a.name.starts_with("vpn-gui-linux-"))
         .collect();
     let mut total = 0u64;
     let mut names = std::collections::HashSet::new();
@@ -522,7 +543,23 @@ fn normalize_proxy(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+fn normalize_token(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.len() > 512
+        || !value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Err("GitHub Token 格式无效".into());
+    }
+    Ok(value.to_owned())
+}
+
 fn github_client(proxy_url: &str) -> Result<reqwest::Client> {
+    github_client_for(proxy_url, false)
+}
+
+fn github_client_for(proxy_url: &str, api: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .user_agent("yilian-client-update-sync")
@@ -535,6 +572,9 @@ fn github_client(proxy_url: &str) -> Result<reqwest::Client> {
                 attempt.error("unexpected GitHub redirect")
             }
         }));
+    if api {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
     let proxy_url = normalize_proxy(proxy_url)?;
     if !proxy_url.is_empty() {
         builder = builder.proxy(reqwest::Proxy::all(&proxy_url).map_err(|_| "代理地址无效")?);
@@ -557,8 +597,10 @@ fn allowed_host(url: &reqwest::Url) -> bool {
         )
 }
 async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let mut response = client
-        .get(url)
+    download_request(client.get(url)).await
+}
+async fn download_request(request: reqwest::RequestBuilder) -> Result<Vec<u8>> {
+    let mut response = request
         .timeout(Duration::from_secs(30))
         .send()
         .await
@@ -601,10 +643,6 @@ fn validate(manifest: &Manifest, release: &Release) -> Result<()> {
         ("windows-x86_64", "windows-amd64-setup", "exe"),
         ("darwin-x86_64", "macos-amd64", "app.tar.gz"),
         ("darwin-aarch64", "macos-arm64", "app.tar.gz"),
-        ("linux-x86_64", "linux-amd64", "AppImage"),
-        ("linux-aarch64", "linux-arm64", "AppImage"),
-        ("linux-x86_64-deb", "linux-amd64", "deb"),
-        ("linux-aarch64-deb", "linux-arm64", "deb"),
     ];
     if manifest.platforms.len() != required.len() {
         return Err("更新清单平台不完整或包含未知平台".into());
@@ -740,6 +778,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn token_is_persisted_but_never_returned_in_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ClientUpdateService::new(dir.path().to_owned());
+        service
+            .configure(
+                false,
+                "https://vpn.example",
+                None,
+                Some("github_pat_TEST123"),
+            )
+            .await
+            .unwrap();
+        let restored = ClientUpdateService::new(dir.path().to_owned());
+        assert_eq!(
+            restored.record.lock().await.github_token,
+            "github_pat_TEST123"
+        );
+        let status = serde_json::to_value(restored.status().await).unwrap();
+        assert_eq!(status["github_token_set"], true);
+        assert!(status.get("github_token").is_none());
+        assert!(!status.to_string().contains("github_pat_TEST123"));
+        restored
+            .configure(true, "https://vpn.example", None, None)
+            .await
+            .unwrap();
+        assert!(restored.status().await.github_token_set);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.path().join("client-update-sync.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        restored
+            .configure(true, "https://vpn.example", None, Some(""))
+            .await
+            .unwrap();
+        assert!(
+            !ClientUpdateService::new(dir.path().to_owned())
+                .status()
+                .await
+                .github_token_set
+        );
+        assert!(normalize_token("secret\r\nAuthorization: injected").is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_api_client_does_not_follow_redirects() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..n]).contains("Bearer test_token"));
+            socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid/leak\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        });
+        let client = github_client_for("", true).unwrap();
+        let response = client
+            .get(format!("http://{address}/api"))
+            .bearer_auth("test_token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.unwrap();
+        let download = github_client("")
+            .unwrap()
+            .get("https://github.com/test")
+            .build()
+            .unwrap();
+        assert!(download
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none());
+    }
+
     fn fixture() -> (Manifest, Release, Vec<(String, Vec<u8>)>) {
         let mut manifest = Manifest {
             version: "0.1.21".into(),
@@ -759,10 +881,6 @@ mod tests {
             ("windows-x86_64", "windows-amd64-setup", "exe"),
             ("darwin-x86_64", "macos-amd64", "app.tar.gz"),
             ("darwin-aarch64", "macos-arm64", "app.tar.gz"),
-            ("linux-x86_64", "linux-amd64", "AppImage"),
-            ("linux-aarch64", "linux-arm64", "AppImage"),
-            ("linux-x86_64-deb", "linux-amd64", "deb"),
-            ("linux-aarch64-deb", "linux-arm64", "deb"),
         ] {
             let name = format!("vpn-gui-{name}-v0.1.21.{ext}");
             let url = format!("https://github.com/{REPO}/releases/download/v0.1.21/{name}");
@@ -798,7 +916,7 @@ mod tests {
         m.platforms.get_mut("darwin-aarch64").unwrap().url = "http://127.0.0.1/private".into();
         assert!(validate(&m, &r).is_err());
         let (mut m, _, _) = fixture();
-        m.platforms.remove("linux-aarch64-deb");
+        m.platforms.remove("darwin-aarch64");
         assert!(validate(&m, &r).is_err());
         let (m, _, _) = fixture();
         r.tag_name = "v0.1.22".into();
@@ -898,7 +1016,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = Arc::new(ClientUpdateService::new(dir.path().to_owned()));
         service
-            .configure(true, "https://vpn.example", Some("http://127.0.0.1:7897"))
+            .configure(
+                true,
+                "https://vpn.example",
+                Some("http://127.0.0.1:7897"),
+                None,
+            )
             .await
             .unwrap();
         let restored = ClientUpdateService::new(dir.path().to_owned());
@@ -912,7 +1035,7 @@ mod tests {
             "http://127.0.0.1:7897/"
         );
         restored
-            .configure(true, "https://vpn.example", None)
+            .configure(true, "https://vpn.example", None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -920,7 +1043,7 @@ mod tests {
             "http://127.0.0.1:7897/"
         );
         restored
-            .configure(true, "https://vpn.example", Some(""))
+            .configure(true, "https://vpn.example", Some(""), None)
             .await
             .unwrap();
         assert!(ClientUpdateService::new(dir.path().to_owned())
@@ -932,7 +1055,7 @@ mod tests {
         let _lock = service.gate.lock().await;
         assert!(service.queue().is_err());
         assert!(service
-            .configure(false, "https://vpn.example", None)
+            .configure(false, "https://vpn.example", None, None)
             .await
             .is_err());
     }
@@ -987,12 +1110,12 @@ mod tests {
         let root = std::env::var("VPN_UPDATE_TEST_DIR").expect("isolated test directory required");
         let service = ClientUpdateService::new(PathBuf::from(root));
         service
-            .configure(false, "http://127.0.0.1:18081", None)
+            .configure(false, "http://127.0.0.1:18081", None, None)
             .await
             .unwrap();
         service.sync().await.unwrap();
         let status = service.status().await;
         assert!(status.record.last_error.is_none());
-        assert_eq!(status.manifest.unwrap().platforms.len(), 7);
+        assert_eq!(status.manifest.unwrap().platforms.len(), 3);
     }
 }

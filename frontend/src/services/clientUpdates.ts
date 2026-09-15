@@ -3,6 +3,7 @@ export interface ClientUpdateStatus {
   autoSync: boolean;
   publicBaseUrl: string;
   proxyUrl: string;
+  githubTokenSet: boolean;
   lastCheckedAt: number | null;
   lastSyncedAt: number | null;
   lastError: string | null;
@@ -18,8 +19,8 @@ export interface ClientUpdateStatus {
 }
 export const clientUpdatesApi = {
   async status() { return (await http.get<ClientUpdateStatus>('/admin/client-updates')).data; },
-  async save(autoSync: boolean, publicBaseUrl: string, proxyUrl: string) {
-    return (await http.put<ClientUpdateStatus>('/admin/client-updates', { autoSync, publicBaseUrl, proxyUrl })).data;
+  async save(autoSync: boolean, publicBaseUrl: string, proxyUrl: string, githubToken?: string) {
+    return (await http.put<ClientUpdateStatus>('/admin/client-updates', { autoSync, publicBaseUrl, proxyUrl, githubToken })).data;
   },
   async sync() { return (await http.post<ClientUpdateStatus>('/admin/client-updates/sync')).data; },
 };

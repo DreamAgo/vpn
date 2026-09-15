@@ -28,6 +28,8 @@ pub struct Settings {
     public_base_url: String,
     #[serde(default)]
     proxy_url: Option<String>,
+    #[serde(default)]
+    github_token: Option<String>,
 }
 pub async fn configure(
     State(state): State<AppState>,
@@ -40,6 +42,7 @@ pub async fn configure(
             settings.auto_sync,
             &settings.public_base_url,
             settings.proxy_url.as_deref(),
+            settings.github_token.as_deref(),
         )
         .await
         .map_err(AppError::Validation)?;
