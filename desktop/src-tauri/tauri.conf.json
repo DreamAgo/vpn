@@ -54,10 +54,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYwRDYwRDY3RjY4REFGRDgKUldUWXI0MzJadzNXWUJiaHd2aUcxYlRJTUVHMkFmWFdodHlwR3hZamdsZHhKVlV4L1lrNk5rekEK",
-      "dangerousInsecureTransportProtocol": true,
-      "endpoints": [
-        "http://121.199.72.138:8080/updates/latest.json"
-      ]
+      "endpoints": []
     }
   }
 }
