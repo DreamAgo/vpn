@@ -31,7 +31,7 @@ fn grant<'a>(
 ) -> ApprovedGrant<'a> {
     ApprovedGrant {
         instance_code,
-        group_id,
+        group_ids: vec![group_id.to_string()],
         expires_at,
         reason: "project",
         identity: ApprovalIdentity {

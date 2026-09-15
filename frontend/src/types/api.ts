@@ -265,6 +265,20 @@ export interface UserApprovalGrantDto {
   expiresAt: number; // Unix 毫秒，独占截止时间
 }
 
+export interface FeishuBindingDto {
+  unionId: string;
+  name: string;
+  email: string;
+  status: 'unknown' | 'active' | 'inactive' | 'frozen' | 'resigned' | 'deleted';
+  blocked: boolean;
+  syncedAt: number | null;
+  lastError: string | null;
+}
+export interface FeishuLookupRequest {
+  userId: string;
+  idType: 'open_id' | 'user_id' | 'union_id';
+}
+
 export interface UserDto {
   id: string;
   username: string;
@@ -275,6 +289,7 @@ export interface UserDto {
   lastLoginAt: number | null;
   accessMode?: 'legacy' | 'approval_required';
   approvalGrants?: UserApprovalGrantDto[];
+  feishuBindings?: FeishuBindingDto[];
   groupIds: string[]; // 所属用户组 id 列表（可属多个组；未分组为空）
   maxDevices: number; // 终端数量上限（≥1，默认 1）
   createdAt: number;

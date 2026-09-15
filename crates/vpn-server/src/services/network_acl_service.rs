@@ -85,7 +85,7 @@ async fn build_acl_snapshot(
     let peers: Vec<(String, String)> = sqlx::query_as(
         r#"SELECT p.vpn_ip, p.routed_subnets
                  FROM peers p JOIN users u ON u.id=p.user_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'"#,
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active' AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=u.id AND f.blocked=1)"#,
     )
     .fetch_all(pool)
     .await
@@ -107,7 +107,7 @@ async fn build_acl_snapshot(
                  JOIN users u ON u.id=p.user_id
                  JOIN user_group_members m ON m.user_id=p.user_id
                  JOIN user_groups g ON g.id=m.group_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'"#,
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active' AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=u.id AND f.blocked=1)"#,
     )
     .fetch_all(pool)
     .await
@@ -117,7 +117,7 @@ async fn build_acl_snapshot(
                  JOIN users u ON u.id=p.user_id
                  JOIN access_grants a ON a.user_id=p.user_id
                  JOIN user_groups g ON g.id=a.group_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active' AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=u.id AND f.blocked=1)
                   AND a.expires_at>?1"#,
     )
     .bind(now)
@@ -126,7 +126,7 @@ async fn build_acl_snapshot(
     .map_err(db)?;
     let legacy: Vec<(String,)> = sqlx::query_as(
         r#"SELECT p.vpn_ip FROM peers p JOIN users u ON u.id=p.user_id
-                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active'
+                WHERE p.status NOT IN ('deleted','force_removed') AND u.status='active' AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=u.id AND f.blocked=1)
                   AND u.access_mode='legacy'
                   AND NOT EXISTS (SELECT 1 FROM user_group_members m WHERE m.user_id=u.id)
                   AND NOT EXISTS (SELECT 1 FROM access_grants a

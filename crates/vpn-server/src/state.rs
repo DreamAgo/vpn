@@ -19,6 +19,7 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub restart_tx: Option<tokio::sync::watch::Sender<bool>>,
     pub auth_service: Option<Arc<AuthService>>,
+    pub feishu_directory_service: Option<Arc<crate::services::FeishuDirectoryService>>,
     pub feishu_auth_service: Option<Arc<FeishuAuthService>>,
     pub feishu_approval_service: Option<Arc<FeishuApprovalService>>,
     pub external_options_service: Option<Arc<ExternalOptionsService>>,
@@ -45,6 +46,7 @@ impl AppState {
             restart_tx: None,
             auth_service: None,
             feishu_auth_service: None,
+            feishu_directory_service: None,
             feishu_approval_service: None,
             external_options_service: None,
             api_key_service: None,
@@ -66,6 +68,21 @@ impl AppState {
     pub fn with_auth_service(mut self, svc: Arc<AuthService>) -> Self {
         self.auth_service = Some(svc);
         self
+    }
+
+    pub fn with_feishu_directory_service(
+        mut self,
+        svc: Arc<crate::services::FeishuDirectoryService>,
+    ) -> Self {
+        self.feishu_directory_service = Some(svc);
+        self
+    }
+    pub fn feishu_directory_service(
+        &self,
+    ) -> Result<Arc<crate::services::FeishuDirectoryService>, vpn_core::AppError> {
+        self.feishu_directory_service
+            .clone()
+            .ok_or_else(|| vpn_core::AppError::Config("请启用并配置飞书登录后重启服务".into()))
     }
 
     pub fn with_feishu_auth_service(mut self, svc: Arc<FeishuAuthService>) -> Self {

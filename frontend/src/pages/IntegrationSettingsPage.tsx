@@ -228,6 +228,23 @@ export function IntegrationSettingsPage() {
           </Form.Item>
         </Card>
 
+        <Card title="飞书用户状态同步" style={{ marginTop: 16 }}>
+          <Typography.Paragraph>
+            只同步已绑定飞书的 VPN 账号；手动创建且未绑定的账号不受影响。可在用户管理中绑定用户、查看飞书状态和手动同步。
+            冻结、离职、退出或未激活会限制登录并断开 VPN；恢复后仍受管理员禁用及审批有效期约束。
+          </Typography.Paragraph>
+          <Typography.Paragraph>
+            启用飞书登录并重启后，会自动逐项校对已绑定身份。请为应用开通通讯录用户信息、状态及邮箱读取权限，并将目标人员加入可见范围。
+          </Typography.Paragraph>
+          <Typography.Paragraph>
+            已启用审批时，继续使用原审批事件请求地址，添加员工信息变更、员工离职和员工入职事件即可；仅使用通讯录同步时，请使用下方地址。
+          </Typography.Paragraph>
+          <Typography.Text code copyable>{`${window.location.origin}/api/v1/integrations/feishu/contact-events`}</Typography.Text>
+          <Typography.Paragraph type="secondary">
+            事件使用下方同一组 Verification Token 和 Encrypt Key。审批的“订阅审批事件”按钮不会代替通讯录事件订阅。
+          </Typography.Paragraph>
+        </Card>
+
         <Card title="飞书审批" style={{ marginTop: 16 }}>
           <Form.Item name="approvalEnabled" label="启用飞书审批" valuePropName="checked"><Switch /></Form.Item>
           <Form.Item name="approvalCode" label="审批 Code"><Input /></Form.Item>

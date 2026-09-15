@@ -58,6 +58,68 @@ impl UserService {
         }
     }
 
+    pub async fn update_grant_expiry(
+        &self,
+        actor: &str,
+        user_id: &str,
+        group_id: &str,
+        expires_at: i64,
+        expected: i64,
+    ) -> Result<()> {
+        // 限制到公历 9999 年以内，允许设置过去时间以立即终止授权。
+        if !(1..=253402271999000).contains(&expires_at) {
+            return Err(AppError::Validation("到期时间超出有效范围".into()));
+        }
+        let db = |e| AppError::Internal(Box::new(e));
+        let mut tx = self.user_repo.pool().begin().await.map_err(db)?;
+        // 先获得写锁，读取与修改使用同一事务。
+        sqlx::query(
+            "UPDATE access_grants SET updated_at=updated_at WHERE user_id=?1 AND group_id=?2",
+        )
+        .bind(user_id)
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        let before: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id,expires_at FROM access_grants WHERE user_id=?1 AND group_id=?2 ORDER BY id",
+        )
+        .bind(user_id)
+        .bind(group_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        let current = before
+            .iter()
+            .map(|(_, expiry)| *expiry)
+            .max()
+            .ok_or_else(|| AppError::Validation("该用户组没有可修改的审批授权".into()))?;
+        if current != expected {
+            return Err(AppError::Validation(
+                "授权到期时间已变化，请刷新后重新修改".into(),
+            ));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        // 列表按组取最大值，必须同时调整该组已有授权，缩短期限才能实际生效。
+        sqlx::query(
+            "UPDATE access_grants SET expires_at=?3,updated_at=?4 WHERE user_id=?1 AND group_id=?2",
+        )
+        .bind(user_id)
+        .bind(group_id)
+        .bind(expires_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        let metadata = serde_json::json!({"target_user_id":user_id,"group_id":group_id,
+            "before":before,"previous_expires_at":current,"expires_at":expires_at});
+        sqlx::query("INSERT INTO audit_logs(id,user_id,username,action,resource,metadata,created_at) VALUES(?1,?2,(SELECT username FROM users WHERE id=?2),'grant.expiry.update',?3,?4,?5)")
+            .bind(Uuid::new_v4().to_string()).bind(actor).bind(format!("users/{user_id}/approval-grants/{group_id}"))
+            .bind(metadata.to_string()).bind(now).execute(&mut *tx).await.map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+
     async fn populate_approval_grants(&self, users: &mut [UserDto]) -> Result<()> {
         let ids: Vec<&str> = users.iter().map(|user| user.id.as_str()).collect();
         let grants = self.user_repo.approval_expiries(&ids).await?;
@@ -69,6 +131,10 @@ impl UserService {
                     expires_at,
                 });
             }
+        }
+        for user in users {
+            user.feishu_bindings =
+                super::feishu_directory_service::bindings(self.user_repo.pool(), &user.id).await?;
         }
         Ok(())
     }
@@ -233,6 +299,7 @@ fn user_row_to_dto(row: UserRow) -> UserDto {
         max_devices: row.max_devices,
         access_mode: row.access_mode,
         approval_grants: Vec::new(),
+        feishu_bindings: Vec::new(),
         created_at: row.created_at,
     }
 }
@@ -293,6 +360,83 @@ mod tests {
             SqliteSessionRepository::new(pool),
             Arc::new(Argon2Hasher::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn expiry_edit_updates_all_same_group_grants_and_audits_atomically() {
+        let pool = setup_pool().await;
+        let svc = service(pool.clone());
+        let user = svc
+            .create_user("alice", "alice@example.com", None, None)
+            .await
+            .unwrap()
+            .user;
+        for group in ["g1", "g2"] {
+            sqlx::query("INSERT INTO user_groups(id,name,routes,created_at,updated_at) VALUES(?1,?1,'',0,0)")
+                .bind(group).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO user_group_members(user_id,group_id) VALUES(?1,'g1')")
+            .bind(&user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, group, expiry) in [("a", "g1", 1000), ("b", "g1", 2000), ("c", "g2", 3000)] {
+            sqlx::query("INSERT INTO access_grants(id,approval_instance_code,user_id,group_id,expires_at,created_at,updated_at) VALUES(?1,?1,?2,?3,?4,0,0)")
+                .bind(id).bind(&user.id).bind(group).bind(expiry).execute(&pool).await.unwrap();
+        }
+        svc.update_grant_expiry(&user.id, &user.id, "g1", 500, 2000)
+            .await
+            .unwrap();
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT id,expires_at FROM access_grants ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("a".into(), 500), ("b".into(), 500), ("c".into(), 3000)]
+        );
+        assert!(svc
+            .update_grant_expiry(&user.id, &user.id, "g1", 9000, 2000)
+            .await
+            .is_err());
+        assert!(svc
+            .update_grant_expiry(&user.id, &user.id, "missing", 9000, 500)
+            .await
+            .is_err());
+        assert!(svc
+            .update_grant_expiry(&user.id, &user.id, "g1", 0, 500)
+            .await
+            .is_err());
+        let audit: (String, String) = sqlx::query_as(
+            "SELECT user_id,metadata FROM audit_logs WHERE action='grant.expiry.update'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.0, user.id);
+        let data: serde_json::Value = serde_json::from_str(&audit.1).unwrap();
+        assert_eq!(data["previous_expires_at"], 2000);
+        assert_eq!(data["expires_at"], 500);
+        assert_eq!(data["before"].as_array().unwrap().len(), 2);
+        svc.update_grant_expiry(&user.id, &user.id, "g1", 9000, 500)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_group_members")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM users WHERE id=?1")
+                .bind(&user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "active"
+        );
     }
 
     #[tokio::test]

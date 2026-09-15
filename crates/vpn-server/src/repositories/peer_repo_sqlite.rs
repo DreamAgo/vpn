@@ -124,7 +124,7 @@ impl SqlitePeerRepository {
     /// 列出活跃 peer 的 (wg_public_key, vpn_ip, routed_subnets)，用于启动时向内核接口恢复配置。
     pub async fn list_active_peer_keys(&self) -> Result<Vec<(String, String, String)>> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT wg_public_key, vpn_ip, routed_subnets FROM peers WHERE status NOT IN ('deleted', 'force_removed')",
+            "SELECT wg_public_key, vpn_ip, routed_subnets FROM peers WHERE status NOT IN ('deleted', 'force_removed') AND EXISTS (SELECT 1 FROM users u WHERE u.id=peers.user_id AND u.status='active') AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=peers.user_id AND f.blocked=1)",
         )
         .fetch_all(&self.pool)
         .await

@@ -35,6 +35,53 @@ use zeroize::Zeroizing;
 use crate::daemon::{RoutePolicy, SharedState, TunnelTransport};
 use crate::error::{CliError, CliResult};
 
+/// 恢复只依赖认证握手，不用业务网站响应，避免权限/目标停机引发重连。
+#[derive(Default)]
+struct TunnelRecovery {
+    last_attempt: Option<Duration>,
+    attempts: u32,
+}
+impl TunnelRecovery {
+    fn healthy(&self, now: Duration, age: Option<Duration>, expired: bool) -> bool {
+        !expired
+            && age.is_some_and(|age| {
+                age < Duration::from_secs(180)
+                    && self
+                        .last_attempt
+                        .is_none_or(|last| now.saturating_sub(age) > last)
+            })
+    }
+    fn tick(&mut self, now: Duration, age: Option<Duration>, expired: bool) -> (bool, bool) {
+        if self.healthy(now, age, expired) {
+            self.attempts = 0;
+            self.last_attempt = None;
+            return (true, false);
+        }
+        let delay = Duration::from_secs((15u64 << self.attempts.min(2)).min(60));
+        let due = match self.last_attempt {
+            Some(last) => now.saturating_sub(last) >= delay,
+            None => expired || now >= Duration::from_secs(15),
+        };
+        if due {
+            self.last_attempt = Some(now);
+            self.attempts = self.attempts.saturating_add(1);
+        }
+        (false, due)
+    }
+}
+
+async fn renewed_udp(old: &UdpSocket) -> std::io::Result<UdpSocket> {
+    let peer = old.peer_addr()?;
+    let socket = UdpSocket::bind(if peer.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    })
+    .await?;
+    socket.connect(peer).await?;
+    Ok(socket)
+}
+
 const IP_UDP_OVERHEAD: u16 = 28;
 const WG_OVERHEAD: u16 = 32;
 const WG_BLOCK_SIZE: usize = 16;
@@ -604,7 +651,7 @@ impl UserspaceTunnel {
 #[allow(clippy::too_many_arguments)]
 async fn forward_loop(
     device: tun::AsyncDevice,
-    udp: UdpSocket,
+    mut udp: UdpSocket,
     mut tunn: Tunn,
     handle: Handle,
     mut added_routes: Vec<(String, Route)>,
@@ -645,6 +692,7 @@ async fn forward_loop(
     let mut last_udp_error_log = std::time::Instant::now();
     let mut obfs_drops: u64 = 0;
     let mut send_state = SendState::default();
+    let mut recovery = TunnelRecovery::default();
 
     // 立即发起握手（无 src 触发 handshake initiation）。
     if let TunnResult::WriteToNetwork(p) = tunn.encapsulate(&[], &mut enc_buf) {
@@ -771,6 +819,7 @@ async fn forward_loop(
             // 定时器：握手重传 / keepalive，并顺带把累计流量刷回状态。
             _ = ticker.tick() => {
                 let mut tbuf = vec![0u8; packet_buffer_size];
+                let mut expired = false;
                 match tunn.update_timers(&mut tbuf) {
                     TunnResult::WriteToNetwork(p) => {
                         if let Err(error) = send_network(&udp, obfs.as_ref(), p).await {
@@ -779,6 +828,7 @@ async fn forward_loop(
                         }
                     }
                     TunnResult::Err(error) => {
+                        expired = matches!(error, boringtun::noise::errors::WireGuardError::ConnectionExpired);
                         let cleared_pending = send_state.clear_pending_tx();
                         let diagnostic = NetworkSendError {
                             stage: "wireguard_timer",
@@ -790,6 +840,25 @@ async fn forward_loop(
                         timer_failures = timer_failures.saturating_add(1);
                     }
                     _ => {}
+                }
+                let (healthy, retry) = recovery.tick(loop_started.elapsed(), tunn.time_since_last_handshake(), expired);
+                if let Some(state) = &traffic { state.set_channel_health(true, healthy).await; }
+                if retry && !*shutdown.borrow() {
+                    // 新 socket 更新源端口/NAT 映射；保留 TUN、路由与密钥，不与退出清理竞态。
+                    match renewed_udp(&udp).await {
+                        Ok(socket) => udp = socket,
+                        Err(error) => tracing::warn!(error=%error, "恢复 UDP socket 失败，保留旧 socket 稍后重试"),
+                    }
+                    match tunn.format_handshake_initiation(&mut tbuf, true) {
+                        TunnResult::WriteToNetwork(packet) => {
+                            if let Err(error) = send_network(&udp, obfs.as_ref(), packet).await {
+                                send_state.failure_logger.record("recovery_handshake", packet, &error);
+                            }
+                        }
+                        TunnResult::Err(error) => tracing::warn!(?error, "重新发起 WireGuard 握手失败"),
+                        _ => {}
+                    }
+                    tracing::warn!(attempt=recovery.attempts, "数据隧道未就绪，已更新 UDP socket 并重新发起握手");
                 }
                 if (udp_send_failures > 0
                     || udp_recv_failures > 0
@@ -1350,6 +1419,73 @@ mod tests {
         assert_eq!(state.clear_pending_tx(), 2);
         assert!(state.pending_tx_lengths.is_empty());
         assert_eq!(state.clear_pending_tx(), 0);
+    }
+
+    #[test]
+    fn recovery_is_bounded_and_requires_a_new_authenticated_handshake() {
+        let secs = Duration::from_secs;
+        let mut recovery = TunnelRecovery::default();
+        assert_eq!(recovery.tick(secs(0), None, false), (false, false));
+        assert_eq!(recovery.tick(secs(15), None, false), (false, true));
+        assert_eq!(recovery.tick(secs(16), None, true), (false, false));
+        assert_eq!(recovery.tick(secs(44), None, true), (false, false));
+        assert_eq!(recovery.tick(secs(45), None, true), (false, true));
+        // 旧的握手记录不能把本轮恢复误报为成功。
+        assert_eq!(
+            recovery.tick(secs(46), Some(secs(20)), false),
+            (false, false)
+        );
+        assert_eq!(recovery.tick(secs(47), Some(secs(1)), false), (true, false));
+        assert_eq!(recovery.attempts, 0);
+        assert_eq!(
+            recovery.tick(secs(228), Some(secs(182)), false),
+            (false, true)
+        );
+        for now in 229..288 {
+            assert!(!recovery.tick(secs(now), None, true).0);
+        }
+        assert!(recovery.attempts < 4);
+    }
+
+    #[tokio::test]
+    async fn recovery_rebinds_udp_and_can_complete_a_fresh_handshake() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        old.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let new = renewed_udp(&old).await.unwrap();
+        assert_ne!(
+            old.local_addr().unwrap().port(),
+            new.local_addr().unwrap().port()
+        );
+        assert_eq!(old.peer_addr().unwrap(), new.peer_addr().unwrap());
+        let (mut client, mut server) = establish_tunn_pair();
+        let mut buffer = [0u8; 2048];
+        // 丢弃一次握手请求，恢复必须能重新生成有效请求。
+        assert!(matches!(
+            client.format_handshake_initiation(&mut buffer, true),
+            TunnResult::WriteToNetwork(_)
+        ));
+        let request = match client.format_handshake_initiation(&mut buffer, true) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("{other:?}"),
+        };
+        new.send(&request).await.unwrap();
+        let (n, from) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(from.port(), new.local_addr().unwrap().port());
+        let received = buffer[..n].to_vec();
+        let response = match server.decapsulate(None, &received, &mut buffer) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            client.decapsulate(None, &response, &mut buffer),
+            TunnResult::WriteToNetwork(_)
+        ));
+        assert!(client.time_since_last_handshake().unwrap() < Duration::from_secs(1));
     }
 
     fn establish_tunn_pair() -> (Tunn, Tunn) {

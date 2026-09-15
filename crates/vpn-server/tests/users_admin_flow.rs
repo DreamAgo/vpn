@@ -225,3 +225,41 @@ async fn admin_cannot_delete_or_reset_self() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], json!(2002));
 }
+
+#[tokio::test]
+async fn grant_expiry_route_requires_admin_and_rejects_missing_grants() {
+    let (app, _tmp, admin, _) = setup_admin().await;
+    let (_, created) = req(
+        &app,
+        "POST",
+        "/api/v1/admin/users",
+        Some(json!({"username":"expiry-user","email":"expiry@example.com"})),
+        Some(&admin),
+    )
+    .await;
+    let id = created["data"]["user"]["id"].as_str().unwrap();
+    let password = created["data"]["initial_password"].as_str().unwrap();
+    let (_, login) = req(
+        &app,
+        "POST",
+        "/api/v1/auth/login",
+        Some(json!({"username":"expiry-user","password":password})),
+        None,
+    )
+    .await;
+    let access = login["data"]["access_token"].as_str().unwrap();
+    let url = format!("/api/v1/admin/users/{id}/approval-grants/missing");
+    let input = json!({"expires_at":2000,"expected_expires_at":1000});
+    assert_eq!(
+        req(&app, "PATCH", &url, Some(input.clone()), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        req(&app, "PATCH", &url, Some(input.clone()), Some(access))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, body) = req(&app, "PATCH", &url, Some(input), Some(&admin)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

@@ -43,6 +43,7 @@ pub const PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 #[derive(Debug, Clone)]
 pub struct SharedState {
     inner: Arc<Mutex<StatusResponse>>,
+    health: Arc<Mutex<(bool, bool)>>,
 }
 
 impl Default for SharedState {
@@ -56,6 +57,7 @@ impl SharedState {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(StatusResponse::disconnected())),
+            health: Arc::new(Mutex::new((false, false))),
         }
     }
 
@@ -66,8 +68,36 @@ impl SharedState {
 
     /// 设置连接状态（并维护 since / last_error 的一致性）。
     pub async fn set_state(&self, state: ConnState, now_unix: i64) {
+        let mut health = self.health.lock().await;
+        if matches!(state, ConnState::Connecting | ConnState::Disconnected) {
+            *health = (false, false);
+        }
         let mut s = self.inner.lock().await;
         apply_state_transition(&mut s, state, now_unix);
+    }
+
+    /// 管理心跳与经过认证的 WireGuard 握手必须同时正常，才显示已连接。
+    pub async fn set_channel_health(&self, data_plane: bool, healthy: bool) {
+        let mut health = self.health.lock().await;
+        if data_plane {
+            health.0 = healthy;
+        } else {
+            health.1 = healthy;
+        }
+        let mut status = self.inner.lock().await;
+        if matches!(
+            status.state,
+            ConnState::Connecting | ConnState::Connected | ConnState::Reconnecting
+        ) {
+            let next = if health.0 && health.1 {
+                ConnState::Connected
+            } else {
+                ConnState::Reconnecting
+            };
+            if status.state != next {
+                apply_state_transition(&mut status, next, now_unix());
+            }
+        }
     }
 
     /// 设置已分配的 VPN IP。
@@ -562,13 +592,11 @@ pub async fn run_heartbeat(
                             ),
                             _ => {}
                         }
-                        // 抖动后恢复:从 Reconnecting 标回 Connected。
+                        if let Some(s) = &state { s.set_channel_health(false, true).await; }
+                        // HTTP 恢复不代表 WireGuard 握手恢复。
                         if failures > 0 {
                             failures = 0;
-                            tracing::info!("心跳恢复,连接已重新建立");
-                            if let Some(s) = &state {
-                                s.set_state(ConnState::Connected, now_unix()).await;
-                            }
+                            tracing::info!("管理心跳恢复，连接状态由数据隧道共同确认");
                         }
                     }
                     // 致命错误 → 交上层拆隧道、回登录，而非当瞬时错误无限重连、把死隧道挂着黑洞流量：
@@ -583,7 +611,7 @@ pub async fn run_heartbeat(
                         failures = failures.saturating_add(1);
                         tracing::warn!(stage = "heartbeat", result = "retrying", elapsed_ms = started.elapsed().as_millis(), error = %e.safe_diagnostic(), failures, "心跳失败,保持隧道并重试");
                         if let Some(s) = &state {
-                            s.set_state(ConnState::Reconnecting, now_unix()).await;
+                            s.set_channel_health(false, false).await;
                         }
                     }
                 }
@@ -845,7 +873,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         {
                             Ok(forward) => {
                                 state.set_vpn_ip(Some(params.vpn_ip.clone())).await;
-                                state.set_state(ConnState::Connected, now_unix()).await;
+                                state.set_channel_health(false, false).await;
                                 // 启动心跳任务：每 30s 上报，daemon 在线即自动保活。
                                 // 韧性重连:瞬时失败不退出;仅致命错误(强制下线/peer 被删)才退出并置错误态。
                                 let api_hb = api.clone();
@@ -962,6 +990,33 @@ mod tests {
         let message = shared.snapshot().await.last_error.unwrap();
         assert!(message.contains("[REDACTED sensitive diagnostic]"));
         assert!(!message.contains("synthetic-secret"));
+    }
+
+    #[tokio::test]
+    async fn connection_health_requires_both_channels_and_never_revives_stopped_connections() {
+        let state = SharedState::new();
+        state.set_state(ConnState::Connecting, 1).await;
+        state.set_channel_health(false, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Reconnecting);
+        state.set_channel_health(true, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Connected);
+        state.set_channel_health(true, false).await;
+        state.set_channel_health(false, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Reconnecting);
+        state.set_channel_health(false, false).await;
+        state.set_channel_health(true, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Reconnecting);
+        state.set_channel_health(false, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Connected);
+        state.set_state(ConnState::Disconnected, 2).await;
+        state.set_channel_health(true, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Disconnected);
+        state.set_state(ConnState::Connecting, 3).await;
+        state.set_channel_health(false, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Reconnecting);
+        state.set_error("fatal", 4).await;
+        state.set_channel_health(true, true).await;
+        assert_eq!(state.snapshot().await.state, ConnState::Error);
     }
 
     #[test]

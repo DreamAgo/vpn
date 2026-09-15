@@ -41,6 +41,7 @@ impl AuthService {
         ip: Option<&str>,
         ua: Option<&str>,
     ) -> Result<LoginOutcome> {
+        self.user_repo.ensure_available(&user.id).await?;
         if user.status == "disabled" {
             return Err(AppError::AccountDisabled);
         }
@@ -106,6 +107,7 @@ impl AuthService {
             }
         };
 
+        self.user_repo.ensure_available(&user.id).await?;
         if user.status == "disabled" {
             return Err(AppError::AccountDisabled);
         }
@@ -134,6 +136,7 @@ impl AuthService {
             .find_by_id(&session.user_id)
             .await?
             .ok_or(AppError::TokenExpired)?;
+        self.user_repo.ensure_available(&user.id).await?;
         if user.status == "disabled" {
             return Err(AppError::AccountDisabled);
         }

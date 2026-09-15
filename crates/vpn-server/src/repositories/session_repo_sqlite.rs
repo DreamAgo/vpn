@@ -120,7 +120,7 @@ impl SqliteSessionRepository {
                  AND EXISTS (
                      SELECT 1 FROM users
                      WHERE users.id = sessions.user_id
-                       AND users.status = 'active'
+                       AND users.status = 'active' AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=users.id AND f.blocked=1)
                  )"#,
         )
         .bind(expires_at_ms)

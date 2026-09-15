@@ -122,6 +122,21 @@ pub struct SqliteUserRepository {
 }
 
 impl SqliteUserRepository {
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    pub async fn ensure_available(&self, user_id: &str) -> Result<()> {
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "SELECT status, EXISTS(SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=users.id AND f.blocked=1) FROM users WHERE id=?1")
+            .bind(user_id).fetch_optional(&self.pool).await.map_err(|e| AppError::Database(Box::new(e)))?;
+        match row {
+            Some((status, false)) if status == "active" => Ok(()),
+            Some(_) => Err(AppError::AccountDisabled),
+            None => Err(AppError::UserNotFound),
+        }
+    }
+
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
@@ -352,6 +367,15 @@ impl SqliteUserRepository {
                 })?;
                 user_id.to_string()
             };
+            if provider == "feishu" {
+                let other: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM external_identities WHERE provider='feishu' AND user_id=?1 AND subject!=?2)")
+                    .bind(&id).bind(subject).fetch_one(&mut *tx).await.map_err(|e|AppError::Database(Box::new(e)))?;
+                if other {
+                    return Err(AppError::DuplicateResource(
+                        "该账号已绑定其他飞书身份".into(),
+                    ));
+                }
+            }
             sqlx::query(
                 "INSERT INTO external_identities (provider, subject, user_id, created_at) VALUES (?1, ?2, ?3, ?4)",
             )

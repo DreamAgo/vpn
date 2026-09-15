@@ -272,3 +272,44 @@ curl -sS -X DELETE http://127.0.0.1:8080/api/v1/admin/api-keys/$API_KEY_ID \
 - `audit:read`
 - `system:write`
 - `admin:*`
+
+## 飞书用户绑定与状态同步
+
+启用飞书登录并重启服务端后，系统只同步 `external_identities` 中已绑定的飞书身份。**手动创建且未绑定飞书的账号不受通讯录同步影响**；不会按通讯录邮箱批量绑定或建号。原有飞书登录/审批首次关联逻辑继续使用稳定 `union_id`，手动绑定也通过飞书接口重新核实身份；已经绑定的账号或身份不能被另一绑定覆盖。
+
+用户管理提供“绑定飞书用户”（输入 Open ID / User ID / Union ID、查询预览、确认绑定）、单用户“同步飞书状态”以及“同步所有已绑定飞书用户”。列表显示姓名、邮箱、飞书状态、最近成功同步时间和同步错误。飞书字段只更新身份信息，不覆盖本地账号邮箱或管理员设置。
+
+- `active`：已激活且未冻结、离职、退出；允许继续使用，但仍受本地管理员禁用、组权限和审批到期时间限制。
+- `inactive` / `frozen` / `resigned` / `deleted`：独立限制该绑定账号，拒绝密码/飞书登录、Access Token API 请求、Refresh Token 续期和 VPN 注册/心跳，撤销刷新会话并摘除现有 VPN 节点。
+- `unknown`：尚未成功同步。字段缺失、网络失败、接口权限不足或通讯录范围变化只记录错误并保留已知状态，不把查询失败解释成离职。已经明确受限的用户不会因这些错误恢复。
+- 解除飞书限制不会修改本地 `users.status`、续期审批或恢复旧刷新会话。管理员禁用仍优先。
+
+事件配置：
+
+1. 在飞书应用开通所需的通讯录用户信息、状态、邮箱读取权限，确保已绑定用户在应用通讯录可见范围内；按平台要求发布应用。
+2. 配置 Verification Token 和 Encrypt Key，保存后重启。这两个字段与审批事件共用。
+3. 已启用审批时保留现有 `/api/v1/integrations/feishu/approval-events` 事件请求地址，该入口同时分发通讯录事件；只使用通讯录同步时可配置 `/api/v1/integrations/feishu/contact-events`。
+4. 添加 `contact.user.updated_v3`、`contact.user.deleted_v3`、`contact.user.created_v3`。审批定义的手动订阅按钮不负责这些通讯录事件。
+
+事件经过时间窗、签名、解密、Token 和 App ID 校验，入库后才 ACK。重复事件幂等，变更载荷的同 ID 重放会被拒绝。变更事件重新获取当前用户事实；离职事件在用户不可读取时按已验真的离职通知限制账号。乱序旧事件不会覆盖新事件；读取到已恢复用户时以当前信息为准。
+
+后台每两秒扫描一项到期身份，成功或失败后同一身份的周期校对间隔至少五分钟；较大的队列逐项处理。事件失败至少三十秒后重试；手动全量同步只重置已绑定身份的排队时间。VPN 摘除失败会持续重试，服务端重启也不会重新装载已受限用户的节点。
+
+管理员 API：
+
+| 方法与路径 | 用途 |
+|---|---|
+| `POST /api/v1/admin/integrations/feishu/users/lookup` | 请求 `{user_id, id_type}`，从飞书查询绑定预览，不写入绑定 |
+| `POST /api/v1/admin/users/{id}/feishu-binding` | 同样的请求字段，重新核实身份后事务性写入绑定及状态 |
+| `POST /api/v1/admin/users/{id}/feishu-sync` | 立即同步此账号已绑定的飞书身份 |
+| `POST /api/v1/admin/integrations/feishu/users/sync` | 安排所有已绑定身份同步，返回数量 |
+
+所有管理员 API 都需要管理员身份；通讯录错误响应只包含分类和错误码，不返回令牌或原始用户响应。备份格式升级到 v3，包含飞书状态和通讯录事件队列；仍支持导入 v1/v2，旧格式中不存在的状态需重新同步。
+
+参考：[飞书获取单个用户](https://open.feishu.cn/document/server-docs/contact-v3/user/get)、[员工信息变更](https://open.feishu.cn/document/server-docs/contact-v3/user/events/updated)、[员工离职](https://open.feishu.cn/document/server-docs/contact-v3/user/events/deleted)。
+
+### 管理员修改审批授权到期时间
+
+用户列表中每个审批用户组旁的“修改到期时间”按上海时间（UTC+8）编辑独占截止时刻，允许延长、缩短或设为过去时间使授权立即失效。修改会调整该用户在该组的所有已有审批授权，避免同组其他授权仍保留更晚期限；不修改其他组、手工分组、账号状态或飞书状态。后续新审批仍按审批期限授予权限。
+
+`PATCH /api/v1/admin/users/{id}/approval-grants/{group_id}`，请求 `{ "expires_at": 1790000000000, "expected_expires_at": 1789000000000 }`（Unix 毫秒）。仅管理员可操作已有审批授权；页面记录的原到期时间若已变化则拒绝覆盖，需刷新重试。授权更新与审计日志 `grant.expiry.update` 同事务保存，记录操作人、目标用户、组、每条旧期限和新期限，并立即刷新网络 ACL。该操作不创建新授权，不改变人工分组权限。

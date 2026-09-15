@@ -70,6 +70,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::external_options::list_external_options),
         )
         .route(
+            "/api/v1/integrations/feishu/contact-events",
+            post(handlers::feishu_directory::webhook),
+        )
+        .route(
             "/api/v1/integrations/feishu/approval-events",
             post(handlers::feishu_approval::webhook),
         )
@@ -132,6 +136,22 @@ pub fn build_router(state: AppState) -> Router {
                 post(handlers::backup::restore_backup),
             )
             .route(
+                "/api/v1/admin/integrations/feishu/users/lookup",
+                post(handlers::feishu_directory::lookup),
+            )
+            .route(
+                "/api/v1/admin/integrations/feishu/users/sync",
+                post(handlers::feishu_directory::sync_all),
+            )
+            .route(
+                "/api/v1/admin/users/{id}/feishu-binding",
+                post(handlers::feishu_directory::bind),
+            )
+            .route(
+                "/api/v1/admin/users/{id}/feishu-sync",
+                post(handlers::feishu_directory::sync_user),
+            )
+            .route(
                 "/api/v1/admin/users",
                 post(handlers::users::create_user).get(handlers::users::list_users),
             )
@@ -142,6 +162,10 @@ pub fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/admin/users/{id}/reset-password",
                 post(handlers::users::reset_password),
+            )
+            .route(
+                "/api/v1/admin/users/{id}/approval-grants/{group_id}",
+                patch(handlers::users::update_grant_expiry),
             )
             .route(
                 "/api/v1/admin/users/{id}/groups",

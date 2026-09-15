@@ -14,3 +14,5 @@ pub mod static_files;
 pub mod subnets;
 pub mod system;
 pub mod users;
+
+pub mod feishu_directory;
