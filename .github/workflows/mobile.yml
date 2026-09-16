@@ -54,13 +54,19 @@ jobs:
         run: |
           mobile/android/gradlew -p mobile/android --no-daemon assembleRelease bundleRelease
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify mobile/android/app/build/outputs/apk/release/app-release.apk
+      - name: Name release artifacts
+        if: inputs.release
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          mkdir -p mobile/android/app/build/distribution
+          cp mobile/android/app/build/outputs/apk/release/app-release.apk "mobile/android/app/build/distribution/vpn-android-universal-$VERSION.apk"
+          cp mobile/android/app/build/outputs/bundle/release/app-release.aab "mobile/android/app/build/distribution/vpn-android-universal-$VERSION.aab"
       - uses: actions/upload-artifact@v4
         if: inputs.release
         with:
           name: android-release
           path: |
-            mobile/android/app/build/outputs/apk/release/*.apk
-            mobile/android/app/build/outputs/bundle/release/*.aab
+            mobile/android/app/build/distribution/*
       - name: Remove signing key
         if: always()
         run: rm -f "$RUNNER_TEMP/android-release.jks"

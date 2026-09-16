@@ -442,12 +442,21 @@ fn package_assets(release: &Release) -> Result<Vec<&Asset>> {
     let assets: Vec<_> = release
         .assets
         .iter()
-        .filter(|a| a.name.starts_with("vpn-gui-") && !a.name.starts_with("vpn-gui-linux-"))
+        .filter(|a| {
+            (a.name.starts_with("vpn-gui-") && !a.name.starts_with("vpn-gui-linux-"))
+                || (a.name.starts_with("vpn-android-") && a.name.ends_with(".apk"))
+        })
         .collect();
+    let android_name = format!(
+        "vpn-android-universal-{}.apk",
+        release.tag_name.trim_start_matches('v')
+    );
     let mut total = 0u64;
     let mut names = std::collections::HashSet::new();
     for a in &assets {
-        if !names.insert(&a.name)
+        if (a.name.starts_with("vpn-android-")
+            && (a.name != android_name || a.size > 256 * 1024 * 1024))
+            || !names.insert(&a.name)
             || !a
                 .name
                 .bytes()
@@ -995,6 +1004,34 @@ mod tests {
             }
         }
         (manifest, release, files)
+    }
+    #[test]
+    fn android_apk_is_optional_canonical_verified_and_aab_is_ignored() {
+        let (_, mut release, _) = fixture();
+        let original = package_assets(&release).unwrap().len();
+        let apk = Asset {
+            name: "vpn-android-universal-0.1.21.apk".into(),
+            browser_download_url: format!("https://github.com/{REPO}/releases/download/v0.1.21/vpn-android-universal-0.1.21.apk"),
+            size: 42,
+            digest: Some(format!("sha256:{}", "ab".repeat(32))),
+        };
+        release.assets.push(apk.clone());
+        let mut aab = apk.clone();
+        aab.name = "vpn-android-universal-0.1.21.aab".into();
+        release.assets.push(aab);
+        assert_eq!(package_assets(&release).unwrap().len(), original + 1);
+        release.assets.pop();
+        release.assets.last_mut().unwrap().digest = None;
+        assert!(package_assets(&release).is_err());
+        *release.assets.last_mut().unwrap() = apk.clone();
+        release.assets.last_mut().unwrap().size = 256 * 1024 * 1024 + 1;
+        assert!(package_assets(&release).is_err());
+        *release.assets.last_mut().unwrap() = apk.clone();
+        release.assets.last_mut().unwrap().name = "vpn-android-universal-0.1.22.apk".into();
+        assert!(package_assets(&release).is_err());
+        *release.assets.last_mut().unwrap() = apk.clone();
+        release.assets.push(apk);
+        assert!(package_assets(&release).is_err());
     }
     #[test]
     fn rejects_incomplete_mismatched_or_foreign_release() {

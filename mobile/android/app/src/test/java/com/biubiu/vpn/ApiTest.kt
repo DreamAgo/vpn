@@ -15,6 +15,38 @@ class ApiTest {
     }
     private fun ok(data: JSONObject? = JSONObject()) = JSONObject().put("code", 0).put("data", data ?: JSONObject.NULL)
     private fun expired() = JSONObject().put("code", 1002)
+    @Test fun cancelledCompletedFeishuLoginRevokesNewSessionWithoutPersisting() {
+        val store = MemoryStore(); val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        var revoked = false
+        val api = Api(store) { path, body, _ ->
+            if (path == "/auth/feishu/poll") {
+                entered.countDown(); release.await()
+                ok(JSONObject().put("status", "complete").put("username", "real-user").put("login", JSONObject().put("access_token", "new-access").put("refresh_token", "new-refresh")))
+            } else {
+                assertEquals("/auth/logout", path); assertEquals("new-refresh", body.getString("refresh_token")); revoked = true; ok()
+            }
+        }
+        val worker = Thread { try { api.publicRequest("https://example.com", "/auth/feishu/poll") } catch (_: Exception) {} }.apply { start() }
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)); api.cancel(); release.countDown(); worker.join(5000)
+        assertFalse(worker.isAlive); assertTrue(revoked); assertEquals(0, store.writes); assertEquals("refresh", store.value.getString("refresh"))
+    }
+    @Test fun failedFeishuPersistenceRevokesIssuedSessionAndKeepsPrevious() {
+        val previous = JSONObject().put("server", "https://example.com").put("username", "real-user").put("private", "private").put("public", "public").put("refresh", "old-refresh")
+        var revoked = false
+        val api = Api(object : CredentialStore {
+            override fun read() = previous
+            override fun write(value: JSONObject) { throw java.io.IOException("storage failure") }
+            override fun clear() { fail("must not clear existing account") }
+        }) { path, body, _ -> assertEquals("/auth/logout", path); assertEquals("new-refresh", body.getString("refresh_token")); revoked = true; ok() }
+        try { api.acceptFeishu("https://example.com", JSONObject().put("username", "real-user").put("login", JSONObject().put("access_token", "new-access").put("refresh_token", "new-refresh"))); fail() } catch (_: java.io.IOException) {}
+        assertTrue(revoked); assertEquals("old-refresh", api.saved().getString("refresh"))
+    }
+    @Test fun feishuUsesServerUsernameAndReusesOnlyMatchingKeys() {
+        val store = MemoryStore(); store.value.put("username", "real-user").put("private", "old-private")
+        val api = Api(store)
+        api.acceptFeishu("https://example.com", JSONObject().put("username", "real-user").put("login", JSONObject().put("access_token", "new-access").put("refresh_token", "new-refresh")))
+        assertEquals("real-user", store.value.getString("username")); assertEquals("new-refresh", store.value.getString("refresh")); assertEquals("old-private", store.value.getString("private"))
+    }
     @Test fun expiredAccessRefreshesOnceAndRetriesWithNewToken() {
         val store = MemoryStore(); val calls = mutableListOf<String>()
         val api = Api(store) { path, _, token ->

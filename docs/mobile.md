@@ -49,6 +49,28 @@ adb install -r mobile/android/app/build/outputs/apk/debug/app-debug.apk
 
 服务端端点首版使用 IPv4（域名解析筛选 IPv4），与混淆路径 MTU 的 IPv4 开销保持一致；IPv6 互联网流量通过底层网络直连。路由沿用项目的 IPv4 分隧道约定，拒绝默认路由/IPv6 路由，保留 VPN 子网。匹配当前物理接口地址的 `local_route_bypass` 规则会从授权路由减去指定网段，最多 1024 条有效路由；心跳热更新原子替换 TUN 路由。旧服务端空心跳和省略绕行策略保持兼容；显式空绕行列表清除策略。DNS global 模式使用 VPN 子网网关，disabled/缺省不配置 VPN DNS。
 
+## 桌面功能对齐
+
+| 能力 | Android 行为 |
+| --- | --- |
+| 密码与飞书登录 | 账号页提供两种方式；飞书未配置时仍可密码登录，授权使用系统浏览器并固定 `accounts.feishu.cn` HTTPS 主机 |
+| 授权取消与生命周期 | 最长 5 分钟轮询，支持取消；页面销毁/旋转终止当前操作，重新发起登录，不保存迟到会话；已收到但未提交的会话尽力撤销 |
+| 更新 | 启动已有账号或登录成功自动检查，也可手动检查；连接期间可检查、确认下载并显示进度；安装先协调断开 |
+| 账号 | 显示真实用户名；改密确认两次且至少 8 位字母数字，成功后重新登录；连接中账号只读 |
+| 连接详情 | IP、流量、持续时间、最近握手、DNS、路由；可复制详情 |
+| 诊断 | 最近 120 条、单条最多 240 字符的内存日志，可查看、刷新、清空、复制；错误不输出服务端原始文本或凭据 |
+| 系统集成 | 前台 VPN 通知、系统 VPN 设置入口；不支持桌面托盘、开机驻留或 Android 始终开启 VPN |
+
+服务器最低版本/权限拒绝（2002）停止重试并保留账号，提示到更新页检查。复制诊断包含内网地址，请按需要分享；日志不持久化，进程退出后清空。
+
+### APK 更新分发与安装
+
+Android 从配置服务器的 `/updates/latest.json` 读取 `downloads`，选择唯一的 `vpn-android-universal-0.1.34.apk`（示例版本，无 `v` 前缀）。下载 URL 必须是同一 HTTPS 源的 `/updates/releases/<UUID>/<标准文件名>`，不接受重定向、用户信息、查询或片段。大小上限 256 MiB，完整检查大小、SHA-256、应用包名、版本名称/递增版本号及当前 APK 签名集合。
+
+服务端镜像将 GitHub 正式发布中可选的标准 APK 纳入本地 `downloads`，校验 GitHub SHA-256 后才发布清单；不改变 Tauri `platforms` 或现有桌面 `.sig` 校验。没有 APK 的旧发布继续支持桌面，Android 明示不可用；AAB 不镜像也不直接安装。将正式签名 APK 附加 GitHub Release 属于单独发布操作，本次未执行。
+
+每次下载使用独立的临时文件和已验证 APK 文件，页面重建后的清理不会影响另一下载。安装通过仅授权读取单个已验证 APK 的私有内容提供器交给系统安装器；首次需要系统“允许此来源安装应用”权限，拒绝后仍可使用原应用。当前采用签名集合严格相等，不接受签名轮换；调试签名与正式签名不同，不能直接覆盖升级。实际发布须持续使用同一生产签名。安装前会重新校验文件与当前服务器，取消安装不会注销账号。
+
 ## GitHub Actions
 
 `.github/workflows/mobile.yml` 对移动代码及依赖变化的 PR 编译；Actions → Android → Run workflow 可手动构建。每次运行保存 `android-debug` APK，并运行 Rust 数据面测试、Kotlin 控制面/生命周期单元测试和 Android lint。此实现只添加工作流，本次未推送或触发远程运行。
@@ -62,16 +84,19 @@ adb install -r mobile/android/app/build/outputs/apk/debug/app-debug.apk
 | `ANDROID_KEY_ALIAS` | 签名 key alias |
 | `ANDROID_KEY_PASSWORD` | 签名 key 密码 |
 
-本机发布可设置 `ANDROID_KEYSTORE_PATH`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 后执行 `./gradlew assembleRelease bundleRelease`。工作流不发布商店；生产密钥不提交版本控制。
+本机发布可设置 `ANDROID_KEYSTORE_PATH`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 后执行 `./gradlew assembleRelease bundleRelease`。签名构建产物标准名为 `vpn-android-universal-<version>.apk` / `.aab`，供后续审核发布。工作流不发布 GitHub Release 或商店；生产密钥不提交版本控制。
 
 ## 验证记录（2026-09-16）
 
-本地 `assembleDebug`、15 项 Kotlin/JVM 测试、17 项 Rust 测试与 clippy 均通过；Android lint 无错误（保留目标 SDK/中文文本的非阻断提示）。最终调试 APK 的 v2 签名、16 KiB ZIP 对齐检查通过，三架构 JNI 库已打包；ARM64 ELF LOAD 段按 16 KiB 对齐。
+本地 `assembleDebug`、27 项 Kotlin/JVM 测试、17 项 Rust 测试与 clippy 均通过；Android lint 无错误（8 项目标 SDK、API 弃用和文本等非阻断提示）。最终调试 APK 的 v2 签名、16 KiB ZIP 对齐检查通过，三架构 JNI 库已打包；ARM64 ELF LOAD 段按 16 KiB 对齐。
 
 Rust 自动化覆盖真实客户端与 boringtun 服务端握手、原生及两种混淆模式的双向 IP 报文（含非 16 字节对齐长度）、重放丢弃、MTU 超限、DNS 校验、策略排除和路由数界限。Kotlin 主机测试覆盖刷新一次、撤销清凭据、改密清会话、取消刷新不落盘、断开后的所有权和并发启动。
 
 本次未连接安卓设备，以下仍待真机验证，不能由编译或主机测试替代：
 
+- 飞书浏览器授权返回、取消/超时、旋转重建、真实账号显示。
+- 相同签名高版本 APK 下载、未知来源权限拒绝/同意、系统安装取消/完成；异签名 APK 拒绝。
+- 连接时切换四个页面、诊断复制、更新检查，安装/退出前断开协调。
 - 有效账号登录、强制改密、系统 VPN 权限拒绝/同意、后台显示独立手机节点。
 - 原生和两种混淆模式下访问授权内网、DNS 查询与普通互联网分流。
 - Wi-Fi/蜂窝切换、锁屏及 OEM 后台限制、服务端路由和绕行规则热更新。

@@ -18,9 +18,16 @@ import java.util.concurrent.atomic.AtomicReference
 class TunnelService : VpnService() {
     companion object {
         @Volatile var status = "未连接"
+        @Volatile var details = "暂无连接详情"
         private val lifetime = TunnelLifetime()
         val running: Boolean get() = lifetime.running()
         const val STOP = "com.biubiu.vpn.STOP"
+        private const val GENERATION = "generation"
+        fun requestStart(context: android.content.Context) {
+            val token = lifetime.begin() ?: return
+            try { context.startForegroundService(Intent(context, TunnelService::class.java).putExtra(GENERATION, token)) }
+            catch (e: Exception) { lifetime.finish(token); throw e }
+        }
     }
     private val stopping = AtomicBoolean(false)
     private var generation = -1L
@@ -34,11 +41,19 @@ class TunnelService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == STOP) { shutdown(); return START_NOT_STICKY }
         if (worker != null) return START_NOT_STICKY
-        generation = lifetime.begin() ?: return START_NOT_STICKY
+        generation = intent?.getLongExtra(GENERATION, -1L) ?: -1L
+        if (!lifetime.accepts(generation)) { stopSelf(startId); return START_NOT_STICKY }
         stopping.set(false)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("vpn", "VPN 连接", NotificationManager.IMPORTANCE_LOW))
-        startForeground(1, notification("正在连接"))
-        worker = Thread({ runConnection() }, "vpn-control").also { it.start() }
+        details = "等待本次连接信息"
+        try {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("vpn", "VPN 连接", NotificationManager.IMPORTANCE_LOW))
+            startForeground(1, notification("正在连接"))
+            worker = Thread({ runConnection() }, "vpn-control").also { it.start() }
+        } catch (e: Exception) {
+            worker = null; lifetime.finish(generation)
+            status = "启动失败：${Diagnostics.error(e)}"
+            Diagnostics.event(status); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId)
+        }
         return START_NOT_STICKY
     }
     private fun notification(text: String): Notification {
@@ -49,6 +64,9 @@ class TunnelService : VpnService() {
     }
     private fun report(text: String) {
         if (stopping.get() || !lifetime.accepts(generation)) return
+        if (text.startsWith("已连接")) {
+            if (!status.startsWith("已连接")) Diagnostics.event("WireGuard 握手成功，VPN 已连接")
+        } else if (status != text) Diagnostics.event(text)
         status = text
         getSystemService(NotificationManager::class.java).notify(1, notification(text))
     }
@@ -57,6 +75,7 @@ class TunnelService : VpnService() {
         try { tun?.close() } catch (_: Exception) {} finally { tun = null }
     }
     private fun shutdown() {
+        if (!stopping.get()) Diagnostics.event("请求断开 VPN")
         stopping.set(true); lifetime.stop(generation); api?.cancel(); closeIO(); worker?.interrupt()
         status = "正在断开"
         if (worker == null) { status = "已断开"; lifetime.finish(generation); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
@@ -78,11 +97,11 @@ class TunnelService : VpnService() {
                     delay = 1000L
                 } catch (e: Exception) {
                     if (stopping.get()) break
-                    if (e is ApiError && (e.fatal || e.code == 1006) || e is IllegalArgumentException || e is IllegalStateException || e is org.json.JSONException) {
-                        report("连接停止：${e.message}"); break
+                    if (e is ApiError && (e.fatal || e.code == 1006 || e.code == 2002) || e is IllegalArgumentException || e is IllegalStateException || e is org.json.JSONException) {
+                        report("连接停止：${Diagnostics.error(e)}"); break
                     }
                     if (handshaken) { delay = 1000L; handshaken = false }
-                    report("连接中断，${delay / 1000} 秒后重试：${e.message}")
+                    report("连接中断，${delay / 1000} 秒后重试：${Diagnostics.error(e)}")
                     Thread.sleep(delay); delay = (delay * 2).coerceAtMost(30000)
                 } finally { api?.cancel(); api = null; closeIO() }
             }
@@ -90,7 +109,7 @@ class TunnelService : VpnService() {
         } finally {
             closeIO(); worker = null
             Handler(Looper.getMainLooper()).post {
-                if (lifetime.finish(generation)) { if (stopping.get()) status = "已断开"; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+                if (lifetime.finish(generation)) { if (stopping.get()) { status = "已断开"; Diagnostics.event(status) }; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
             }
         }
     }
@@ -170,6 +189,7 @@ class TunnelService : VpnService() {
                     if (!stats.isNull("handshake_seconds")) {
                         handshaken = true
                         if (stats.getLong("handshake_seconds") > 180) throw java.io.IOException("WireGuard 握手已失效")
+                        details = "VPN IP：${plan.getString("address")}\n连接时长：${(now - started) / 1000} 秒\n上传：${stats.getLong("tx_bytes")} B\n下载：${stats.getLong("rx_bytes")} B\nDNS：${plan.optString("dns", "系统默认")}\n路由：${plan.getJSONArray("routes")}\n最近握手：${stats.getLong("handshake_seconds")} 秒前"
                         report("已连接 ${plan.getString("address")} · ↑ ${stats.getLong("tx_bytes")} B ↓ ${stats.getLong("rx_bytes")} B")
                     } else if (now - started > 20000) throw java.io.IOException("WireGuard 握手超时")
                     lastStatus = now

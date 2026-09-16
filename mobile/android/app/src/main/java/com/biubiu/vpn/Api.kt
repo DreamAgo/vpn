@@ -35,6 +35,45 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
             return session.getBoolean("mustChange")
         } catch (e: Exception) { session = previous; throw e }
     }
+    @Synchronized fun publicRequest(server: String, path: String, body: JSONObject = JSONObject(), method: String = "POST"): JSONObject {
+        val previous = session
+        session = JSONObject().put("server", validServer(server))
+        try { return once(path, body, false, method) } finally { session = previous }
+    }
+    @Synchronized fun acceptFeishu(server: String, response: JSONObject) {
+        val previous = session
+        try {
+            val user = response.getString("username").also { require(it.isNotBlank()) }
+            val login = response.getJSONObject("login")
+            val keys = if (previous.optString("server") == server && previous.optString("username") == user && previous.has("private")) previous else Native.request("keys")
+            session = JSONObject().put("server", server).put("username", user)
+                .put("access", login.getString("access_token")).put("refresh", login.getString("refresh_token"))
+                .put("mustChange", login.optBoolean("must_change_password"))
+                .put("private", keys.getString("private")).put("public", keys.getString("public"))
+            save()
+        } catch (e: Exception) { revokeFeishu(server, response); session = previous; throw e }
+    }
+    fun revokeFeishu(server: String, response: JSONObject) {
+        val login = response.optJSONObject("login") ?: return
+        try {
+            val cleanup = Api(object : CredentialStore {
+                override fun read() = JSONObject().put("server", server).put("access", login.getString("access_token")).put("refresh", login.getString("refresh_token"))
+                override fun write(value: JSONObject) {}
+                override fun clear() {}
+            }, exchange).also { it.network = network }
+            cleanup.logout()
+        } catch (_: Exception) { /* best effort: never persist a late session */ }
+    }
+    private fun ensureResponseActive(path: String, response: JSONObject) {
+        if (cancelled) { if (path == "/auth/feishu/poll") revokeFeishu(session.getString("server"), response.optJSONObject("data") ?: JSONObject()); error("操作已取消") }
+    }
+    companion object {
+        fun validServer(input: String): String {
+            val url = URL(input.trim().trimEnd('/'))
+            require(url.protocol == "https" && url.host.isNotEmpty() && url.userInfo == null && url.query == null && url.ref == null && (url.path.isEmpty() || url.path == "/")) { "请输入 HTTPS 服务器地址（不含路径）" }
+            return url.toString().trimEnd('/')
+        }
+    }
     @Synchronized fun changePassword(old: String, new: String) {
         post("/auth/change-password", JSONObject().put("old_password", old).put("new_password", new))
         clearSession()
@@ -70,11 +109,11 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
             throw e
         }
     }
-    private fun once(path: String, body: JSONObject, auth: Boolean): JSONObject {
+    private fun once(path: String, body: JSONObject, auth: Boolean, method: String = "POST"): JSONObject {
         check(!cancelled) { "操作已取消" }
         if (exchange != null) {
             val response = exchange.invoke(path, body, if (auth) session.getString("access") else null)
-            check(!cancelled) { "操作已取消" }
+            ensureResponseActive(path, response)
             val code = response.getInt("code")
             if (code != 0) throw ApiError(code, response.optString("message", "请求失败 ($code)"))
             return response.optJSONObject("data") ?: JSONObject()
@@ -86,10 +125,10 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
             check(!cancelled) { "操作已取消" }
             conn.instanceFollowRedirects = false
             conn.connectTimeout = 10000; conn.readTimeout = 10000
-            conn.requestMethod = "POST"; conn.doOutput = true
+            conn.requestMethod = method; conn.doOutput = method != "GET"
             conn.setRequestProperty("Content-Type", "application/json")
             if (auth) conn.setRequestProperty("Authorization", "Bearer " + session.getString("access"))
-            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            if (method != "GET") conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val status = conn.responseCode
             if (status in 300..399) throw java.io.IOException("服务器重定向被拒绝")
             val stream = if (status >= 400) conn.errorStream else conn.inputStream
@@ -101,7 +140,7 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
                 if (status == 401) throw ApiError(1002, "登录已过期")
                 throw java.io.IOException("服务器响应无效 ($status)")
             }
-            check(!cancelled) { "操作已取消" }
+            ensureResponseActive(path, result)
             val code = result.getInt("code")
             if (code != 0) throw ApiError(code, result.optString("message", "请求失败 ($code)"))
             if (status !in 200..299) throw java.io.IOException("HTTP $status")
