@@ -1,0 +1,23 @@
+[package]
+name = "vpn-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+vpn-api-types.workspace = true
+vpn-obfs.workspace = true
+boringtun = "0.7"
+serde.workspace = true
+serde_json.workspace = true
+ipnet.workspace = true
+base64.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+jni = "0.21"

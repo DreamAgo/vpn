@@ -123,3 +123,7 @@ packaging/        各平台安装包脚手架
 ## License
 
 MIT
+
+### Android 客户端
+
+易链 Android 客户端位于 `mobile/android`，使用 Kotlin 原生界面与共享 Rust WireGuard/混淆核心，最低 Android 8。支持 HTTPS 登录、系统 VPN、心跳、路由/DNS 和切网重连；本地及 GitHub Actions 可构建 APK。构建、签名与真机验证清单见 [Android 客户端文档](docs/mobile.md)。iOS 版本后续实现。
