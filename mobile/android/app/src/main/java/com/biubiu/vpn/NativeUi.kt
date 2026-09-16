@@ -79,3 +79,29 @@ internal class NativeLineIcon(private val size: Int, color: Int, private val kin
     override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) { paint.colorFilter = colorFilter }
     @Deprecated("Drawable opacity") override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
 }
+
+/** Shrink decorative rings into available space; text/action areas keep their own height. */
+internal class ConnectionHeroLayout(context: Context, private val ui: NativeUi) : LinearLayout(context) {
+    init { orientation = VERTICAL; gravity = Gravity.CENTER }
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        if (childCount > 0 && MeasureSpec.getMode(heightMeasureSpec) != MeasureSpec.UNSPECIFIED) {
+            val width = MeasureSpec.getSize(widthMeasureSpec)
+            var textHeight = 0
+            for (index in 1 until childCount) {
+                val child = getChildAt(index)
+                child.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED))
+                textHeight += child.measuredHeight
+            }
+            val available = (MeasureSpec.getSize(heightMeasureSpec) - textHeight - ui.dp(12)).coerceAtLeast(0)
+            val diameter = minOf(ui.dp(168), available, width)
+            val ring = getChildAt(0) as FrameLayout
+            ring.visibility = if (diameter >= ui.dp(80)) VISIBLE else GONE
+            ring.layoutParams.width = diameter; ring.layoutParams.height = diameter
+            for (index in 0 until ring.childCount) {
+                val size = (diameter * (if (index == 0) 144f / 168 else 116f / 168)).toInt()
+                ring.getChildAt(index).layoutParams.apply { this.width = size; height = size }
+            }
+        }
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
+}

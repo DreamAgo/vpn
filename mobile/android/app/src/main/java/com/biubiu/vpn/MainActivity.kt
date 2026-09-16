@@ -53,11 +53,13 @@ class MainActivity : Activity() {
     private lateinit var title: TextView
     private lateinit var subtitle: TextView
     private lateinit var metricsCard: LinearLayout
+    private lateinit var privacyCard: TextView
+    private var compactHome = false
     private lateinit var duration: TextView
     private lateinit var upload: TextView
     private lateinit var download: TextView
     private lateinit var primary: Button
-    private lateinit var power: Button
+    private lateinit var power: ImageButton
     private lateinit var cancelButton: Button
     private lateinit var errorCard: LinearLayout
     private lateinit var errorText: TextView
@@ -72,6 +74,7 @@ class MainActivity : Activity() {
     private val refresh = object : Runnable {
         override fun run() {
             if (!busy && !TunnelService.running) reloadAccount()
+            state.visibility = if (state.text.isNotBlank() && (busy || !sessionVisible)) android.view.View.VISIBLE else android.view.View.GONE
             refreshConnection()
             server.isEnabled = !busy && !TunnelService.running
             username.isEnabled = !busy; password.isEnabled = !busy
@@ -95,45 +98,57 @@ class MainActivity : Activity() {
         design = NativeUi(this)
         visiblePage = savedInstanceState?.getInt("selectedTab", 0)?.coerceIn(0, 2) ?: 0
         shell = design.column().apply { setBackgroundColor(design.background) }
-        val header = LinearLayout(this).apply { gravity = android.view.Gravity.CENTER_VERTICAL; setPadding(design.dp(24), design.dp(16), design.dp(24), design.dp(12)) }
-        header.addView(ImageView(this).apply { setImageResource(applicationInfo.icon); contentDescription = "易链" }, LinearLayout.LayoutParams(design.dp(38), design.dp(38)))
-        val brand = design.column().apply { setPadding(design.dp(12), 0, 0, 0) }
-        design.text(brand, "易链", 21f, bold = true).setPadding(0, 0, 0, 0)
-        design.text(brand, "YILIAN CONNECT", 9f, design.muted).setPadding(0, 0, 0, 0)
-        header.addView(brand); shell.addView(header)
-        state = design.text(shell, "", 12f, design.muted).apply { setPadding(design.dp(24), design.dp(4), design.dp(24), design.dp(4)); accessibilityLiveRegion = android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE }
+        state = design.text(shell, "", 12f, design.muted).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setOnClickListener { sheet("操作提示") { box -> design.text(box, text.toString(), 14f) } }; setPadding(design.dp(24), design.dp(4), design.dp(24), design.dp(4)); accessibilityLiveRegion = android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE }
         pages = ViewFlipper(this); shell.addView(pages, LinearLayout.LayoutParams(-1, 0, 1f))
-        fun page(): LinearLayout = design.column(24).also { content -> pages.addView(ScrollView(this).apply { isFillViewport = true; addView(content) }) }
-        val connectPage = page()
-        val space = design.card(connectPage)
-        workspace = design.text(space, "工作网络", 14f, bold = true)
-        design.text(space, "仅授权网段通过安全连接访问", 11f, design.muted)
+        fun page(): LinearLayout = design.column(24).also { content -> pages.addView(ScrollView(this).apply { isFillViewport = true; isVerticalScrollBarEnabled = false; addView(content) }) }
+        // The connection screen is a fixed viewport, not a scrollable document.
+        val connectPage = design.column().apply { setPadding(design.dp(24), design.dp(8), design.dp(24), design.dp(8)) }
+        pages.addView(connectPage, android.widget.FrameLayout.LayoutParams(-1, -1))
+        val space = design.card(connectPage).apply { setPadding(design.dp(14), design.dp(8), design.dp(14), design.dp(8)) }
+        workspace = design.text(space, "工作网络", 13f, bold = true).apply {
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            setCompoundDrawablesWithIntrinsicBounds(NativeLineIcon(design.dp(20), design.blue, 5), null, NativeLineIcon(design.dp(16), design.muted, 3), null)
+            compoundDrawablePadding = design.dp(10); minHeight = design.dp(32)
+        }
         space.setOnClickListener { detailsSheet() }; space.contentDescription = "查看工作网络连接详情"; space.isFocusable = true
-        val hero = design.column().apply { gravity = android.view.Gravity.CENTER_HORIZONTAL }; connectPage.addView(hero)
-        design.gap(hero, 12)
+        val hero = ConnectionHeroLayout(this, design)
+        connectPage.addView(hero, LinearLayout.LayoutParams(-1, 0, 1f))
         val ring = FrameLayout(this).apply { background = design.shape(design.soft, 100, true) }
-        power = Button(this).apply {
-            text = ""; setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(40), design.blue, 0), null, null); setPadding(design.dp(38), design.dp(38), design.dp(38), design.dp(38)); background = design.shape(android.graphics.Color.WHITE, 100, true)
+        power = ImageButton(this).apply {
+            setImageDrawable(NativeLineIcon(design.dp(40), design.blue, 0)); scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(design.dp(20), design.dp(20), design.dp(20), design.dp(20)); background = design.shape(android.graphics.Color.WHITE, 100, true)
             contentDescription = "连接工作网络"; setOnClickListener { connectionAction() }
         }
         ring.addView(android.view.View(this).apply { background = design.shape(design.soft, 100, true) }, FrameLayout.LayoutParams(design.dp(144), design.dp(144), android.view.Gravity.CENTER))
         ring.addView(power, FrameLayout.LayoutParams(design.dp(116), design.dp(116), android.view.Gravity.CENTER))
-        hero.addView(ring, LinearLayout.LayoutParams(design.dp(168), design.dp(168)).apply { topMargin = design.dp(10); bottomMargin = design.dp(16) })
-        title = design.text(hero, "准备连接", 24f, bold = true).also(design::centered)
-        subtitle = design.text(hero, "安全访问你的工作网络", 12f, design.muted).also(design::centered)
+        hero.addView(ring, LinearLayout.LayoutParams(design.dp(168), design.dp(168)).apply { bottomMargin = design.dp(12) })
+        title = design.text(hero, "准备连接", 24f, bold = true).also(design::centered).apply {
+            maxLines = 1; setAutoSizeTextTypeUniformWithConfiguration(16, 24, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+        }
+        subtitle = design.text(hero, "安全访问你的工作网络", 12f, design.muted).also(design::centered).apply {
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            setOnClickListener { detailsSheet() }
+        }
         primary = design.button(connectPage, "连接工作网络", true) { connectionAction() }
-        design.gap(connectPage)
-        val metrics = design.card(connectPage); metricsCard = metrics; val row = LinearLayout(this); metrics.addView(row)
-        fun metric(label: String): TextView { val col = design.column(); row.addView(col, LinearLayout.LayoutParams(0, -2, 1f)); design.text(col, label, 11f, design.muted).also(design::centered); return design.text(col, "—", 14f, bold = true).also(design::centered) }
+        val metrics = design.card(connectPage).apply { setPadding(design.dp(8), design.dp(4), design.dp(8), design.dp(4)) }; metricsCard = metrics
+        val row = LinearLayout(this); metrics.addView(row)
+        fun metric(label: String): TextView { val col = design.column(); row.addView(col, LinearLayout.LayoutParams(0, -2, 1f)); design.text(col, label, 10f, design.muted).also(design::centered).setPadding(0, 0, 0, 0); return design.text(col, "—", 13f, bold = true).also(design::centered).apply { maxLines = 1; setPadding(0, design.dp(2), 0, 0) } }
         duration = metric("连接时长"); upload = metric("已上传"); download = metric("已下载")
-        errorCard = design.card(connectPage, android.graphics.Color.rgb(255, 244, 237))
-        design.text(errorCard, "连接需要处理", 14f, bold = true)
-        errorText = design.text(errorCard, "", 12f, design.muted)
-        design.button(errorCard, "查看诊断与处理建议") { diagnosticsSheet() }
-        val privacy = design.card(connectPage, design.soft)
-        design.text(privacy, "只连接需要的工作网络", 13f, design.blue, true)
-        design.text(privacy, "仅授权网段通过 VPN，普通上网继续使用当前网络。", 12f, design.muted)
-        design.button(connectPage, "查看连接详情") { detailsSheet() }
+        errorCard = design.card(connectPage, android.graphics.Color.rgb(255, 244, 237)).apply { setPadding(design.dp(12), design.dp(4), design.dp(12), design.dp(4)) }
+        errorText = design.text(errorCard, "", 12f, design.muted).apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END }
+        errorCard.setOnClickListener { diagnosticsSheet() }; errorCard.contentDescription = "查看完整错误与处理建议"; errorCard.isFocusable = true
+        privacyCard = design.text(connectPage, "仅工作网络通过安全通道，日常上网保持直连。", 12f, design.blue).apply {
+            background = design.shape(design.soft, 14); setPadding(design.dp(14), design.dp(12), design.dp(14), design.dp(12)); maxLines = 2
+        }
+        design.button(connectPage, "查看连接详情  ›") { detailsSheet() }.apply {
+            background = android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT); textSize = 12f
+            minimumHeight = design.dp(48); minHeight = design.dp(48); setPadding(0, 0, 0, 0)
+            (layoutParams as LinearLayout.LayoutParams).apply { topMargin = 0; bottomMargin = 0 }
+        }
+        connectPage.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+            val compact = bottom - top < design.dp(380)
+            if (compact != compactHome) { compactHome = compact; refreshConnection() }
+        }
         detail = TextView(this)
         val activityPage = page()
         design.text(activityPage, "活动", 25f, bold = true)
@@ -160,7 +175,7 @@ class MainActivity : Activity() {
         design.button(mine, "退出登录") { if (!busy) afterDisconnect { work("退出登录") { client -> client.logout(); ui { reloadAccount() } } } }.setTextColor(android.graphics.Color.rgb(170, 70, 60))
         design.text(mine, "易链 ${BuildConfig.VERSION_NAME}", 11f, design.muted).also(design::centered)
         val login = design.column(24)
-        loginPage = ScrollView(this).apply { isFillViewport = true; addView(login) }; shell.addView(loginPage, LinearLayout.LayoutParams(-1, 0, 1f))
+        loginPage = ScrollView(this).apply { isFillViewport = true; isVerticalScrollBarEnabled = false; addView(login) }; shell.addView(loginPage, LinearLayout.LayoutParams(-1, 0, 1f))
         design.text(login, "连接工作，\n也连接安心。", 30f, bold = true)
         design.text(login, "登录你的工作账号，安全访问内部资源。", 13f, design.muted)
         design.gap(login, 16)
@@ -224,16 +239,17 @@ class MainActivity : Activity() {
     }
     private fun refreshConnection() {
         val model = ConnectionPresentation.from(TunnelService.running, TunnelService.status, TunnelService.details)
-        title.text = model.title; subtitle.text = model.subtitle; primary.text = model.actionLabel
+        title.text = model.title; subtitle.text = if (model.failed) "点击下方提示查看原因与处理建议" else model.subtitle; primary.text = model.actionLabel
         primary.isEnabled = (!busy || TunnelService.running) && !model.stopping && actionAfterStop == null; power.isEnabled = primary.isEnabled
         power.contentDescription = model.actionLabel
         primary.alpha = if (primary.isEnabled) 1f else .45f; power.alpha = primary.alpha
-        power.setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(40), if (model.connected) android.graphics.Color.WHITE else design.blue, if (model.connected) 4 else 0), null, null)
+        power.setImageDrawable(NativeLineIcon(design.dp(40), if (model.connected) android.graphics.Color.WHITE else design.blue, if (model.connected) 4 else 0))
         power.background = design.shape(if (model.connected) design.blue else android.graphics.Color.WHITE, 100, true)
-        metricsCard.visibility = if (model.connected) android.view.View.VISIBLE else android.view.View.GONE
+        metricsCard.visibility = if (model.connected && !compactHome) android.view.View.VISIBLE else android.view.View.GONE
         duration.text = model.duration; upload.text = model.uploaded; download.text = model.downloaded
         errorCard.visibility = if (model.failed) android.view.View.VISIBLE else android.view.View.GONE
-        errorText.text = model.subtitle
+        errorText.text = "${model.subtitle} · 点击查看详情"
+        privacyCard.visibility = if (!model.connected && !model.failed && !compactHome) android.view.View.VISIBLE else android.view.View.GONE
         detail.text = "服务器：$connectedServer\n${TunnelService.status}\n${TunnelService.details}"
     }
     private fun connectionAction() {
@@ -263,7 +279,7 @@ class MainActivity : Activity() {
         val dialog = Dialog(this); val box = design.column(24).apply { background = design.shape(android.graphics.Color.WHITE, 24) }
         design.text(box, heading, 23f, bold = true); content(box)
         design.button(box, "关闭") { dialog.dismiss() }
-        dialog.setContentView(ScrollView(this).apply { addView(box) })
+        dialog.setContentView(ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(box) })
         dialog.window?.apply { setBackgroundDrawableResource(android.R.color.transparent); setGravity(android.view.Gravity.BOTTOM); addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE); setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE) }
         dialog.show(); dialog.window?.setLayout(-1, (resources.displayMetrics.heightPixels * .8).toInt())
         sheetDialog = dialog
