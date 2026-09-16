@@ -217,6 +217,7 @@ export interface IntegrationSettingsSnapshot {
     groupControlId: string | null;
     expiryControlId: string | null;
     reasonControlId: string | null;
+    maxDevicesControlId: string | null;
     verificationTokenSet: boolean;
     encryptKeySet: boolean;
   };
@@ -251,6 +252,7 @@ export interface UpdateIntegrationSettingsRequest {
     groupControlId?: string | null;
     expiryControlId?: string | null;
     reasonControlId?: string | null;
+    maxDevicesControlId?: string | null;
     verificationToken: SecretUpdate;
     encryptKey: SecretUpdate;
   };

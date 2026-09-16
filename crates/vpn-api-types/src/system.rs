@@ -563,6 +563,7 @@ pub struct FeishuApprovalSettingsView {
     pub group_control_id: Option<String>,
     pub expiry_control_id: Option<String>,
     pub reason_control_id: Option<String>,
+    pub max_devices_control_id: Option<String>,
     pub verification_token_set: bool,
     pub encrypt_key_set: bool,
 }
@@ -604,6 +605,7 @@ pub struct UpdateFeishuApprovalSettings {
     pub group_control_id: Option<String>,
     pub expiry_control_id: Option<String>,
     pub reason_control_id: Option<String>,
+    pub max_devices_control_id: Option<String>,
     #[serde(default)]
     pub verification_token: SecretUpdate,
     #[serde(default)]
