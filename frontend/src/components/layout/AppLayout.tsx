@@ -43,6 +43,7 @@ const adminRoutes: NonNullable<ProLayoutProps['route']>['routes'] = [
   { path: '/notifications', name: '通知设置', icon: <BellOutlined /> },
   { path: '/network-settings', name: '网络设置', icon: <GlobalOutlined /> },
   { path: '/integration-settings', name: '集成设置', icon: <AppstoreOutlined /> },
+  { path: '/client-versions', name: '客户端版本', icon: <AppstoreOutlined /> },
   { path: '/backup', name: '备份恢复', icon: <DatabaseOutlined /> },
   { path: '/connect', name: '接入指南', icon: <LinkOutlined /> },
 ];

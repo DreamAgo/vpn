@@ -61,7 +61,7 @@ sudo VPN_HTTPS=true VPN_DOMAIN=vpn.example.com \
 2. 重启服务——启动时自动执行数据库 migration、加载已有 WireGuard 服务端密钥、从 `peers` 表恢复节点。
 3. 数据卷保持不变即可平滑升级。
 
-升级后服务端会把旧 `network_settings_v2`（或更早的 v1 MTU）迁移到 `network_settings_v3`，并仅在 v3 不存在时用数据面环境变量初始化基础 VPN、混淆、MTU 和 DNS。之后请在管理后台“网络设置”页面调整；非秘密环境变量不会覆盖已保存值。基础 VPN/混淆修改需由管理员自行重启，LAN 路由和 DNS 转发规则热更新，MTU 与客户端 DNS 在下一次连接或重连时生效。混淆 PSK 仍只由 `VPN_OBFS_PSK` 提供。内置 DNS 的 UDP/TCP 53 只绑定 VPN 网关，不要添加 Docker 公网端口映射。
+升级后服务端会把旧 `network_settings_v2`（或更早的 v1 MTU）迁移到 `network_settings_v3`，并仅在 v3 不存在时用数据面环境变量初始化基础 VPN、混淆、MTU 和 DNS。之后请在管理后台“网络设置”页面调整；非秘密环境变量不会覆盖已保存值。基础 VPN/混淆修改保存后，可在网络设置页面点击“重启并应用”（Linux/macOS 服务端支持）；在线连接会暂时中断，页面自动检查配置是否生效，LAN 路由和 DNS 转发规则热更新，MTU 与客户端 DNS 在下一次连接或重连时生效。混淆 PSK 仍只由 `VPN_OBFS_PSK` 提供。内置 DNS 的 UDP/TCP 53 只绑定 VPN 网关，不要添加 Docker 公网端口映射。
 
 ## 健康检查
 

@@ -15,4 +15,5 @@ pub mod subnets;
 pub mod system;
 pub mod users;
 
+pub mod client_updates;
 pub mod feishu_directory;
