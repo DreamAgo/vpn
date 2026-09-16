@@ -8,6 +8,7 @@ export function ClientVersionsPage() {
   const cache = useQueryClient();
   const query = useQuery({ queryKey: ['client-updates'], queryFn: clientUpdatesApi.status, refetchInterval: 3000 });
   const [base, setBase] = useState<string | null>(null);
+  const [minimum, setMinimum] = useState<string | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [proxy, setProxy] = useState<string | null>(null);
   const [enabled, setEnabled] = useState<boolean | null>(null);
@@ -19,9 +20,9 @@ export function ClientVersionsPage() {
   const save = async () => {
     setSaving(true);
     try {
-      const next = await clientUpdatesApi.save(auto, address, proxy ?? data?.proxyUrl ?? "", token ?? undefined);
+      const next = await clientUpdatesApi.save(auto, address, proxy ?? data?.proxyUrl ?? "", token ?? undefined, minimum ?? data?.minimumClientVersion ?? "");
       cache.setQueryData(['client-updates'], next);
-      setBase(null); setEnabled(null); setProxy(null); setToken(null);
+      setBase(null); setEnabled(null); setProxy(null); setToken(null); setMinimum(null);
       message.success('设置已保存');
     } catch (e) { message.error(e instanceof Error ? e.message : '保存失败'); }
     finally { setSaving(false); }
@@ -53,10 +54,13 @@ export function ClientVersionsPage() {
         <Space><Typography.Text type="secondary">{token === '' ? '保存后将清除 Token' : data?.githubTokenSet ? 'Token 已配置，保存后不回显' : '用于认证 GitHub API 请求'}</Typography.Text>
           {(data?.githubTokenSet || token) && <Button size="small" onClick={() => setToken('')} disabled={data?.syncing || saving}>清除 Token</Button>}
         </Space>
+        <label htmlFor="minimum-client-version">最低客户端版本（可选）</label>
+        <Input id="minimum-client-version" value={minimum ?? data?.minimumClientVersion ?? ''} onChange={e => setMinimum(e.target.value)} placeholder="例如 0.1.32；留空不限制" disabled={data?.syncing || saving} />
+        <Typography.Text type="secondary">仅限制新连接和重连，现有在线连接保留。低于此版本或未上报有效版本的桌面端、CLI 和节点客户端都会被拒绝；仍可登录并下载更新。</Typography.Text>
         <Space><Switch checked={auto} onChange={setEnabled} disabled={data?.syncing} /><span>每小时自动同步（开启后一分钟内首次检查）</span></Space>
         <Space wrap>
           <Button onClick={save} loading={saving} disabled={!data || data.syncing || starting}>保存设置</Button>
-          <Button type="primary" onClick={sync} loading={starting || data?.syncing} disabled={!data?.publicBaseUrl || saving || base !== null || enabled !== null || proxy !== null || token !== null}>立即同步最新版本</Button>
+          <Button type="primary" onClick={sync} loading={starting || data?.syncing} disabled={!data?.publicBaseUrl || saving || base !== null || enabled !== null || proxy !== null || token !== null || minimum !== null}>立即同步最新版本</Button>
         </Space>
         {!data?.publicBaseUrl && <Typography.Text type="secondary">请先确认服务端地址并保存设置，再开始同步。</Typography.Text>}
       </Space>

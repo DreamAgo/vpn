@@ -30,6 +30,8 @@ pub struct Settings {
     proxy_url: Option<String>,
     #[serde(default)]
     github_token: Option<String>,
+    #[serde(default)]
+    minimum_client_version: Option<String>,
 }
 pub async fn configure(
     State(state): State<AppState>,
@@ -43,6 +45,7 @@ pub async fn configure(
             &settings.public_base_url,
             settings.proxy_url.as_deref(),
             settings.github_token.as_deref(),
+            settings.minimum_client_version.as_deref(),
         )
         .await
         .map_err(AppError::Validation)?;

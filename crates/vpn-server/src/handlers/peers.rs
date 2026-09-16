@@ -6,12 +6,15 @@
 //! - DELETE /api/v1/peers/me         注销当前节点（Story 4.7）
 //! - GET    /api/v1/peers/me/config  下载客户端配置文件（Story 4.7）
 
+use crate::services::client_update_service::ClientUpdateService;
+use axum::Extension;
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use std::sync::Arc;
 use vpn_api_types::{
     peer::{
         AdminPeerQuery, AdminPeerView, PeerEventQuery, PeerEventView, PeerHeartbeatRequest,
@@ -36,12 +39,17 @@ fn success<T: serde::Serialize>(state: &AppState, data: T) -> Json<ApiResponse<T
 }
 
 /// Story 4.5：POST /api/v1/peers/register
-#[tracing::instrument(skip(state, body, current))]
+#[tracing::instrument(skip(state, body, current, updates))]
 pub async fn register(
     State(state): State<AppState>,
     current: CurrentUser,
+    Extension(updates): Extension<Arc<ClientUpdateService>>,
     Json(body): Json<PeerRegisterRequest>,
 ) -> Result<Json<ApiResponse<PeerRegisterResponse>>, ApiError> {
+    updates
+        .enforce_client_version(body.client_version.as_deref())
+        .await
+        .map_err(vpn_core::AppError::NoAccessReason)?;
     let svc = state.peer_service()?;
     let resp = svc.register(&current.user_id, &body).await?;
     state.refresh_network_acl().await?;
@@ -49,13 +57,31 @@ pub async fn register(
 }
 
 /// Story 4.6：POST /api/v1/peers/heartbeat
-#[tracing::instrument(skip(state, body, current))]
+#[tracing::instrument(skip(state, body, current, updates))]
 pub async fn heartbeat(
     State(state): State<AppState>,
     current: CurrentUser,
+    Extension(updates): Extension<Arc<ClientUpdateService>>,
     Json(body): Json<PeerHeartbeatRequest>,
 ) -> Result<Json<ApiResponse<PeerHeartbeatResponse>>, ApiError> {
     let svc = state.peer_service()?;
+    // Existing online sessions are grandfathered; an offline peer must pass the
+    // version gate before a heartbeat can bring it back online.
+    let peer = if let Some(key) = body.wg_public_key.as_deref() {
+        svc.peer_repo
+            .find_active_by_user_and_pubkey(&current.user_id, key)
+            .await?
+    } else {
+        svc.peer_repo.find_active_by_user(&current.user_id).await?
+    };
+    if let Some(peer) = peer {
+        if peer.status != "online" && peer.status != "force_removed" {
+            updates
+                .enforce_client_version(peer.client_version.as_deref())
+                .await
+                .map_err(vpn_core::AppError::NoAccessReason)?;
+        }
+    }
     // Story 5.5：若该 peer 已被 admin 强制下线，心跳被拒（TokenExpired → 401，提示重新登录）。
     // 多终端模式：请求带 wg_public_key 时精确定位该终端打卡（含 RTT/丢包等健康指标）。
     let heartbeat = svc
@@ -102,12 +128,19 @@ pub async fn delete_me(
 }
 
 /// Story 4.7：GET /api/v1/peers/me/config（文件下载，非 ApiResponse 信封）。
-#[tracing::instrument(skip(state, current))]
+#[tracing::instrument(skip(state, current, updates))]
 pub async fn download_config(
     State(state): State<AppState>,
     current: CurrentUser,
+    Extension(updates): Extension<Arc<ClientUpdateService>>,
 ) -> Result<Response, ApiError> {
     let svc = state.peer_service()?;
+    if let Some(peer) = svc.peer_repo.find_active_by_user(&current.user_id).await? {
+        updates
+            .enforce_client_version(peer.client_version.as_deref())
+            .await
+            .map_err(vpn_core::AppError::NoAccessReason)?;
+    }
     let dl = svc.render_config(&current.user_id).await?;
     let response = (
         StatusCode::OK,
@@ -189,4 +222,44 @@ pub async fn purge_peer(
     svc.purge(&id).await?;
     state.refresh_network_acl().await?;
     Ok(success(&state, ()))
+}
+
+#[cfg(test)]
+mod version_policy_tests {
+    use super::*;
+    #[tokio::test]
+    async fn obsolete_registration_is_rejected_before_peer_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Arc::new(ClientUpdateService::new(dir.path().to_owned()));
+        policy
+            .configure(false, "https://vpn.example", None, None, Some("0.1.32"))
+            .await
+            .unwrap();
+        let result = register(
+            State(AppState::new()),
+            CurrentUser {
+                user_id: "test-user".into(),
+                role: "user".into(),
+            },
+            Extension(policy),
+            Json(PeerRegisterRequest {
+                device_name: "old-client".into(),
+                wg_public_key: "invalid-key".into(),
+                os_info: None,
+                client_version: Some("0.1.31".into()),
+                capabilities: vec![],
+            }),
+        )
+        .await;
+        let response = match result {
+            Err(error) => error.into_response(),
+            Ok(_) => panic!("old client accepted"),
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let message = String::from_utf8_lossy(&bytes);
+        assert!(message.contains("0.1.32") && message.contains("升级"));
+    }
 }

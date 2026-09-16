@@ -51,6 +51,8 @@ pub struct SyncRecord {
     pub public_base_url: String,
     #[serde(default)]
     pub proxy_url: String,
+    #[serde(default)]
+    pub minimum_client_version: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub github_token: String,
     pub last_checked_at: Option<i64>,
@@ -151,7 +153,18 @@ impl ClientUpdateService {
         base_url: &str,
         proxy_url: Option<&str>,
         github_token: Option<&str>,
+        minimum_client_version: Option<&str>,
     ) -> Result<()> {
+        let minimum_client_version = minimum_client_version
+            .map(|value| {
+                let value = value.trim();
+                if value.is_empty() {
+                    Ok(String::new())
+                } else {
+                    version(value).map(|v| v.to_string())
+                }
+            })
+            .transpose()?;
         let github_token = github_token.map(normalize_token).transpose()?;
         let base_url = normalize_base(base_url)?;
         let proxy_url = proxy_url.map(normalize_proxy).transpose()?;
@@ -166,6 +179,9 @@ impl ClientUpdateService {
         }
         next.auto_sync = enabled;
         next.public_base_url = base_url;
+        if let Some(minimum) = minimum_client_version {
+            next.minimum_client_version = minimum;
+        }
         if let Some(token) = github_token {
             next.github_token = token;
         }
@@ -176,6 +192,10 @@ impl ClientUpdateService {
         *record = next;
         Ok(())
     }
+    pub async fn enforce_client_version(&self, reported: Option<&str>) -> Result<()> {
+        check_client_version(&self.record.lock().await.minimum_client_version, reported)
+    }
+
     pub fn start(service: &Arc<Self>) {
         let weak = Arc::downgrade(service);
         tokio::spawn(async move {
@@ -543,6 +563,25 @@ fn normalize_proxy(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+fn check_client_version(minimum: &str, reported: Option<&str>) -> Result<()> {
+    if minimum.is_empty() {
+        return Ok(());
+    }
+    let minimum =
+        version(minimum).map_err(|_| "最低客户端版本配置无效，请联系管理员".to_string())?;
+    let client = reported
+        .and_then(|s| semver::Version::parse(s.trim().strip_prefix('v').unwrap_or(s.trim())).ok());
+    match client {
+        Some(client) if !client.cmp_precedence(&minimum).is_lt() => Ok(()),
+        Some(client) => Err(format!(
+            "客户端版本 {client} 低于服务端要求的 {minimum}，请升级客户端后重新连接"
+        )),
+        None => Err(format!(
+            "无法识别客户端版本，服务端要求 {minimum} 或更高版本，请升级客户端后重新连接"
+        )),
+    }
+}
+
 fn normalize_token(value: &str) -> Result<String> {
     let value = value.trim();
     if value.len() > 512
@@ -788,6 +827,7 @@ mod tests {
                 "https://vpn.example",
                 None,
                 Some("github_pat_TEST123"),
+                None,
             )
             .await
             .unwrap();
@@ -801,7 +841,7 @@ mod tests {
         assert!(status.get("github_token").is_none());
         assert!(!status.to_string().contains("github_pat_TEST123"));
         restored
-            .configure(true, "https://vpn.example", None, None)
+            .configure(true, "https://vpn.example", None, None, None)
             .await
             .unwrap();
         assert!(restored.status().await.github_token_set);
@@ -818,7 +858,7 @@ mod tests {
             );
         }
         restored
-            .configure(true, "https://vpn.example", None, Some(""))
+            .configure(true, "https://vpn.example", None, Some(""), None)
             .await
             .unwrap();
         assert!(
@@ -860,6 +900,53 @@ mod tests {
             .headers()
             .get(reqwest::header::AUTHORIZATION)
             .is_none());
+    }
+
+    #[test]
+    fn minimum_version_uses_semantic_precedence() {
+        for reported in [None, Some(""), Some("invalid")] {
+            assert!(check_client_version("", reported).is_ok());
+            assert!(check_client_version("0.1.32", reported).is_err());
+        }
+        for reported in ["0.1.31", "0.1.9", "0.1.32-beta.1"] {
+            assert!(check_client_version("0.1.32", Some(reported)).is_err());
+        }
+        for reported in ["0.1.32", "v0.1.32", "0.1.32+build1", "0.1.100", "1.0.0"] {
+            assert!(check_client_version("0.1.32", Some(reported)).is_ok());
+        }
+        assert!(check_client_version("corrupt", Some("99.0.0")).is_err());
+    }
+
+    #[tokio::test]
+    async fn minimum_version_settings_survive_restart_and_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ClientUpdateService::new(dir.path().to_owned());
+        service
+            .configure(false, "https://vpn.example", None, None, Some("v0.1.32"))
+            .await
+            .unwrap();
+        let restored = ClientUpdateService::new(dir.path().to_owned());
+        assert!(restored
+            .enforce_client_version(Some("0.1.31"))
+            .await
+            .is_err());
+        restored
+            .configure(false, "https://vpn.example", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.status().await.record.minimum_client_version,
+            "0.1.32"
+        );
+        assert!(restored
+            .configure(false, "https://vpn.example", None, None, Some("oops"))
+            .await
+            .is_err());
+        restored
+            .configure(false, "https://vpn.example", None, None, Some(""))
+            .await
+            .unwrap();
+        assert!(restored.enforce_client_version(None).await.is_ok());
     }
 
     fn fixture() -> (Manifest, Release, Vec<(String, Vec<u8>)>) {
@@ -1021,6 +1108,7 @@ mod tests {
                 "https://vpn.example",
                 Some("http://127.0.0.1:7897"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1035,7 +1123,7 @@ mod tests {
             "http://127.0.0.1:7897/"
         );
         restored
-            .configure(true, "https://vpn.example", None, None)
+            .configure(true, "https://vpn.example", None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1043,7 +1131,7 @@ mod tests {
             "http://127.0.0.1:7897/"
         );
         restored
-            .configure(true, "https://vpn.example", Some(""), None)
+            .configure(true, "https://vpn.example", Some(""), None, None)
             .await
             .unwrap();
         assert!(ClientUpdateService::new(dir.path().to_owned())
@@ -1055,7 +1143,7 @@ mod tests {
         let _lock = service.gate.lock().await;
         assert!(service.queue().is_err());
         assert!(service
-            .configure(false, "https://vpn.example", None, None)
+            .configure(false, "https://vpn.example", None, None, None)
             .await
             .is_err());
     }
@@ -1110,7 +1198,7 @@ mod tests {
         let root = std::env::var("VPN_UPDATE_TEST_DIR").expect("isolated test directory required");
         let service = ClientUpdateService::new(PathBuf::from(root));
         service
-            .configure(false, "http://127.0.0.1:18081", None, None)
+            .configure(false, "http://127.0.0.1:18081", None, None, None)
             .await
             .unwrap();
         service.sync().await.unwrap();
