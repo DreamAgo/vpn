@@ -171,9 +171,9 @@ class MainActivity : Activity() {
         updateRow = design.button(mine, "应用更新") { updateSheet() }
         design.button(mine, "诊断与日志") { diagnosticsSheet() }
         design.button(mine, "系统 VPN 设置") { runCatching { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }.onFailure { state.text = "无法打开系统 VPN 设置" } }
-        design.button(mine, "关于易链") { sheet("关于易链") { box -> design.text(box, "易链 · ${BuildConfig.VERSION_NAME}", 22f, bold = true); design.text(box, "安全访问工作网络。\nAndroid ${Build.VERSION.RELEASE}\n仅授权网段使用 VPN，连接以握手为准。\n暂不支持开机自动连接或始终开启 VPN。", 13f, design.muted) } }
+        design.button(mine, "关于易链") { sheet("关于易链") { box -> design.text(box, "易链 · ${BuildConfig.VERSION_NAME}", 22f, bold = true); design.text(box, "单屏界面 · 构建 ${BuildConfig.UI_BUILD}", 12f, design.muted); design.text(box, "安全访问工作网络。\nAndroid ${Build.VERSION.RELEASE}\n仅授权网段使用 VPN，连接以握手为准。\n暂不支持开机自动连接或始终开启 VPN。", 13f, design.muted) } }
         design.button(mine, "退出登录") { if (!busy) afterDisconnect { work("退出登录") { client -> client.logout(); ui { reloadAccount() } } } }.setTextColor(android.graphics.Color.rgb(170, 70, 60))
-        design.text(mine, "易链 ${BuildConfig.VERSION_NAME}", 11f, design.muted).also(design::centered)
+        design.text(mine, "易链 ${BuildConfig.VERSION_NAME} · 单屏 ${BuildConfig.UI_BUILD}", 11f, design.muted).also(design::centered)
         val login = design.column(24)
         loginPage = ScrollView(this).apply { isFillViewport = true; isVerticalScrollBarEnabled = false; addView(login) }; shell.addView(loginPage, LinearLayout.LayoutParams(-1, 0, 1f))
         design.text(login, "连接工作，\n也连接安心。", 30f, bold = true)

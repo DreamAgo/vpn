@@ -51,6 +51,8 @@ adb install -r mobile/android/app/build/outputs/apk/debug/app-debug.apk
 
 ## 手机端界面
 
+「我的」页底部和「关于易链」显示界面源码构建标识，用于区分版本号相同的本地调试包；此标识不改变统一版本或更新比较规则。
+
 Android 原生界面按已确认的蓝色手机 Demo 实现，主色 `#2563EB`，浅灰背景、白色卡片与底部三页导航，沿用易链原图标。
 
 - **登录**：企业 HTTPS 服务地址、飞书主入口与密码登录；不显示 Demo 场景或模拟账号。
