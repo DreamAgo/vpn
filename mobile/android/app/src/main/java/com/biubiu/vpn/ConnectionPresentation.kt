@@ -53,15 +53,9 @@ data class ConnectionPresentation(
                     if (elapsed >= 3600) String.format(Locale.ROOT, "%02d:%02d:%02d", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
                     else String.format(Locale.ROOT, "%02d:%02d", elapsed / 60, elapsed % 60)
                 } ?: "—",
-                number("上传")?.let(::bytes) ?: "—",
-                number("下载")?.let(::bytes) ?: "—",
+                number("上传")?.let(TrafficFormat::bytes) ?: "—",
+                number("下载")?.let(TrafficFormat::bytes) ?: "—",
             )
-        }
-        private fun bytes(value: Long): String = when {
-            value >= 1024L * 1024 * 1024 -> String.format(Locale.ROOT, "%.2f GB", value / (1024.0 * 1024 * 1024))
-            value >= 1024L * 1024 -> String.format(Locale.ROOT, "%.2f MB", value / (1024.0 * 1024))
-            value >= 1024 -> String.format(Locale.ROOT, "%.1f KB", value / 1024.0)
-            else -> "$value B"
         }
     }
 }

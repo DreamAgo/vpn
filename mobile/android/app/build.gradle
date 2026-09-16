@@ -14,8 +14,8 @@ if (minor >= 1000 || patch >= 1000 || androidVersionCode < 1 || androidVersionCo
 }
 // Identify UI iterations without changing protocol/release version ordering.
 def uiDigest = java.security.MessageDigest.getInstance('SHA-256')
-['src/main/java/com/biubiu/vpn/MainActivity.kt', 'src/main/java/com/biubiu/vpn/NativeUi.kt'].each {
-    uiDigest.update(file(it).bytes)
+fileTree('src/main') { include '**/*.kt', '**/*.xml', '**/*.png' }.files.sort { it.path }.each {
+    uiDigest.update(it.bytes)
 }
 def uiBuild = uiDigest.digest().encodeHex().toString().take(8)
 android {

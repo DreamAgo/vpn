@@ -250,7 +250,7 @@ class MainActivity : Activity() {
         errorCard.visibility = if (model.failed) android.view.View.VISIBLE else android.view.View.GONE
         errorText.text = "${model.subtitle} · 点击查看详情"
         privacyCard.visibility = if (!model.connected && !model.failed && !compactHome) android.view.View.VISIBLE else android.view.View.GONE
-        detail.text = "服务器：$connectedServer\n${TunnelService.status}\n${TunnelService.details}"
+        detail.text = "服务器：$connectedServer\n${TunnelService.status}\n${TrafficFormat.details(TunnelService.details)}"
     }
     private fun connectionAction() {
         if (actionAfterStop != null) return
@@ -285,16 +285,16 @@ class MainActivity : Activity() {
         sheetDialog = dialog
     }
     private fun detailsSheet() { sheet("连接详情") { box ->
-        design.text(box, "${if (ConnectionPresentation.from(TunnelService.running, TunnelService.status, TunnelService.details).connected) "当前连接" else "最近连接快照（非实时）"}\n服务器：$connectedServer\n${TunnelService.status}\n${TunnelService.details}", 13f, design.muted).setTextIsSelectable(true)
-        design.button(box, "复制连接详情") { copy("易链连接", "$connectedServer\n${TunnelService.details}"); Toast.makeText(this, "连接详情已复制", Toast.LENGTH_SHORT).show() }
+        design.text(box, "${if (ConnectionPresentation.from(TunnelService.running, TunnelService.status, TunnelService.details).connected) "当前连接" else "最近连接快照（非实时）"}\n服务器：$connectedServer\n${TunnelService.status}\n${TrafficFormat.details(TunnelService.details)}", 13f, design.muted).setTextIsSelectable(true)
+        design.button(box, "复制连接详情") { copy("易链连接", "$connectedServer\n${TrafficFormat.details(TunnelService.details)}"); Toast.makeText(this, "连接详情已复制", Toast.LENGTH_SHORT).show() }
     } }
     private fun copy(title: String, value: String) { getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(title, value)) }
     private fun copyDiagnostics() {
-        copy("易链诊断", "易链 ${BuildConfig.VERSION_NAME}\nAndroid ${Build.VERSION.RELEASE}\n${TunnelService.status}\n${TunnelService.details}\n${Diagnostics.snapshot()}")
+        copy("易链诊断", "易链 ${BuildConfig.VERSION_NAME}\nAndroid ${Build.VERSION.RELEASE}\n${TunnelService.status}\n${TrafficFormat.details(TunnelService.details)}\n${Diagnostics.snapshot()}")
         Toast.makeText(this, "诊断已复制（包含内网地址）", Toast.LENGTH_SHORT).show()
     }
     private fun diagnosticsSheet() { sheet("诊断与支持") { box ->
-        design.text(box, "${TunnelService.status}\n${TunnelService.details}", 13f, design.muted).setTextIsSelectable(true)
+        design.text(box, "${TunnelService.status}\n${TrafficFormat.details(TunnelService.details)}", 13f, design.muted).setTextIsSelectable(true)
         design.text(box, "请先检查当前网络与服务地址。若服务端拒绝请求，请将错误信息交给管理员确认；错误码本身不能确定原因。", 13f, design.muted)
         design.button(box, "复制诊断") { copyDiagnostics() }
         design.text(box, Diagnostics.snapshot().ifBlank { "暂无活动记录。" }, 12f, design.muted).setTextIsSelectable(true)

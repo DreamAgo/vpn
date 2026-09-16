@@ -59,7 +59,7 @@ class TunnelService : VpnService() {
     private fun notification(text: String): Notification {
         val stop = PendingIntent.getService(this, 1, Intent(this, TunnelService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE)
         val open = PendingIntent.getActivity(this, 2, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Builder(this, "vpn").setSmallIcon(android.R.drawable.stat_sys_upload_done).setContentTitle("易链")
+        return Notification.Builder(this, "vpn").setSmallIcon(R.drawable.ic_vpn_notification).setOnlyAlertOnce(true).setContentTitle("易链")
             .setContentText(text).setContentIntent(open).setOngoing(true).addAction(Notification.Action.Builder(null, "断开", stop).build()).build()
     }
     private fun report(text: String, diagnostic: String = text) {
@@ -143,6 +143,7 @@ class TunnelService : VpnService() {
             var lastNetworkCheck = 0L
             var lastTimer = 0L; var lastStatus = 0L; var lastHeartbeat = SystemClock.elapsedRealtime()
             val started = SystemClock.elapsedRealtime()
+            val rateMeter = TrafficRateMeter(started)
             report("正在进行 WireGuard 握手")
             while (!stopping.get()) {
                 failure.getAndSet(null)?.let { throw it }
@@ -190,7 +191,8 @@ class TunnelService : VpnService() {
                         handshaken = true
                         if (stats.getLong("handshake_seconds") > 180) throw java.io.IOException("WireGuard 握手已失效")
                         details = "VPN IP：${plan.getString("address")}\n连接时长：${(now - started) / 1000} 秒\n上传：${stats.getLong("tx_bytes")} B\n下载：${stats.getLong("rx_bytes")} B\nDNS：${plan.optString("dns", "系统默认")}\n路由：${plan.getJSONArray("routes")}\n最近握手：${stats.getLong("handshake_seconds")} 秒前"
-                        report("已连接 ${plan.getString("address")} · ↑ ${stats.getLong("tx_bytes")} B ↓ ${stats.getLong("rx_bytes")} B")
+                        val (up, down) = rateMeter.sample(now, stats.getLong("tx_bytes"), stats.getLong("rx_bytes"))
+                        report("已连接 ${plan.getString("address")} · ↑ ${TrafficFormat.rate(up)} ↓ ${TrafficFormat.rate(down)}")
                     } else if (now - started > 20000) throw java.io.IOException("WireGuard 握手超时")
                     lastStatus = now
                 }
