@@ -1,5 +1,19 @@
 plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+
+// Cargo workspace is the version source for all clients and the server.
+def manifest = rootProject.file('../../Cargo.toml').getText('UTF-8')
+def packageSection = (manifest =~ /(?ms)^\[workspace\.package\]\s*\n(.*?)(?=^\[|\z)/)
+if (!packageSection.find()) throw new GradleException('Missing Cargo workspace.package')
+def versionMatch = (packageSection.group(1) =~ /(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"\s*$/)
+if (!versionMatch.find()) throw new GradleException('Expected a stable major.minor.patch workspace version')
+def projectVersion = "${versionMatch.group(1)}.${versionMatch.group(2)}.${versionMatch.group(3)}"
+def (major, minor, patch) = (1..3).collect { versionMatch.group(it).toBigInteger() }
+def androidVersionCode = major * 1000000 + minor * 1000 + patch
+if (minor >= 1000 || patch >= 1000 || androidVersionCode < 1 || androidVersionCode > 2100000000) {
+    throw new GradleException('Workspace version exceeds Android versionCode range')
+}
 android {
+    buildFeatures { buildConfig true }
     namespace 'com.biubiu.vpn'
     compileSdk 35
     ndkVersion '28.2.13676358'
@@ -7,8 +21,8 @@ android {
         applicationId 'com.biubiu.vpn'
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '0.1.15'
+        versionCode androidVersionCode.intValue()
+        versionName projectVersion
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64' }
     }
     signingConfigs {

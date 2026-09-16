@@ -47,7 +47,7 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
         check(!session.optBoolean("mustChange")) { "请先修改密码" }
         return post("/peers/register", JSONObject().put("wg_public_key", session.getString("public"))
             .put("device_name", "Android ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
-            .put("os_info", "Android ${android.os.Build.VERSION.RELEASE}").put("client_version", "0.1.15")
+            .put("os_info", "Android ${android.os.Build.VERSION.RELEASE}").put("client_version", BuildConfig.VERSION_NAME)
             .put("capabilities", org.json.JSONArray().put("obfs-v1")))
     }
     @Synchronized fun heartbeat(): JSONObject = post("/peers/heartbeat", JSONObject().put("wg_public_key", session.getString("public")))

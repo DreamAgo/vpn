@@ -48,6 +48,7 @@ class MainActivity : Activity() {
         fun label(text: String, size: Float = 16f) = TextView(this).apply { this.text = text; textSize = size; setPadding(0, 12, 0, 12); content.addView(this) }
         label("易链", 28f)
         label("安全连接企业内网")
+        label("版本 ${BuildConfig.VERSION_NAME}", 13f)
         server = EditText(this).apply { hint = "https://vpn.example.com"; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI; setSingleLine(); content.addView(this) }
         username = EditText(this).apply { hint = "账号"; inputType = InputType.TYPE_CLASS_TEXT; setSingleLine(); content.addView(this) }
         password = EditText(this).apply { hint = "密码"; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD; setSingleLine(); content.addView(this) }

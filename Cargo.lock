@@ -4941,7 +4941,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-mobile"
-version = "0.1.15"
+version = "0.1.33"
 dependencies = [
  "base64",
  "boringtun",

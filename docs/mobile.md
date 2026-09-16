@@ -2,6 +2,8 @@
 
 Android 首版使用 Kotlin 原生界面、`VpnService` 和共享 Rust `vpn-mobile` 数据面；iOS 尚未实现。最低 Android 8/API 26，目标 API 35，支持 ARM64、ARMv7 和 x86_64。无需 root。
 
+开发基线已同步到 `v0.1.33`。APK 版本、界面版本和注册节点时上报的客户端版本统一读取根 `Cargo.toml` 的 `workspace.package.version`。Android `versionCode` 按 `major × 1000000 + minor × 1000 + patch` 生成（minor/patch 小于 1000）；`0.1.33` 对应 `1033`，后续发布只需更新项目统一版本。
+
 ## 本地构建
 
 工具版本：JDK 17、Gradle Wrapper 8.11.1、AGP 8.9.2、Kotlin 2.1.20、Rust 1.90、cargo-ndk 4.1.2、Android SDK 35、NDK 28.2.13676358。
