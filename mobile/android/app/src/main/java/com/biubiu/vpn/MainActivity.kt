@@ -140,11 +140,6 @@ class MainActivity : Activity() {
         privacyCard = design.text(connectPage, "仅工作网络通过安全通道，日常上网保持直连。", 12f, design.blue).apply {
             background = design.shape(design.soft, 14); setPadding(design.dp(14), design.dp(12), design.dp(14), design.dp(12)); maxLines = 2
         }
-        design.button(connectPage, "查看连接详情  ›") { detailsSheet() }.apply {
-            background = android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT); textSize = 12f
-            minimumHeight = design.dp(48); minHeight = design.dp(48); setPadding(0, 0, 0, 0)
-            (layoutParams as LinearLayout.LayoutParams).apply { topMargin = 0; bottomMargin = 0 }
-        }
         connectPage.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
             val compact = bottom - top < design.dp(380)
             if (compact != compactHome) { compactHome = compact; refreshConnection() }
@@ -195,7 +190,12 @@ class MainActivity : Activity() {
         cancelButton = design.button(shell, "取消当前操作") { cancelOperation() }.apply { visibility = android.view.View.GONE }
         navigation = LinearLayout(this).apply { setPadding(design.dp(12), design.dp(8), design.dp(12), design.dp(8)); setBackgroundColor(android.graphics.Color.WHITE) }
         listOf("连接", "活动", "我的").forEachIndexed { index, label ->
-            val button = Button(this).apply { text = label; setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(22), design.muted, if (index == 0) 4 else index), null, null); compoundDrawablePadding = design.dp(4); textSize = 12f; isAllCaps = false; minHeight = design.dp(52); setOnClickListener { selectTab(index) } }
+            val button = Button(this).apply {
+                stateListAnimator = null; elevation = 0f; translationZ = 0f; outlineProvider = null
+                backgroundTintList = null
+                background = android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x142563EB), null, null)
+                setPadding(design.dp(8), design.dp(6), design.dp(8), design.dp(6))
+                text = label; setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(22), design.muted, if (index == 0) 4 else index), null, null); compoundDrawablePadding = design.dp(4); textSize = 12f; isAllCaps = false; minHeight = design.dp(52); setOnClickListener { selectTab(index) } }
             navigation.addView(button, LinearLayout.LayoutParams(0, -2, 1f)); tabButtons.add(button)
         }
         shell.addView(navigation)
@@ -208,7 +208,7 @@ class MainActivity : Activity() {
     }
     private fun selectTab(index: Int) {
         visiblePage = index; pages.displayedChild = index
-        tabButtons.forEachIndexed { i, button -> button.setTextColor(if (i == index) design.blue else design.muted); button.background = design.shape(if (i == index) design.soft else android.graphics.Color.WHITE, 12); button.isSelected = i == index; button.setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(22), if (i == index) design.blue else design.muted, if (i == 0) 4 else i), null, null) }
+        tabButtons.forEachIndexed { i, button -> button.setTextColor(if (i == index) design.blue else design.muted); button.isSelected = i == index; button.setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(22), if (i == index) design.blue else design.muted, if (i == 0) 4 else i), null, null) }
         if (index == 1) refreshActivities()
     }
     private fun refreshActivities() {
