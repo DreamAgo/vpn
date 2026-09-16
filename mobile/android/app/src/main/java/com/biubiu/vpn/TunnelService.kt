@@ -62,11 +62,11 @@ class TunnelService : VpnService() {
         return Notification.Builder(this, "vpn").setSmallIcon(android.R.drawable.stat_sys_upload_done).setContentTitle("易链")
             .setContentText(text).setContentIntent(open).setOngoing(true).addAction(Notification.Action.Builder(null, "断开", stop).build()).build()
     }
-    private fun report(text: String) {
+    private fun report(text: String, diagnostic: String = text) {
         if (stopping.get() || !lifetime.accepts(generation)) return
         if (text.startsWith("已连接")) {
             if (!status.startsWith("已连接")) Diagnostics.event("WireGuard 握手成功，VPN 已连接")
-        } else if (status != text) Diagnostics.event(text)
+        } else if (status != text) Diagnostics.event(diagnostic)
         status = text
         getSystemService(NotificationManager::class.java).notify(1, notification(text))
     }
@@ -97,8 +97,8 @@ class TunnelService : VpnService() {
                     delay = 1000L
                 } catch (e: Exception) {
                     if (stopping.get()) break
-                    if (e is ApiError && (e.fatal || e.code == 1006 || e.code == 2002) || e is IllegalArgumentException || e is IllegalStateException || e is org.json.JSONException) {
-                        report("连接停止：${Diagnostics.error(e)}"); break
+                    if (e is ApiError && e.stopsTunnel || e is IllegalArgumentException || e is IllegalStateException || e is org.json.JSONException) {
+                        report("连接停止：${Diagnostics.error(e)}", "连接停止：${Diagnostics.logError(e)}"); break
                     }
                     if (handshaken) { delay = 1000L; handshaken = false }
                     report("连接中断，${delay / 1000} 秒后重试：${Diagnostics.error(e)}")

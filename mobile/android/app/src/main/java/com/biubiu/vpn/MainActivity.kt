@@ -172,7 +172,7 @@ class MainActivity : Activity() {
             taskEpoch.set(ticket)
             var success = false
             try { client.network = PhysicalNetwork.choose(getSystemService(ConnectivityManager::class.java)); action(client); success = true; ui { if (gate.accepts(ticket)) { state.text = "$stage 完成"; Diagnostics.event("$stage 完成") } } }
-            catch (e: Exception) { ui { if (gate.accepts(ticket)) { state.text = "$stage：${Diagnostics.error(e)}"; updateText.text = state.text; Diagnostics.event("$stage 失败：${e.javaClass.simpleName} ${Diagnostics.error(e)}") } } }
+            catch (e: Exception) { ui { if (gate.accepts(ticket)) { state.text = "$stage：${Diagnostics.error(e)}"; updateText.text = state.text; Diagnostics.event("$stage 失败：${e.javaClass.simpleName} ${Diagnostics.logError(e)}") } } }
             finally { ui { if (gate.accepts(ticket)) { busy = false; operationApi = null; updater = null; if (success && (stage == "密码登录" || stage == "飞书登录")) { reloadAccount(); val saved = api.saved(); if (!saved.optBoolean("mustChange")) checkUpdates(saved.getString("server")) } } }; taskEpoch.remove() }
         }
     }

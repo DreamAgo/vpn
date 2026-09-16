@@ -88,7 +88,7 @@ Android 从配置服务器的 `/updates/latest.json` 读取 `downloads`，选择
 
 ## 验证记录（2026-09-16）
 
-本地 `assembleDebug`、27 项 Kotlin/JVM 测试、17 项 Rust 测试与 clippy 均通过；Android lint 无错误（8 项目标 SDK、API 弃用和文本等非阻断提示）。最终调试 APK 的 v2 签名、16 KiB ZIP 对齐检查通过，三架构 JNI 库已打包；ARM64 ELF LOAD 段按 16 KiB 对齐。
+本地 `assembleDebug`、29 项 Kotlin/JVM 测试、17 项 Rust 测试与 clippy 均通过；Android lint 无错误（8 项目标 SDK、API 弃用和文本等非阻断提示）。最终调试 APK 的 v2 签名、16 KiB ZIP 对齐检查通过，三架构 JNI 库已打包；ARM64 ELF LOAD 段按 16 KiB 对齐。
 
 Rust 自动化覆盖真实客户端与 boringtun 服务端握手、原生及两种混淆模式的双向 IP 报文（含非 16 字节对齐长度）、重放丢弃、MTU 超限、DNS 校验、策略排除和路由数界限。Kotlin 主机测试覆盖刷新一次、撤销清凭据、改密清会话、取消刷新不落盘、断开后的所有权和并发启动。
 
@@ -104,3 +104,7 @@ Rust 自动化覆盖真实客户端与 boringtun 服务端握手、原生及两�
 - API 26 与 Android 15/16 KiB 页大小设备的安装和运行。
 
 JNI 内存契约：Java 输入复制后使用，返回数组由 JVM 持有；句柄是注册表 ID，不是地址，`process`/`destroy` 通过锁串行化，过期句柄安全失败。Rust 不持有平台资源、不创建线程；Android 关闭 IO 后销毁句柄。
+
+### 6001 校验错误排障
+
+`6001` 是服务端参数校验错误，不能仅凭错误码确定具体原因。Android 展示脱敏后的服务端说明（例如终端配额已满、配置等待重启或飞书资料校验失败）；连接遇到该错误时停止自动重试并保留登录。运行日志仅记录错误码，不写入任意服务端原始消息。排障时需结合出错操作和界面完整提示。

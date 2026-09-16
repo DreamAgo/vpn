@@ -7,6 +7,7 @@ import javax.net.ssl.HttpsURLConnection
 
 class ApiError(val code: Int, message: String) : Exception(message) {
     val fatal: Boolean get() = code in setOf(1002, 1004, 1007, 3002)
+    val stopsTunnel: Boolean get() = fatal || code in setOf(1006, 2002, 6001)
 }
 
 /** One lock serializes refresh and all session changes; normal TLS verification stays enabled. */
