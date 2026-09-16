@@ -20,7 +20,13 @@ class MainActivity : Activity() {
     private lateinit var account: TextView
     private lateinit var detail: TextView
     private lateinit var updateText: TextView
-    private lateinit var logText: TextView
+    private lateinit var activityEvents: LinearLayout
+    private var lastActivities: String? = null
+    private var updateCheckButton: Button? = null
+    private var updateDownloadButton: Button? = null
+    private var updateInstallButton: Button? = null
+    private var updateCancelButton: Button? = null
+    private var updateOperation = false
     private val mutableButtons = mutableListOf<Button>()
     private val executor = Executors.newSingleThreadExecutor()
     private val handler = Handler(Looper.getMainLooper())
@@ -39,16 +45,42 @@ class MainActivity : Activity() {
     private var ready: File? = null
     private var pendingInstall = false
     private var actionAfterStop: (() -> Unit)? = null
+    private lateinit var design: NativeUi
+    private lateinit var shell: LinearLayout
+    private lateinit var pages: ViewFlipper
+    private lateinit var loginPage: ScrollView
+    private lateinit var navigation: LinearLayout
+    private lateinit var title: TextView
+    private lateinit var subtitle: TextView
+    private lateinit var metricsCard: LinearLayout
+    private lateinit var duration: TextView
+    private lateinit var upload: TextView
+    private lateinit var download: TextView
+    private lateinit var primary: Button
+    private lateinit var power: Button
+    private lateinit var cancelButton: Button
+    private lateinit var errorCard: LinearLayout
+    private lateinit var errorText: TextView
+    private lateinit var workspace: TextView
+    private lateinit var serverRow: Button
+    private lateinit var updateRow: Button
+    private var sessionInitialized = false
+    private var sessionVisible = false
+    private var sessionIdentity = ""
+    private var sheetDialog: Dialog? = null
+    private val tabButtons = mutableListOf<Button>()
     private val refresh = object : Runnable {
         override fun run() {
-            val active = TunnelService.running
-            if (!busy && TunnelService.status != lastStatus) { lastStatus = TunnelService.status; state.text = lastStatus }
-            detail.text = "服务器：$connectedServer\n" + if (active) TunnelService.details else "${TunnelService.status}\n${TunnelService.details}"
-            server.isEnabled = !busy && !active; username.isEnabled = !busy && !active; password.isEnabled = !busy && !active
-            mutableButtons.forEach { it.isEnabled = !busy && !active }
-            if (!active && actionAfterStop != null) { val next = actionAfterStop; actionAfterStop = null; next?.invoke() }
-            if (!busy && !active) reloadAccount()
-            if (visiblePage == 3) { val logs = Diagnostics.snapshot(); if (logText.text.toString() != logs) logText.text = logs }
+            if (!busy && !TunnelService.running) reloadAccount()
+            refreshConnection()
+            server.isEnabled = !busy && !TunnelService.running
+            username.isEnabled = !busy; password.isEnabled = !busy
+            mutableButtons.forEach { it.isEnabled = !busy && !TunnelService.running; it.alpha = if (it.isEnabled) 1f else .45f }
+            cancelButton.visibility = if (busy || actionAfterStop != null) android.view.View.VISIBLE else android.view.View.GONE
+            if (!TunnelService.running && actionAfterStop != null) { val next = actionAfterStop; actionAfterStop = null; next?.invoke() }
+            if (visiblePage == 1) refreshActivities()
+            refreshUpdateActions()
+            updateRow.text = if (candidate != null) "应用更新 · 有新版本" else "应用更新"
             handler.postDelayed(this, 1000)
         }
     }
@@ -60,95 +92,231 @@ class MainActivity : Activity() {
             AlertDialog.Builder(this).setTitle("安全凭据不可读取").setMessage("清除本机保存的登录后重新登录。")
                 .setPositiveButton("清除并重新登录") { _, _ -> Vault(this).clear(); recreate() }.setNegativeButton("关闭") { _, _ -> finish() }.setCancelable(false).show(); return
         }
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 32, 24, 24) }
-        fun label(parent: LinearLayout, text: String, size: Float = 16f) = TextView(this).apply { this.text = text; textSize = size; setPadding(0, 10, 0, 10); parent.addView(this) }
-        label(root, "易链 · ${BuildConfig.VERSION_NAME}", 24f)
-        state = label(root, TunnelService.status)
-        val nav = LinearLayout(this); root.addView(nav)
-        val pages = android.widget.ViewFlipper(this); root.addView(pages, LinearLayout.LayoutParams(-1, 0, 1f))
-        fun page(title: String): LinearLayout {
-            val index = pages.childCount
-            nav.addView(Button(this).apply { text = title; textSize = 12f; setOnClickListener { pages.displayedChild = index; visiblePage = index; if (::logText.isInitialized) logText.text = Diagnostics.snapshot() } }, LinearLayout.LayoutParams(0, -2, 1f))
-            val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            pages.addView(ScrollView(this).apply { addView(content) }); return content
+        design = NativeUi(this)
+        visiblePage = savedInstanceState?.getInt("selectedTab", 0)?.coerceIn(0, 2) ?: 0
+        shell = design.column().apply { setBackgroundColor(design.background) }
+        val header = LinearLayout(this).apply { gravity = android.view.Gravity.CENTER_VERTICAL; setPadding(design.dp(24), design.dp(16), design.dp(24), design.dp(12)) }
+        header.addView(ImageView(this).apply { setImageResource(applicationInfo.icon); contentDescription = "易链" }, LinearLayout.LayoutParams(design.dp(38), design.dp(38)))
+        val brand = design.column().apply { setPadding(design.dp(12), 0, 0, 0) }
+        design.text(brand, "易链", 21f, bold = true).setPadding(0, 0, 0, 0)
+        design.text(brand, "YILIAN CONNECT", 9f, design.muted).setPadding(0, 0, 0, 0)
+        header.addView(brand); shell.addView(header)
+        state = design.text(shell, "", 12f, design.muted).apply { setPadding(design.dp(24), design.dp(4), design.dp(24), design.dp(4)); accessibilityLiveRegion = android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE }
+        pages = ViewFlipper(this); shell.addView(pages, LinearLayout.LayoutParams(-1, 0, 1f))
+        fun page(): LinearLayout = design.column(24).also { content -> pages.addView(ScrollView(this).apply { isFillViewport = true; addView(content) }) }
+        val connectPage = page()
+        val space = design.card(connectPage)
+        workspace = design.text(space, "工作网络", 14f, bold = true)
+        design.text(space, "仅授权网段通过安全连接访问", 11f, design.muted)
+        space.setOnClickListener { detailsSheet() }; space.contentDescription = "查看工作网络连接详情"; space.isFocusable = true
+        val hero = design.column().apply { gravity = android.view.Gravity.CENTER_HORIZONTAL }; connectPage.addView(hero)
+        design.gap(hero, 12)
+        val ring = FrameLayout(this).apply { background = design.shape(design.soft, 100, true) }
+        power = Button(this).apply {
+            text = ""; setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(40), design.blue, 0), null, null); setPadding(design.dp(38), design.dp(38), design.dp(38), design.dp(38)); background = design.shape(android.graphics.Color.WHITE, 100, true)
+            contentDescription = "连接工作网络"; setOnClickListener { connectionAction() }
         }
-        fun button(parent: LinearLayout, text: String, mutable: Boolean = false, action: () -> Unit): Button = Button(this).apply {
-            this.text = text; setOnClickListener { action() }; parent.addView(this); if (mutable) mutableButtons.add(this)
-        }
-        val connectPage = page("连接")
-        detail = label(connectPage, TunnelService.details)
-        button(connectPage, "连接", true) {
-            if (busy || actionAfterStop != null || TunnelService.running) return@button
-            if (!reloadAccount() || !api.saved().has("refresh")) { state.text = "请先在账号页登录"; return@button }
-            if (api.saved().optBoolean("mustChange")) { passwordDialog(); return@button }
-            val permission = VpnService.prepare(this)
-            if (permission != null) { vpnPermissionTicket = gate.current(); startActivityForResult(permission, 10) } else connect()
-        }
-        button(connectPage, "断开") { stopTunnel() }
-        button(connectPage, "复制连接详情") {
-            getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("易链连接", "$connectedServer\n${TunnelService.details}"))
-            Toast.makeText(this, "连接详情已复制", Toast.LENGTH_SHORT).show()
-        }
-        button(connectPage, "系统 VPN 设置") { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }
-        label(connectPage, "仅授权网段通过 VPN，普通上网使用当前网络。连接以握手为准。Android 通过前台通知保持服务；暂不支持开机自动连接或始终开启 VPN。", 13f)
-        val updatePage = page("更新")
-        updateText = label(updatePage, "使用账号页配置的 HTTPS 服务器检查更新。")
-        button(updatePage, "检查更新") {
-            checkUpdates(server.text.toString())
-        }
-        button(updatePage, "下载更新") {
-            val update = candidate ?: return@button
-            if (busy) return@button
-            AlertDialog.Builder(this).setTitle("下载 ${update.version}").setMessage("下载 ${update.size / 1024} KiB，完成校验后可交给系统安装。")
-                .setNegativeButton("取消", null).setPositiveButton("下载") { _, _ ->
-                    val host = server.text.toString()
-                    work("下载与校验", true) {
-                        require(Api.validServer(host) == update.server)
-                        val client = ClientUpdates(this, PhysicalNetwork.choose(getSystemService(ConnectivityManager::class.java)) ?: error("没有网络")); updater = client
-                        var lastPercent = -1
-                        val file = client.download(update) { done, total -> val percent = (done * 100 / total).toInt(); if (percent != lastPercent) { lastPercent = percent; ui { updateText.text = "下载中 $percent%" } } }
-                        ui { ready = file; updateText.text = "${update.version} 校验通过，点击安装更新" }
-                    }
-                }.show()
-        }
-        button(updatePage, "安装更新") { if (!busy && ready != null) afterDisconnect { install() } }
-        val accountPage = page("账号")
-        fun field(hint: String, type: Int) = EditText(this).apply { this.hint = hint; inputType = type; setSingleLine(); accountPage.addView(this) }
-        server = field("https://vpn.example.com", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        username = field("账号", InputType.TYPE_CLASS_TEXT)
-        password = field("密码", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD).apply { isSaveEnabled = false }
-        val saved = api.saved(); connectedServer = saved.optString("server"); server.setText(saved.optString("server")); username.setText(saved.optString("username"))
-        account = label(accountPage, if (saved.has("refresh")) "已登录：${saved.optString("username")}" else "请先登录")
-        button(accountPage, "密码登录", true) {
+        ring.addView(android.view.View(this).apply { background = design.shape(design.soft, 100, true) }, FrameLayout.LayoutParams(design.dp(144), design.dp(144), android.view.Gravity.CENTER))
+        ring.addView(power, FrameLayout.LayoutParams(design.dp(116), design.dp(116), android.view.Gravity.CENTER))
+        hero.addView(ring, LinearLayout.LayoutParams(design.dp(168), design.dp(168)).apply { topMargin = design.dp(10); bottomMargin = design.dp(16) })
+        title = design.text(hero, "准备连接", 24f, bold = true).also(design::centered)
+        subtitle = design.text(hero, "安全访问你的工作网络", 12f, design.muted).also(design::centered)
+        primary = design.button(connectPage, "连接工作网络", true) { connectionAction() }
+        design.gap(connectPage)
+        val metrics = design.card(connectPage); metricsCard = metrics; val row = LinearLayout(this); metrics.addView(row)
+        fun metric(label: String): TextView { val col = design.column(); row.addView(col, LinearLayout.LayoutParams(0, -2, 1f)); design.text(col, label, 11f, design.muted).also(design::centered); return design.text(col, "—", 14f, bold = true).also(design::centered) }
+        duration = metric("连接时长"); upload = metric("已上传"); download = metric("已下载")
+        errorCard = design.card(connectPage, android.graphics.Color.rgb(255, 244, 237))
+        design.text(errorCard, "连接需要处理", 14f, bold = true)
+        errorText = design.text(errorCard, "", 12f, design.muted)
+        design.button(errorCard, "查看诊断与处理建议") { diagnosticsSheet() }
+        val privacy = design.card(connectPage, design.soft)
+        design.text(privacy, "只连接需要的工作网络", 13f, design.blue, true)
+        design.text(privacy, "仅授权网段通过 VPN，普通上网继续使用当前网络。", 12f, design.muted)
+        design.button(connectPage, "查看连接详情") { detailsSheet() }
+        detail = TextView(this)
+        val activityPage = page()
+        design.text(activityPage, "活动", 25f, bold = true)
+        design.text(activityPage, "连接与操作记录，帮助你了解当前状态。", 12f, design.muted)
+        design.text(activityPage, "最近活动", 12f, design.muted)
+        activityEvents = design.column(); activityPage.addView(activityEvents)
+        refreshActivities()
+        design.button(activityPage, "复制诊断") { copyDiagnostics() }
+        design.button(activityPage, "清空记录") { Diagnostics.clear(); refreshActivities() }
+        val mine = page()
+        design.text(mine, "我的", 25f, bold = true)
+        val profile = design.card(mine)
+        account = design.text(profile, "", 22f, bold = true)
+        design.text(profile, "已登录工作账号", 12f, design.muted)
+        design.text(mine, "工作空间", 12f, design.muted)
+        serverRow = design.button(mine, "服务地址") { serverSheet() }
+        design.button(mine, "修改密码") { if (!busy) afterDisconnect { passwordDialog() } }
+        design.gap(mine)
+        design.text(mine, "应用与支持", 12f, design.muted)
+        updateRow = design.button(mine, "应用更新") { updateSheet() }
+        design.button(mine, "诊断与日志") { diagnosticsSheet() }
+        design.button(mine, "系统 VPN 设置") { runCatching { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }.onFailure { state.text = "无法打开系统 VPN 设置" } }
+        design.button(mine, "关于易链") { sheet("关于易链") { box -> design.text(box, "易链 · ${BuildConfig.VERSION_NAME}", 22f, bold = true); design.text(box, "安全访问工作网络。\nAndroid ${Build.VERSION.RELEASE}\n仅授权网段使用 VPN，连接以握手为准。\n暂不支持开机自动连接或始终开启 VPN。", 13f, design.muted) } }
+        design.button(mine, "退出登录") { if (!busy) afterDisconnect { work("退出登录") { client -> client.logout(); ui { reloadAccount() } } } }.setTextColor(android.graphics.Color.rgb(170, 70, 60))
+        design.text(mine, "易链 ${BuildConfig.VERSION_NAME}", 11f, design.muted).also(design::centered)
+        val login = design.column(24)
+        loginPage = ScrollView(this).apply { isFillViewport = true; addView(login) }; shell.addView(loginPage, LinearLayout.LayoutParams(-1, 0, 1f))
+        design.text(login, "连接工作，\n也连接安心。", 30f, bold = true)
+        design.text(login, "登录你的工作账号，安全访问内部资源。", 13f, design.muted)
+        design.gap(login, 16)
+        design.text(login, "服务地址", 12f, design.muted)
+        server = design.field(login, "https://vpn.example.com", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        mutableButtons.add(design.button(login, "使用飞书登录", true) { feishuLogin() })
+        design.text(login, "或使用账号密码", 12f, design.muted).also(design::centered)
+        username = design.field(login, "账号", InputType.TYPE_CLASS_TEXT)
+        password = design.field(login, "密码", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD).apply { isSaveEnabled = false; importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO }
+        mutableButtons.add(design.button(login, "密码登录") {
             val host = server.text.toString(); val user = username.text.toString(); val secret = password.text.toString(); password.text.clear()
             work("密码登录") { client -> val change = client.login(host, user, secret); ui { reloadAccount(); if (change) passwordDialog() } }
+        })
+        design.text(login, "授权完成后返回易链。首次连接需允许系统 VPN 请求。", 12f, design.muted)
+        design.button(login, "登录遇到问题？查看诊断") { diagnosticsSheet() }
+        design.button(login, "检查应用更新") { updateSheet() }
+        cancelButton = design.button(shell, "取消当前操作") { cancelOperation() }.apply { visibility = android.view.View.GONE }
+        navigation = LinearLayout(this).apply { setPadding(design.dp(12), design.dp(8), design.dp(12), design.dp(8)); setBackgroundColor(android.graphics.Color.WHITE) }
+        listOf("连接", "活动", "我的").forEachIndexed { index, label ->
+            val button = Button(this).apply { text = label; setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(22), design.muted, if (index == 0) 4 else index), null, null); compoundDrawablePadding = design.dp(4); textSize = 12f; isAllCaps = false; minHeight = design.dp(52); setOnClickListener { selectTab(index) } }
+            navigation.addView(button, LinearLayout.LayoutParams(0, -2, 1f)); tabButtons.add(button)
         }
-        button(accountPage, "飞书登录", true) {
-            val host = server.text.toString()
-            work("飞书登录") { client -> FeishuLogin(client).run(host) { url ->
-                val latch = java.util.concurrent.CountDownLatch(1); var failure: Exception? = null
-                ui { try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)); state.text = "在浏览器授权后返回，可点击取消操作" } catch (e: Exception) { failure = e } finally { latch.countDown() } }
-                check(latch.await(5, java.util.concurrent.TimeUnit.SECONDS)); failure?.let { throw it }
-            }; ui { reloadAccount() } }
-        }
-        button(accountPage, "修改密码") { if (!busy) afterDisconnect { passwordDialog() } }
-        button(accountPage, "退出登录") { if (!busy) afterDisconnect { work("退出登录") { client -> client.logout(); ui { reloadAccount() } } } }
-        label(accountPage, "连接中账号只读；修改密码或退出登录前会断开 VPN。", 13f)
-        val diagnosticsPage = page("诊断")
-        logText = label(diagnosticsPage, Diagnostics.snapshot(), 13f)
-        button(diagnosticsPage, "刷新日志") { logText.text = Diagnostics.snapshot() }
-        button(diagnosticsPage, "复制诊断") {
-            val text = "易链 ${BuildConfig.VERSION_NAME}\nAndroid ${Build.VERSION.RELEASE}\n${TunnelService.status}\n${TunnelService.details}\n${Diagnostics.snapshot()}"
-            getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("易链诊断", text))
-            Toast.makeText(this, "诊断已复制（包含内网地址）", Toast.LENGTH_SHORT).show()
-        }
-        button(diagnosticsPage, "清空日志") { Diagnostics.clear(); logText.text = "" }
-        button(root, "取消操作") { cancelOperation() }
-        setContentView(root)
-        root.setOnApplyWindowInsetsListener { view, insets -> view.setPadding(24, 16 + insets.systemWindowInsetTop, 24, 16 + insets.systemWindowInsetBottom); insets }
-        handler.post(refresh)
+        shell.addView(navigation)
+        updateText = TextView(this).apply { text = "从当前工作服务器获取更新。"; textSize = 14f; setTextColor(design.muted); setPadding(0, design.dp(12), 0, design.dp(12)) }
+        val saved = api.saved(); server.setText(saved.optString("server")); username.setText(saved.optString("username"))
+        setContentView(shell)
+        shell.setOnApplyWindowInsetsListener { view, insets -> view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop, insets.systemWindowInsetRight, insets.systemWindowInsetBottom); insets }
+        reloadAccount(); selectTab(visiblePage); handler.post(refresh)
         if (saved.has("refresh") && !saved.optBoolean("mustChange")) handler.post { checkUpdates(saved.getString("server")) }
     }
+    private fun selectTab(index: Int) {
+        visiblePage = index; pages.displayedChild = index
+        tabButtons.forEachIndexed { i, button -> button.setTextColor(if (i == index) design.blue else design.muted); button.background = design.shape(if (i == index) design.soft else android.graphics.Color.WHITE, 12); button.isSelected = i == index; button.setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(22), if (i == index) design.blue else design.muted, if (i == 0) 4 else i), null, null) }
+        if (index == 1) refreshActivities()
+    }
+    private fun refreshActivities() {
+        val logs = Diagnostics.snapshot()
+        if (logs == lastActivities) return
+        lastActivities = logs; activityEvents.removeAllViews()
+        if (logs.isBlank()) {
+            val card = design.card(activityEvents)
+            design.text(card, "还没有连接记录", 14f, bold = true)
+            design.text(card, "连接工作网络后，成功、重连与异常都会出现在这里。", 12f, design.muted)
+            return
+        }
+        logs.lines().asReversed().forEach { entry ->
+            val row = LinearLayout(this).apply { gravity = android.view.Gravity.TOP; setPadding(0, design.dp(10), 0, design.dp(10)) }
+            val glyph = ImageView(this).apply { setImageDrawable(NativeLineIcon(design.dp(18), design.blue, 1)); setPadding(design.dp(7), design.dp(7), design.dp(7), design.dp(7)); background = design.shape(design.soft, 20); importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO }
+            row.addView(glyph, LinearLayout.LayoutParams(design.dp(32), design.dp(32)))
+            val content = design.column().apply { setPadding(design.dp(12), 0, 0, 0) }
+            row.addView(content, LinearLayout.LayoutParams(0, -2, 1f))
+            design.text(content, entry.substringAfter(' ', entry), 13f).setTextIsSelectable(true)
+            design.text(content, entry.substringBefore(' '), 11f, design.muted)
+            activityEvents.addView(row)
+        }
+    }
+    private fun refreshUpdateActions() {
+        listOf(updateCheckButton to !busy, updateDownloadButton to (!busy && candidate != null), updateInstallButton to (!busy && ready != null), updateCancelButton to (busy && updateOperation)).forEach { (button, enabled) ->
+            button?.isEnabled = enabled; button?.alpha = if (enabled) 1f else .45f
+        }
+    }
+    private fun refreshConnection() {
+        val model = ConnectionPresentation.from(TunnelService.running, TunnelService.status, TunnelService.details)
+        title.text = model.title; subtitle.text = model.subtitle; primary.text = model.actionLabel
+        primary.isEnabled = (!busy || TunnelService.running) && !model.stopping && actionAfterStop == null; power.isEnabled = primary.isEnabled
+        power.contentDescription = model.actionLabel
+        primary.alpha = if (primary.isEnabled) 1f else .45f; power.alpha = primary.alpha
+        power.setCompoundDrawablesWithIntrinsicBounds(null, NativeLineIcon(design.dp(40), if (model.connected) android.graphics.Color.WHITE else design.blue, if (model.connected) 4 else 0), null, null)
+        power.background = design.shape(if (model.connected) design.blue else android.graphics.Color.WHITE, 100, true)
+        metricsCard.visibility = if (model.connected) android.view.View.VISIBLE else android.view.View.GONE
+        duration.text = model.duration; upload.text = model.uploaded; download.text = model.downloaded
+        errorCard.visibility = if (model.failed) android.view.View.VISIBLE else android.view.View.GONE
+        errorText.text = model.subtitle
+        detail.text = "服务器：$connectedServer\n${TunnelService.status}\n${TunnelService.details}"
+    }
+    private fun connectionAction() {
+        if (actionAfterStop != null) return
+        if (TunnelService.running) {
+            val model = ConnectionPresentation.from(true, TunnelService.status, TunnelService.details)
+            if (model.connected) AlertDialog.Builder(this).setTitle("断开工作网络？").setMessage("断开后将无法通过易链访问内部资源。").setNegativeButton("保持连接", null).setPositiveButton("断开连接") { _, _ -> stopTunnel() }.show()
+            else stopTunnel()
+            return
+        }
+        if (busy) return
+        if (!reloadAccount() || !api.saved().has("refresh")) { state.text = "请先登录工作账号"; return }
+        if (api.saved().optBoolean("mustChange")) { passwordDialog(); return }
+        val permission = VpnService.prepare(this)
+        if (permission != null) { vpnPermissionTicket = gate.current(); startActivityForResult(permission, 10) } else connect()
+    }
+    private fun feishuLogin() {
+        val host = server.text.toString()
+        work("飞书登录") { client -> FeishuLogin(client).run(host) { url ->
+            val latch = java.util.concurrent.CountDownLatch(1); var failure: Exception? = null
+            ui { try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)); state.text = "在浏览器授权后返回，可点击取消当前操作" } catch (e: Exception) { failure = e } finally { latch.countDown() } }
+            check(latch.await(5, java.util.concurrent.TimeUnit.SECONDS)); failure?.let { throw it }
+        }; ui { reloadAccount(); if (api.saved().optBoolean("mustChange")) passwordDialog() } }
+    }
+    private fun sheet(heading: String, content: (LinearLayout) -> Unit) {
+        sheetDialog?.dismiss()
+        val dialog = Dialog(this); val box = design.column(24).apply { background = design.shape(android.graphics.Color.WHITE, 24) }
+        design.text(box, heading, 23f, bold = true); content(box)
+        design.button(box, "关闭") { dialog.dismiss() }
+        dialog.setContentView(ScrollView(this).apply { addView(box) })
+        dialog.window?.apply { setBackgroundDrawableResource(android.R.color.transparent); setGravity(android.view.Gravity.BOTTOM); addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE); setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE) }
+        dialog.show(); dialog.window?.setLayout(-1, (resources.displayMetrics.heightPixels * .8).toInt())
+        sheetDialog = dialog
+    }
+    private fun detailsSheet() { sheet("连接详情") { box ->
+        design.text(box, "${if (ConnectionPresentation.from(TunnelService.running, TunnelService.status, TunnelService.details).connected) "当前连接" else "最近连接快照（非实时）"}\n服务器：$connectedServer\n${TunnelService.status}\n${TunnelService.details}", 13f, design.muted).setTextIsSelectable(true)
+        design.button(box, "复制连接详情") { copy("易链连接", "$connectedServer\n${TunnelService.details}"); Toast.makeText(this, "连接详情已复制", Toast.LENGTH_SHORT).show() }
+    } }
+    private fun copy(title: String, value: String) { getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(title, value)) }
+    private fun copyDiagnostics() {
+        copy("易链诊断", "易链 ${BuildConfig.VERSION_NAME}\nAndroid ${Build.VERSION.RELEASE}\n${TunnelService.status}\n${TunnelService.details}\n${Diagnostics.snapshot()}")
+        Toast.makeText(this, "诊断已复制（包含内网地址）", Toast.LENGTH_SHORT).show()
+    }
+    private fun diagnosticsSheet() { sheet("诊断与支持") { box ->
+        design.text(box, "${TunnelService.status}\n${TunnelService.details}", 13f, design.muted).setTextIsSelectable(true)
+        design.text(box, "请先检查当前网络与服务地址。若服务端拒绝请求，请将错误信息交给管理员确认；错误码本身不能确定原因。", 13f, design.muted)
+        design.button(box, "复制诊断") { copyDiagnostics() }
+        design.text(box, Diagnostics.snapshot().ifBlank { "暂无活动记录。" }, 12f, design.muted).setTextIsSelectable(true)
+        if (sessionVisible) design.button(box, "查看活动记录") { sheetDialog?.dismiss(); selectTab(1) }
+    } }
+    private fun serverSheet() { sheet("服务地址") { box ->
+        design.text(box, connectedServer, 16f, bold = true)
+        design.text(box, "更换服务需要退出当前账号，并在登录页填写新的 HTTPS 地址。", 13f, design.muted)
+        design.button(box, "更换服务并重新登录") { if (!busy) afterDisconnect { work("退出登录") { client -> client.logout(); ui { candidate = null; ready = null; reloadAccount(); server.text.clear(); sheetDialog?.dismiss() } } } }
+    } }
+    private fun updateSheet() { sheet("应用更新") { box ->
+        design.text(box, "当前版本 ${BuildConfig.VERSION_NAME}", 14f, bold = true)
+        (updateText.parent as? android.view.ViewGroup)?.removeView(updateText); box.addView(updateText)
+        updateCheckButton = design.button(box, "检查更新", true) { checkUpdates(server.text.toString()) }
+        updateDownloadButton = design.button(box, "下载并校验更新") { downloadUpdate() }
+        updateInstallButton = design.button(box, "安装已校验的更新") { if (!busy && ready != null) afterDisconnect { install() } else if (!busy) updateText.text = "请先下载并校验更新" }
+        updateCancelButton = design.button(box, "取消更新操作") { if (busy && updateOperation) { cancelOperation(); updateText.text = "更新操作已取消" } }
+        refreshUpdateActions()
+    } }
+    private fun downloadUpdate() {
+        val update = candidate ?: run { updateText.text = "请先检查是否有可用更新"; return }
+        if (busy) return
+        AlertDialog.Builder(this).setTitle("下载 ${update.version}")
+            .setMessage("安装包 ${update.size / 1024} KiB。下载后会验证版本、完整性与签名，再由系统确认安装。")
+            .setNegativeButton("取消", null).setPositiveButton("下载") { _, _ -> startDownload(update) }.show()
+    }
+    private fun startDownload(update: UpdatePackage) {
+        if (busy || candidate != update) return
+        val host = server.text.toString()
+        work("下载与校验", true) {
+            require(Api.validServer(host) == update.server)
+            val client = ClientUpdates(this, PhysicalNetwork.choose(getSystemService(ConnectivityManager::class.java)) ?: error("没有网络")); updater = client
+            var lastPercent = -1
+            val file = client.download(update) { done, total -> val percent = (done * 100 / total).toInt(); if (percent != lastPercent) { lastPercent = percent; ui { updateText.text = if (percent == 100) "下载完成，正在校验完整性与签名…" else "下载中 $percent%" } } }
+            ui { ready = file; updateText.text = "${update.version} 校验通过，可交给系统安装。安装前将断开 VPN。" }
+        }
+    }
+    override fun onSaveInstanceState(outState: Bundle) { outState.putInt("selectedTab", visiblePage); super.onSaveInstanceState(outState) }
     private fun checkUpdates(host: String) {
         work("更新检查", allowConnected = true) {
             val client = ClientUpdates(this, PhysicalNetwork.choose(getSystemService(ConnectivityManager::class.java)) ?: throw LocalFailure("没有可用网络")); updater = client
@@ -157,15 +325,32 @@ class MainActivity : Activity() {
         }
     }
     private fun reloadAccount(): Boolean {
-        if (TunnelService.running) return false
-        try { api = Api(Vault(this)) } catch (_: Exception) { state.text = "安全凭据不可读取"; return false }
-        val saved = api.saved(); connectedServer = saved.optString("server"); account.text = if (saved.has("refresh")) "已登录：${saved.optString("username")}" else "请先登录"
-        return true
+        if (!TunnelService.running) try { api = Api(Vault(this)) } catch (_: Exception) { state.text = "安全凭据不可读取"; return false }
+        val saved = api.saved(); connectedServer = saved.optString("server")
+        val authenticated = saved.has("refresh")
+        val identity = saved.optString("username") + "|" + connectedServer
+        if (authenticated != sessionVisible || identity != sessionIdentity) {
+            if (authenticated) { server.setText(connectedServer); username.setText(saved.optString("username")); if (sessionInitialized && !sessionVisible) selectTab(0) }
+            if (sessionInitialized && (identity != sessionIdentity || !authenticated)) { candidate = null; ready = null }
+            if (sessionVisible && !authenticated && TunnelService.status.startsWith("连接停止")) state.text = TunnelService.status
+            sessionVisible = authenticated; sessionIdentity = identity
+            account.text = saved.optString("username").ifBlank { "工作账号" }
+            workspace.text = connectedServer.ifBlank { "工作网络" }
+        }
+        sessionInitialized = true
+        pages.visibility = if (authenticated) android.view.View.VISIBLE else android.view.View.GONE
+        navigation.visibility = pages.visibility
+        loginPage.visibility = if (authenticated) android.view.View.GONE else android.view.View.VISIBLE
+        return !TunnelService.running
     }
     private fun work(stage: String, allowConnected: Boolean = false, action: (Api) -> Unit) {
         if (busy || (!allowConnected && TunnelService.running)) return
         if (!allowConnected && !reloadAccount()) return
-        busy = true; val ticket = gate.begin(); state.text = "$stage…"; Diagnostics.event("$stage 开始")
+        busy = true
+        updateOperation = stage in setOf("更新检查", "下载与校验", "安装前校验")
+        if (updateOperation) updateText.text = "$stage…"
+        refreshUpdateActions()
+        val ticket = gate.begin(); state.text = "$stage…"; Diagnostics.event("$stage 开始")
         val client = api
         operationApi = client
         operation = executor.submit {
@@ -173,10 +358,10 @@ class MainActivity : Activity() {
             var success = false
             try { client.network = PhysicalNetwork.choose(getSystemService(ConnectivityManager::class.java)); action(client); success = true; ui { if (gate.accepts(ticket)) { state.text = "$stage 完成"; Diagnostics.event("$stage 完成") } } }
             catch (e: Exception) { ui { if (gate.accepts(ticket)) { state.text = "$stage：${Diagnostics.error(e)}"; updateText.text = state.text; Diagnostics.event("$stage 失败：${e.javaClass.simpleName} ${Diagnostics.logError(e)}") } } }
-            finally { ui { if (gate.accepts(ticket)) { busy = false; operationApi = null; updater = null; if (success && (stage == "密码登录" || stage == "飞书登录")) { reloadAccount(); val saved = api.saved(); if (!saved.optBoolean("mustChange")) checkUpdates(saved.getString("server")) } } }; taskEpoch.remove() }
+            finally { ui { if (gate.accepts(ticket)) { busy = false; updateOperation = false; refreshUpdateActions(); operationApi = null; updater = null; if (success && (stage == "密码登录" || stage == "飞书登录")) { reloadAccount(); val saved = api.saved(); if (!saved.optBoolean("mustChange")) checkUpdates(saved.getString("server")) } } }; taskEpoch.remove() }
         }
     }
-    private fun cancelOperation() { gate.cancel(); operationApi?.cancel(); updater?.cancel(); operation?.cancel(true); busy = false; pendingInstall = false; actionAfterStop = null; state.text = "操作已取消"; Diagnostics.event("用户取消操作") }
+    private fun cancelOperation() { if (updateOperation) updateText.text = "更新操作已取消，可重新检查或继续安装已校验的更新"; gate.cancel(); operationApi?.cancel(); updater?.cancel(); operation?.cancel(true); busy = false; updateOperation = false; refreshUpdateActions(); pendingInstall = false; actionAfterStop = null; state.text = "操作已取消"; Diagnostics.event("用户取消操作") }
     private fun stopTunnel() { startService(Intent(this, TunnelService::class.java).setAction(TunnelService.STOP)) }
     private fun afterDisconnect(action: () -> Unit) {
         if (!TunnelService.running) { action(); return }
@@ -196,13 +381,13 @@ class MainActivity : Activity() {
             updater = verifier
             verifier.verifyPackage(file, update)
             ui { if (!TunnelService.running) {
-                try { startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse("content://$packageName.updates/${file.name}"), "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)); Diagnostics.event("已交给系统安装器") }
-                catch (_: Exception) { state.text = "无法打开系统安装器" }
+                try { startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse("content://$packageName.updates/${file.name}"), "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)); Diagnostics.event("已交给系统安装器"); updateText.text = "校验通过，已交给系统安装器。若取消安装，可再次点击安装。" }
+                catch (_: Exception) { state.text = "无法打开系统安装器"; updateText.text = state.text }
             } }
         }
     }
     private fun passwordDialog() {
-        val fields = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 12, 40, 12) }
+        val fields = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(design.dp(24), design.dp(12), design.dp(24), design.dp(12)) }
         fun field(hint: String) = EditText(this).apply { this.hint = hint; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD; isSaveEnabled = false; fields.addView(this) }
         val old = field("当前密码"); val new = field("新密码"); val confirm = field("确认新密码")
         val dialog = AlertDialog.Builder(this).setTitle("修改密码").setView(fields).setNegativeButton("取消", null).setPositiveButton("保存", null).create()
@@ -211,7 +396,7 @@ class MainActivity : Activity() {
             if (new.text.toString() != confirm.text.toString() || new.text.isEmpty()) { confirm.error = "两次新密码须一致且不能为空"; return@setOnClickListener }
             if (!validPassword(new.text.toString())) { new.error = "新密码至少8位，包含字母和数字"; return@setOnClickListener }
             val oldSecret = old.text.toString(); val newSecret = new.text.toString(); old.text.clear(); new.text.clear(); confirm.text.clear(); dialog.dismiss()
-            work("修改密码") { client -> client.changePassword(oldSecret, newSecret); ui { account.text = "密码已修改，请重新登录" } }
+            work("修改密码") { client -> client.changePassword(oldSecret, newSecret); ui { reloadAccount(); state.text = "密码已修改，请重新登录" } }
         } }; dialog.show()
     }
     companion object { fun validPassword(value: String) = value.length >= 8 && value.any { it.isLetter() } && value.any { it.isDigit() } }
@@ -223,5 +408,5 @@ class MainActivity : Activity() {
     @Deprecated("Legacy activity result supports API 26")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) { super.onActivityResult(requestCode, resultCode, data); if (requestCode == 10) { val ticket = vpnPermissionTicket; vpnPermissionTicket = null; if (resultCode == RESULT_OK && ticket != null && gate.accepts(ticket) && !busy && reloadAccount() && api.saved().has("refresh")) connect() else state.text = "VPN 授权取消或账号状态已变更，请重新连接" } }
     override fun onResume() { super.onResume(); if (::api.isInitialized && !busy && !TunnelService.running) reloadAccount(); if (pendingInstall) { pendingInstall = false; if (packageManager.canRequestPackageInstalls()) afterDisconnect { install() } else state.text = "未授予安装权限，当前应用可继续使用" } }
-    override fun onDestroy() { destroyed = true; handler.removeCallbacksAndMessages(null); if (::api.isInitialized) cancelOperation(); executor.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() { destroyed = true; sheetDialog?.dismiss(); handler.removeCallbacksAndMessages(null); if (::api.isInitialized) cancelOperation(); executor.shutdownNow(); super.onDestroy() }
 }

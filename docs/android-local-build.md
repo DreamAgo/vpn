@@ -1,6 +1,6 @@
 # Android 本地构建环境
 
-本机为 Apple Silicon macOS。以下工具已于 2026-09-16 安装；Android 客户端工程仍待实现。
+本机为 Apple Silicon macOS。以下工具已于 2026-09-16 安装；Android 客户端工程已实现，功能与验证记录见 [mobile.md](mobile.md)。
 
 | 工具 | 版本 / 位置 |
 | --- | --- |
@@ -26,17 +26,17 @@ gradle --version
 rustup target list --toolchain 1.90 --installed
 ```
 
-Rust 原生库构建示例（在未来原生库工程目录运行）：
+Rust 原生库由 `mobile/scripts/build-native.sh` 构建。也可在项目根目录执行：
 
 ```sh
 cargo +1.90 ndk \
   -t arm64-v8a -t armeabi-v7a -t x86_64 \
-  --platform 26 -o ./jniLibs build --release
+  --platform 26 -o target/mobile-jni build --locked -p vpn-mobile --release
 ```
 
-后续 Android 工程应提交 Gradle Wrapper、固定 Android Gradle Plugin 和 NDK 版本，
-使用 `./gradlew assembleDebug` 构建，不依赖开发者随意升级全局 Gradle。
-SDK 编译版本不等于最低系统版本；客户端计划最低支持 Android API 26。
+Android 工程已提交 Gradle Wrapper 并固定 Android Gradle Plugin 和 NDK 版本，
+使用 `mobile/android/gradlew -p mobile/android assembleDebug` 构建。
+SDK 编译版本不等于最低系统版本；客户端最低支持 Android API 26。
 
 本机安装的是命令行构建环境，未安装 Android Studio、模拟器及系统镜像。
 APK 打包成功也不能替代 VPN 真机验证：需要单独检查授权内网通信、DNS、锁屏、

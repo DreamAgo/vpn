@@ -29,7 +29,7 @@ object Diagnostics {
         is LocalFailure -> error.message ?: "操作失败"
         is ApiError -> when (error.code) {
             6001 -> "参数校验失败（6001）：${serverReason(error.message)}"
-            2002 -> "服务端拒绝连接，请检查权限或在更新页升级客户端"
+            2002 -> "服务端拒绝连接，请检查权限或在「我的 → 应用更新」升级客户端"
             1001 -> "账号或密码错误"
             1002, 1004, 1007 -> "登录已失效，请重新登录"
             else -> "服务请求失败（${error.code}）"
