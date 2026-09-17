@@ -39,3 +39,6 @@ Thumbs.db
 
 # 本地 Claude 配置 / skills(不入库)
 .claude/
+
+# Android release signing backup (never commit credentials)
+/.android-signing/

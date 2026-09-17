@@ -80,7 +80,7 @@ Android 原生界面按已确认的蓝色手机 Demo 实现，主色 `#2563EB`�
 
 Android 从配置服务器的 `/updates/latest.json` 读取 `downloads`，选择唯一的 `vpn-android-universal-0.1.34.apk`（示例版本，无 `v` 前缀）。下载 URL 必须是同一 HTTPS 源的 `/updates/releases/<UUID>/<标准文件名>`，不接受重定向、用户信息、查询或片段。大小上限 256 MiB，完整检查大小、SHA-256、应用包名、版本名称/递增版本号及当前 APK 签名集合。
 
-服务端镜像将 GitHub 正式发布中可选的标准 APK 纳入本地 `downloads`，校验 GitHub SHA-256 后才发布清单；不改变 Tauri `platforms` 或现有桌面 `.sig` 校验。没有 APK 的旧发布继续支持桌面，Android 明示不可用；AAB 不镜像也不直接安装。将正式签名 APK 附加 GitHub Release 属于单独发布操作，本次未执行。
+服务端镜像将 GitHub 正式发布中可选的标准 APK 纳入本地 `downloads`，校验 GitHub SHA-256 后才发布清单；不改变 Tauri `platforms` 或现有桌面 `.sig` 校验。没有 APK 的旧发布继续支持桌面，Android 明示不可用；AAB 不镜像也不直接安装。正式 Release 工作流调用 Android 构建，将签名 APK/AAB 与桌面安装包一起发布；客户端镜像仅同步 APK。
 
 每次下载使用独立的临时文件和已验证 APK 文件，页面重建后的清理不会影响另一下载。安装通过仅授权读取单个已验证 APK 的私有内容提供器交给系统安装器；首次需要系统“允许此来源安装应用”权限，拒绝后仍可使用原应用。当前采用签名集合严格相等，不接受签名轮换；调试签名与正式签名不同，不能直接覆盖升级。实际发布须持续使用同一生产签名。安装前会重新校验文件与当前服务器，取消安装不会注销账号。
 
@@ -97,7 +97,7 @@ Android 从配置服务器的 `/updates/latest.json` 读取 `downloads`，选择
 | `ANDROID_KEY_ALIAS` | 签名 key alias |
 | `ANDROID_KEY_PASSWORD` | 签名 key 密码 |
 
-本机发布可设置 `ANDROID_KEYSTORE_PATH`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 后执行 `./gradlew assembleRelease bundleRelease`。签名构建产物标准名为 `vpn-android-universal-<version>.apk` / `.aab`，供后续审核发布。工作流不发布 GitHub Release 或商店；生产密钥不提交版本控制。
+本机发布可设置 `ANDROID_KEYSTORE_PATH`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 后执行 `./gradlew assembleRelease bundleRelease`。签名构建产物标准名为 `vpn-android-universal-<version>.apk` / `.aab`，供后续审核发布。Release 工作流会在版本标签发布时构建并上传 APK/AAB；手动 Android 工作流只产生 Actions 工件，不发布商店。生产密钥通过四个 ANDROID_* GitHub Secrets 注入，失败时不发布未签名包；密钥不提交版本控制。
 
 ## 验证记录（2026-09-16）
 
@@ -141,3 +141,5 @@ VPN 前台通知使用易链盾牌 Y 的单色图标，系统自带的 VPN 钥�
 沿用服务端 HTTPS 回调、随机 state 校验和客户端一次性 poll token，不在 APK 内引入 app secret，也不接收含凭据的自定义 scheme。Android 发起授权时携带 `client=android`，服务端将返回目标绑定到一次性授权流程。验证成功的回调页自动打开固定的 `yilian://auth/feishu-return`，Android 使用 singleTask 恢复原 Activity 和仍在运行的轮询；该链接不携带也不提交任何凭据。自动打开被拦截时可点“返回易链”。页面在返回后尝试调用飞书 closeWindow 或浏览器 window.close；宿主拒绝关闭时保留手动关闭提示。桌面端不唤起 Android。必须同步部署新版服务端和 APK；飞书 HTTPS 回调白名单无需变更。若进程已被系统回收，原轮询不再存在，需重新登录。飞书 SDK 已进入下线阶段，因此未引入旧 SDK。飞书端若未登录或需要切换租户，请先在飞书中完成后重新发起授权。
 
 新增主机测试覆盖 AppLink 参数编码不失真、优先飞书、浏览器兜底、无处理应用与不可信地址拒绝。`node mobile/scripts/test-feishu-callback.cjs` 验证自动回跳、未跳转时不关闭页面、失败页、桌面关闭、飞书关闭与地址清理。Rust 测试验证 Android 返回标记绑定到一次性流程，回调重放和非法 state 不触发自动返回。实际唤起与授权仍需要安装飞书的真机验证。
+
+下载页位于 `frontend/public/downloads.html`，随服务端前端资源内嵌，通过 `/downloads.html` 访问。它从同源 `/updates/latest.json` 展示 Windows、macOS 和 Android；未同步 APK 时明确显示“暂未提供”。独立 Nginx 下载站也可使用此 HTML，但必须代理同源更新清单和 `/updates/releases/` 安装包路径。
