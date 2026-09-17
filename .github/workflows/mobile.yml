@@ -34,6 +34,9 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
