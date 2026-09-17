@@ -45,6 +45,7 @@ struct StoredFeishuApproval {
     group_control_id: Option<String>,
     expiry_control_id: Option<String>,
     reason_control_id: Option<String>,
+    max_devices_control_id: Option<String>,
     verification_token: Option<String>,
     encrypt_key: Option<String>,
 }
@@ -292,6 +293,7 @@ impl StoredIntegrationSettings {
                 group_control_id: clean(approval.group_control_id.clone()),
                 expiry_control_id: clean(approval.expiry_control_id.clone()),
                 reason_control_id: clean(approval.reason_control_id.clone()),
+                max_devices_control_id: clean(approval.max_devices_control_id.clone()),
                 verification_token: clean(approval.verification_token.clone()),
                 encrypt_key: clean(approval.encrypt_key.clone()),
             },
@@ -330,6 +332,10 @@ impl StoredIntegrationSettings {
             (
                 "原因控件 ID",
                 self.feishu_approval.reason_control_id.as_deref(),
+            ),
+            (
+                "终端上限控件 ID",
+                self.feishu_approval.max_devices_control_id.as_deref(),
             ),
             (
                 "Verification Token",
@@ -423,6 +429,7 @@ impl StoredIntegrationSettings {
                 group_control_id: clean(request.feishu_approval.group_control_id),
                 expiry_control_id: clean(request.feishu_approval.expiry_control_id),
                 reason_control_id: clean(request.feishu_approval.reason_control_id),
+                max_devices_control_id: clean(request.feishu_approval.max_devices_control_id),
                 verification_token: apply_secret(
                     self.feishu_approval.verification_token,
                     request.feishu_approval.verification_token,
@@ -466,6 +473,7 @@ impl StoredIntegrationSettings {
                 group_control_id: self.feishu_approval.group_control_id.clone(),
                 expiry_control_id: self.feishu_approval.expiry_control_id.clone(),
                 reason_control_id: self.feishu_approval.reason_control_id.clone(),
+                max_devices_control_id: self.feishu_approval.max_devices_control_id.clone(),
                 verification_token: self.feishu_approval.verification_token.clone(),
                 encrypt_key: self.feishu_approval.encrypt_key.clone(),
             }
@@ -497,6 +505,7 @@ impl StoredIntegrationSettings {
                 group_control_id: self.feishu_approval.group_control_id.clone(),
                 expiry_control_id: self.feishu_approval.expiry_control_id.clone(),
                 reason_control_id: self.feishu_approval.reason_control_id.clone(),
+                max_devices_control_id: self.feishu_approval.max_devices_control_id.clone(),
                 verification_token_set: self.feishu_approval.verification_token.is_some(),
                 encrypt_key_set: self.feishu_approval.encrypt_key.is_some(),
             },
@@ -644,6 +653,7 @@ mod tests {
                 group_control_id: None,
                 expiry_control_id: None,
                 reason_control_id: None,
+                max_devices_control_id: None,
                 verification_token: SecretUpdate::default(),
                 encrypt_key: SecretUpdate::default(),
             },
@@ -661,6 +671,7 @@ mod tests {
             group_control_id: Some("group".into()),
             expiry_control_id: Some("expiry".into()),
             reason_control_id: Some("reason".into()),
+            max_devices_control_id: None,
             verification_token: SecretUpdate {
                 value: Some("1234567890123456".into()),
                 clear: false,
@@ -683,6 +694,41 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn optional_device_control_survives_save_restart_and_clear() {
+        let old = serde_json::json!({
+            "enabled": false, "approval_code": null, "group_control_id": null,
+            "expiry_control_id": null, "reason_control_id": null,
+            "verification_token": null, "encrypt_key": null
+        });
+        let stored: StoredFeishuApproval = serde_json::from_value(old).unwrap();
+        assert!(stored.max_devices_control_id.is_none());
+        let (service, _) = setup().await;
+        let mut request = approval_request();
+        request.feishu_approval.max_devices_control_id = Some(" devices ".into());
+        let view = service.update(request, "kernel").await.unwrap();
+        assert!(view.restart_required);
+        assert_eq!(
+            view.desired
+                .feishu_approval
+                .max_devices_control_id
+                .as_deref(),
+            Some("devices")
+        );
+        let service = restart(&service).await;
+        assert_eq!(
+            service
+                .applied_runtime()
+                .1
+                .max_devices_control_id
+                .as_deref(),
+            Some("devices")
+        );
+        service.update(approval_request(), "kernel").await.unwrap();
+        let service = restart(&service).await;
+        assert!(service.applied_runtime().1.max_devices_control_id.is_none());
     }
 
     #[tokio::test]
@@ -826,6 +872,7 @@ mod tests {
                 group_control_id: Some("group".into()),
                 expiry_control_id: Some("expiry".into()),
                 reason_control_id: Some("reason".into()),
+                max_devices_control_id: None,
                 verification_token: Some("1234567890123456".into()),
                 encrypt_key: Some("abcdefghijklmnop".into()),
             },

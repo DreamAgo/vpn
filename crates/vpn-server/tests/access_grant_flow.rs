@@ -30,6 +30,7 @@ fn grant<'a>(
     user_id: &'a str,
 ) -> ApprovedGrant<'a> {
     ApprovedGrant {
+        max_devices: None,
         instance_code,
         group_ids: vec![group_id.to_string()],
         expires_at,

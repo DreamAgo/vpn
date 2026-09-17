@@ -1,6 +1,6 @@
 # 配置参考
 
-`vpn-server` 的启动基础设施通过环境变量注入；数据面和飞书集成参数只在对应聚合配置尚不存在时读取环境变量，随后存入数据库并通过管理后台修改。下表共 44 项：`ServerConfig` 读取的 43 项，以及 tracing 直接读取的 `RUST_LOG`。
+`vpn-server` 的启动基础设施通过环境变量注入；数据面和飞书集成参数只在对应聚合配置尚不存在时读取环境变量，随后存入数据库并通过管理后台修改。下表共 45 项：`ServerConfig` 读取的 44 项，以及 tracing 直接读取的 `RUST_LOG`。
 
 ## 服务端环境变量
 
@@ -49,9 +49,12 @@
 | `VPN_FEISHU_APPROVAL_REASON_CONTROL_ID` | （无） | “申请事由”控件的稳定 ID。 |
 | `VPN_FEISHU_APPROVAL_VERIFICATION_TOKEN` | （无） | 飞书事件订阅 Verification Token（敏感值）。 |
 | `VPN_FEISHU_APPROVAL_ENCRYPT_KEY` | （无） | 飞书事件订阅 Encrypt Key（敏感值）；服务端只接受验签成功的加密事件。 |
+| `VPN_FEISHU_APPROVAL_MAX_DEVICES_CONTROL_ID` | （无） | 可选的“终端上限”数字控件稳定 ID；填写 1–100 的整数，审批通过后覆盖申请人的终端上限。未配置时保留原值，新用户默认 1。 |
 | `RUST_LOG` | `info` | 日志级别（tracing EnvFilter 语法），如 `vpn_server=debug,info`。 |
 
-> `RUST_LOG` 由 tracing 运行库读取，不计入上述 `ServerConfig` 的 43 项；它和监听、数据库、数据目录、审计保留期及系统密钥继续属于部署层配置。
+> `RUST_LOG` 由 tracing 运行库读取，不计入上述 `ServerConfig` 的 44 项；它和监听、数据库、数据目录、审计保留期及系统密钥继续属于部署层配置。
+
+审批终端上限也可在管理后台「集成设置 → 飞书审批 → 终端上限控件 ID」配置，保存并重启服务端后生效。配置后，审批表单必须包含该控件及有效值；缺失、重复控件或非法值会拒绝整单授权。上限与网络授权在同一事务提交，每个审批实例仅首次应用时更新上限；重复回调不会覆盖后续审批或管理员修改。调低不会注销已注册终端，仅限制后续新终端注册。上限不会随网络授权到期自动恢复；不同审批实例按首次成功处理的顺序更新。
 
 ## 启动校验
 

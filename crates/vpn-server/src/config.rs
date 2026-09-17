@@ -167,6 +167,7 @@ pub struct FeishuApprovalConfig {
     pub group_control_id: Option<String>,
     pub expiry_control_id: Option<String>,
     pub reason_control_id: Option<String>,
+    pub max_devices_control_id: Option<String>,
     pub verification_token: Option<String>,
     pub encrypt_key: Option<String>,
 }
@@ -350,6 +351,9 @@ impl ServerConfig {
             ),
             reason_control_id: optional_non_blank(
                 env::var("VPN_FEISHU_APPROVAL_REASON_CONTROL_ID").ok(),
+            ),
+            max_devices_control_id: optional_non_blank(
+                env::var("VPN_FEISHU_APPROVAL_MAX_DEVICES_CONTROL_ID").ok(),
             ),
             verification_token: optional_non_blank(
                 env::var("VPN_FEISHU_APPROVAL_VERIFICATION_TOKEN").ok(),

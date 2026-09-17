@@ -35,6 +35,7 @@ pub struct ApprovedGrant<'a> {
     pub group_ids: Vec<String>,
     pub expires_at: i64,
     pub reason: &'a str,
+    pub max_devices: Option<i64>,
     pub identity: ApprovalIdentity<'a>,
 }
 
@@ -217,6 +218,14 @@ impl SqliteAccessGrantRepository {
 
     /// 同一事务完成身份绑定/建号/逐审批授权；既有账号保持 legacy，授权不碰人工组。
     pub async fn apply_approved(&self, grant: ApprovedGrant<'_>) -> Result<String> {
+        if grant
+            .max_devices
+            .is_some_and(|count| !(1..=100).contains(&count))
+        {
+            return Err(AppError::Validation(
+                "审批终端上限必须是 1–100 的整数".into(),
+            ));
+        }
         let mut tx = self.pool.begin().await.map_err(db)?;
         let group_ids: std::collections::BTreeSet<&str> =
             grant.group_ids.iter().map(String::as_str).collect();
@@ -338,6 +347,15 @@ impl SqliteAccessGrantRepository {
         // Queue only a newly applied instance, in the same transaction as its grants.
         // Replayed callbacks and mail retries cannot create another notification.
         if prior.is_empty() {
+            if let Some(max_devices) = grant.max_devices {
+                sqlx::query("UPDATE users SET max_devices=?2,updated_at=?3 WHERE id=?1")
+                    .bind(&user_id)
+                    .bind(max_devices)
+                    .bind(Utc::now().timestamp_millis())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+            }
             let groups: Vec<String> = sqlx::query_scalar("SELECT g.name FROM access_grants a JOIN user_groups g ON g.id=a.group_id WHERE a.approval_instance_code=?1 ORDER BY g.name")
                 .bind(grant.instance_code).fetch_all(&mut *tx).await.map_err(db)?;
             let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id=?1")
@@ -418,6 +436,7 @@ mod tests {
 
     fn grant<'a>(instance: &'a str, expires_at: i64) -> ApprovedGrant<'a> {
         ApprovedGrant {
+            max_devices: None,
             instance_code: instance,
             group_ids: vec!["g1".into()],
             expires_at,
@@ -431,6 +450,40 @@ mod tests {
                 password_hash: "hash",
             },
         }
+    }
+
+    #[tokio::test]
+    async fn approval_updates_device_limit_once_and_rolls_back_invalid_grants() {
+        let pool = setup().await;
+        let repo = SqliteAccessGrantRepository::new(pool.clone());
+        sqlx::query(
+            "INSERT INTO user_groups(id,name,created_at,updated_at) VALUES('g1','group',0,0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut first = grant("devices-1", 20_000);
+        first.max_devices = Some(5);
+        repo.apply_approved(first.clone()).await.unwrap();
+        let limit =
+            || sqlx::query_scalar::<_, i64>("SELECT max_devices FROM users WHERE id='u-new'");
+        assert_eq!(limit().fetch_one(&pool).await.unwrap(), 5);
+        let mut second = grant("devices-2", 20_000);
+        second.max_devices = Some(2);
+        repo.apply_approved(second).await.unwrap();
+        repo.apply_approved(first).await.unwrap();
+        assert_eq!(limit().fetch_one(&pool).await.unwrap(), 2);
+        repo.apply_approved(grant("devices-3", 20_000))
+            .await
+            .unwrap();
+        assert_eq!(limit().fetch_one(&pool).await.unwrap(), 2);
+        let mut invalid = grant("devices-invalid", 20_000);
+        invalid.max_devices = Some(101);
+        assert!(repo.apply_approved(invalid.clone()).await.is_err());
+        invalid.max_devices = Some(10);
+        invalid.group_ids = vec!["missing".into()];
+        assert!(repo.apply_approved(invalid).await.is_err());
+        assert_eq!(limit().fetch_one(&pool).await.unwrap(), 2);
     }
 
     #[tokio::test]

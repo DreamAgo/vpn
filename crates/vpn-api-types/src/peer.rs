@@ -214,6 +214,12 @@ pub struct UpdatePeerRoutesRequest {
     pub routed_subnets: Vec<String>,
 }
 
+/// 保存站点网关后的非阻断提示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePeerRoutesResponse {
+    pub warnings: Vec<String>,
+}
+
 /// admin peer 列表查询参数（GET /admin/peers）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminPeerQuery {

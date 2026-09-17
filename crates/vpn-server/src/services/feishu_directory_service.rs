@@ -514,7 +514,16 @@ pub struct DirectoryStateRow {
     pub last_event_at: i64,
 }
 pub async fn bindings(pool: &SqlitePool, user_id: &str) -> Result<Vec<FeishuBindingDto>> {
-    let rows:Vec<(String,String,String,String,bool,Option<i64>,Option<String>)>=sqlx::query_as("SELECT e.subject,COALESCE(f.name,''),COALESCE(f.email,''),COALESCE(f.status,'unknown'),COALESCE(f.blocked,0),f.synced_at,f.last_error FROM external_identities e LEFT JOIN feishu_user_states f ON e.subject=f.subject WHERE e.provider='feishu' AND e.user_id=?1 ORDER BY e.subject")
+    type BindingRow = (
+        String,
+        String,
+        String,
+        String,
+        bool,
+        Option<i64>,
+        Option<String>,
+    );
+    let rows: Vec<BindingRow> = sqlx::query_as("SELECT e.subject,COALESCE(f.name,''),COALESCE(f.email,''),COALESCE(f.status,'unknown'),COALESCE(f.blocked,0),f.synced_at,f.last_error FROM external_identities e LEFT JOIN feishu_user_states f ON e.subject=f.subject WHERE e.provider='feishu' AND e.user_id=?1 ORDER BY e.subject")
         .bind(user_id).fetch_all(pool).await.map_err(db)?;
     Ok(rows
         .into_iter()

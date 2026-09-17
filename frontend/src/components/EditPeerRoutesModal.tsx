@@ -27,7 +27,7 @@ interface FormValues {
 }
 
 export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
-  const { message } = App.useApp();
+  const { message, notification } = App.useApp();
   const [form] = Form.useForm<FormValues>();
   const watched = Form.useWatch('routedSubnets', form);
   const submitDisabled = (watched ?? []).some((s) => !isValidCidr(s));
@@ -38,7 +38,14 @@ export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
         peer.id,
         values.routedSubnets.map((s) => s.trim()).filter((s) => s.length > 0)
       ),
-    onSuccess: () => {
+    onSuccess: (warnings) => {
+      if (warnings.length > 0) {
+        notification.warning({
+          message: '已保存，存在网段重叠',
+          description: warnings.map((warning) => <div key={warning}>{warning}</div>),
+          duration: 0,
+        });
+      }
       message.success('站点网关设置已保存');
       onSaved();
       onClose();
@@ -83,6 +90,13 @@ export function EditPeerRoutesModal({ open, onClose, peer, onSaved }: Props) {
         style={{ marginBottom: 16 }}
         message="指定该节点可转发的站点网段"
         description="填写网段后，该节点会作为这些 LAN 网段的站点网关；其他节点将通过安全链路访问这些网段。网关主机仍需在本机开启 IP 转发，并按现场网络配置路由或 NAT。"
+      />
+      <Alert
+        type="warning"
+        showIcon
+        style={{ marginBottom: 16 }}
+        message="网段重叠仅提示，不阻止保存"
+        description="不同长度的网段按最长前缀匹配，更具体的网段优先；完全相同的网段可能由后配置或重连的节点接管流量。"
       />
       <Form<FormValues>
         form={form}

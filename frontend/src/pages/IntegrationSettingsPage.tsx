@@ -32,6 +32,7 @@ interface FormValues {
   groupControlId?: string;
   expiryControlId?: string;
   reasonControlId?: string;
+  maxDevicesControlId?: string;
   verificationToken?: string;
   clearVerificationToken?: boolean;
   encryptKey?: string;
@@ -57,6 +58,7 @@ function valuesFrom(view: IntegrationSettingsView): FormValues {
     groupControlId: desired.feishuApproval.groupControlId ?? undefined,
     expiryControlId: desired.feishuApproval.expiryControlId ?? undefined,
     reasonControlId: desired.feishuApproval.reasonControlId ?? undefined,
+    maxDevicesControlId: desired.feishuApproval.maxDevicesControlId ?? undefined,
   };
 }
 
@@ -164,6 +166,7 @@ export function IntegrationSettingsPage() {
         groupControlId: clean(values.groupControlId),
         expiryControlId: clean(values.expiryControlId),
         reasonControlId: clean(values.reasonControlId),
+        maxDevicesControlId: clean(values.maxDevicesControlId),
         verificationToken: secret(
           values.verificationToken,
           values.clearVerificationToken
@@ -251,6 +254,7 @@ export function IntegrationSettingsPage() {
           <Form.Item name="groupControlId" label="用户组控件 ID"><Input /></Form.Item>
           <Form.Item name="expiryControlId" label="到期日控件 ID"><Input /></Form.Item>
           <Form.Item name="reasonControlId" label="申请原因控件 ID"><Input /></Form.Item>
+          <Form.Item name="maxDevicesControlId" label="终端上限控件 ID" extra="可选；配置后审批表单须填写 1–100 的整数，审批通过后更新终端上限。留空则保持原有上限。"><Input /></Form.Item>
           <SecretField formName="verificationToken" clearName="clearVerificationToken" label="Verification Token" isSet={desired?.feishuApproval.verificationTokenSet} />
           <SecretField formName="encryptKey" clearName="clearEncryptKey" label="Encrypt Key" isSet={desired?.feishuApproval.encryptKeySet} />
           <Space direction="vertical" style={{ width: '100%' }}>

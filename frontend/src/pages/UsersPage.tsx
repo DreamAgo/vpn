@@ -26,7 +26,8 @@ import relativeTime from 'dayjs/plugin/relativeTime';
 import 'dayjs/locale/zh-cn';
 
 import { GrantExpiryButton } from '@/components/GrantExpiryButton';
-import { FeishuBindingModal, feishuStatusLabels } from '@/components/FeishuBindingModal';
+import { FeishuBindingModal } from '@/components/FeishuBindingModal';
+import { feishuStatusLabels } from '@/services/feishuStatus';
 import { usersApi } from '@/services/users';
 import { groupsApi } from '@/services/groups';
 import { ApiError } from '@/services/http';

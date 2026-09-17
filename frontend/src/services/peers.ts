@@ -27,7 +27,8 @@ export const peersApi = {
     await http.delete(`/admin/peers/${id}/purge`);
   },
 
-  async updatePeerRoutes(id: string, routedSubnets: string[]): Promise<void> {
-    await http.patch(`/admin/peers/${id}`, { routedSubnets });
+  async updatePeerRoutes(id: string, routedSubnets: string[]): Promise<string[]> {
+    const res = await http.patch<{ warnings: string[] } | null>(`/admin/peers/${id}`, { routedSubnets });
+    return res.data?.warnings ?? [];
   },
 };

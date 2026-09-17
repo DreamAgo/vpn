@@ -19,6 +19,7 @@ use vpn_api_types::{
     peer::{
         AdminPeerQuery, AdminPeerView, PeerEventQuery, PeerEventView, PeerHeartbeatRequest,
         PeerHeartbeatResponse, PeerRegisterRequest, PeerRegisterResponse, UpdatePeerRoutesRequest,
+        UpdatePeerRoutesResponse,
     },
     ApiResponse, Page,
 };
@@ -179,11 +180,11 @@ pub async fn update_peer_routes(
     RequireAdmin(_): RequireAdmin,
     Path(id): Path<String>,
     Json(body): Json<UpdatePeerRoutesRequest>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
+) -> Result<Json<ApiResponse<UpdatePeerRoutesResponse>>, ApiError> {
     let svc = state.peer_service()?;
-    svc.update_peer_routes(&id, &body.routed_subnets).await?;
+    let warnings = svc.update_peer_routes(&id, &body.routed_subnets).await?;
     state.refresh_network_acl().await?;
-    Ok(success(&state, ()))
+    Ok(success(&state, UpdatePeerRoutesResponse { warnings }))
 }
 
 /// Story 5.5：DELETE /api/v1/admin/peers/:id（需 admin，强制下线）

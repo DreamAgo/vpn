@@ -16,6 +16,7 @@ export function GrantExpiryButton({ userId, groupId, groupName, expiresAt, onSav
   const [busy, setBusy] = useState(false);
   const [value, setValue] = useState<dayjs.Dayjs | null>(null);
   const [expected, setExpected] = useState(expiresAt);
+  const [comparisonTime, setComparisonTime] = useState(() => Date.now());
   const save = async () => {
     if (!value) return;
     setBusy(true);
@@ -31,6 +32,7 @@ export function GrantExpiryButton({ userId, groupId, groupName, expiresAt, onSav
   };
   return <>
     <Button type="link" size="small" onClick={() => {
+      setComparisonTime(Date.now());
       setExpected(expiresAt);
       setValue(dayjs.utc(dayjs(expiresAt).tz('Asia/Shanghai').format('YYYY-MM-DD HH:mm:ss')));
       setOpen(true);
@@ -42,8 +44,8 @@ export function GrantExpiryButton({ userId, groupId, groupName, expiresAt, onSav
       <Space direction="vertical" style={{ width: '100%' }}>
         <Alert type="info" showIcon message="上海时间（UTC+8），到达此时刻即失效。此组的已有审批授权会一起更新；其他组及手工分组不变。后续新审批仍按审批期限生效。" />
         <DatePicker aria-label="授权到期时间（上海）" showTime format="YYYY-MM-DD HH:mm:ss"
-          value={value} onChange={setValue} disabled={busy} style={{ width: '100%' }} />
-        {value && dayjs.tz(value.format('YYYY-MM-DD HH:mm:ss'), 'Asia/Shanghai').valueOf() <= Date.now()
+          value={value} onChange={(next) => { setValue(next); setComparisonTime(Date.now()); }} disabled={busy} style={{ width: '100%' }} />
+        {value && dayjs.tz(value.format('YYYY-MM-DD HH:mm:ss'), 'Asia/Shanghai').valueOf() <= comparisonTime
           && <Alert type="warning" showIcon message="所选时间已过去，保存后该组审批授权立即失效。" />}
       </Space>
     </Modal>

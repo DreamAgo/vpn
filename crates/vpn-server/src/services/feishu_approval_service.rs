@@ -436,6 +436,7 @@ impl FeishuApprovalService {
                 .reason_control_id
                 .as_deref()
                 .ok_or_else(disabled)?,
+            self.config.max_devices_control_id.as_deref(),
         )?;
         if fields.expires_at <= Utc::now().timestamp_millis() {
             return Err(AppError::Validation(
@@ -462,6 +463,7 @@ impl FeishuApprovalService {
                 group_ids: fields.group_ids,
                 expires_at: fields.expires_at,
                 reason: &fields.reason,
+                max_devices: fields.max_devices,
                 identity: ApprovalIdentity {
                     subject: &applicant.union_id,
                     email: &applicant.email,
@@ -483,6 +485,7 @@ struct FormFields {
     group_ids: Vec<String>,
     expires_at: i64,
     reason: String,
+    max_devices: Option<i64>,
 }
 
 fn parse_form(
@@ -490,6 +493,7 @@ fn parse_form(
     group_id: &str,
     expiry_id: &str,
     reason_id: &str,
+    max_devices_id: Option<&str>,
 ) -> Result<FormFields> {
     let form = if let Some(serialized) = value.as_str() {
         serde_json::from_str::<Value>(serialized)
@@ -509,7 +513,26 @@ fn parse_form(
         group_ids: group_option_ids(group)?,
         expires_at: exclusive_expiry(widget_value(expiry)?)?,
         reason: scalar_text(widget_value(reason)?)?,
+        max_devices: max_devices_id
+            .map(|id| parse_max_devices(widget_value(unique_widget(widgets, id)?)?))
+            .transpose()?,
     })
+}
+
+fn parse_max_devices(value: &Value) -> Result<i64> {
+    let count = value.as_i64().or_else(|| {
+        value.as_str().and_then(|text| {
+            let text = text.trim();
+            if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
+                text.parse::<i64>().ok()
+            } else {
+                None
+            }
+        })
+    });
+    count
+        .filter(|count| (1..=100).contains(count))
+        .ok_or_else(|| AppError::Validation("审批终端上限必须是 1–100 的整数".into()))
 }
 
 fn unique_widget<'a>(widgets: &'a [Value], control_id: &str) -> Result<&'a Value> {
@@ -950,6 +973,51 @@ mod tests {
     }
 
     #[test]
+    fn terminal_limit_is_optional_but_strict_when_configured() {
+        for value in [json!(1), json!(100), json!(" 3 ")] {
+            assert!(parse_max_devices(&value).is_ok());
+        }
+        for value in [
+            json!(0),
+            json!(101),
+            json!(-1),
+            json!(1.5),
+            json!("2.5"),
+            json!(""),
+            json!(null),
+            json!(true),
+            json!({"value": 2}),
+        ] {
+            assert!(parse_max_devices(&value).is_err(), "accepted {value}");
+        }
+        let mut form = json!([
+            {"id":"group", "value":["g1"]},
+            {"id":"expiry", "value":"2027-01-01"},
+            {"id":"reason", "value":"access"}
+        ]);
+        assert_eq!(
+            parse_form(&form, "group", "expiry", "reason", None)
+                .unwrap()
+                .max_devices,
+            None
+        );
+        assert!(parse_form(&form, "group", "expiry", "reason", Some("devices")).is_err());
+        form.as_array_mut()
+            .unwrap()
+            .push(json!({"id":"devices", "value":"5"}));
+        assert_eq!(
+            parse_form(&form, "group", "expiry", "reason", Some("devices"))
+                .unwrap()
+                .max_devices,
+            Some(5)
+        );
+        form.as_array_mut()
+            .unwrap()
+            .push(json!({"id":"devices", "value":3}));
+        assert!(parse_form(&form, "group", "expiry", "reason", Some("devices")).is_err());
+    }
+
+    #[test]
     fn form_uses_exact_control_ids_and_multiple_groups() {
         let form = json!([
             {"id":"group-control","value":[{"id":"group-42","text":"中文文案不参与授权"}]},
@@ -961,6 +1029,7 @@ mod tests {
             "group-control",
             "expiry-control",
             "reason-control",
+            None,
         )
         .unwrap();
         assert_eq!(fields.group_ids, ["group-42"]);
@@ -980,7 +1049,8 @@ mod tests {
                 &multiple,
                 "group-control",
                 "expiry-control",
-                "reason-control"
+                "reason-control",
+                None,
             )
             .unwrap()
             .group_ids,
@@ -994,7 +1064,14 @@ mod tests {
         assert!(option_ids(&json!([])).is_err());
         assert!(option_ids(&json!(["g1", ""])).is_err());
         assert!(option_ids(&json!([{"text":"display label only"}])).is_err());
-        assert!(parse_form(&multiple, "网络组", "expiry-control", "reason-control").is_err());
+        assert!(parse_form(
+            &multiple,
+            "网络组",
+            "expiry-control",
+            "reason-control",
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -1006,7 +1083,7 @@ mod tests {
             {"id":"reason","value":"access"}
         ]);
         assert_eq!(
-            parse_form(&form, "group", "expiry", "reason")
+            parse_form(&form, "group", "expiry", "reason", None)
                 .unwrap()
                 .group_ids,
             ["g1", "g2"]
@@ -1097,6 +1174,7 @@ mod tests {
             group_control_id: Some("group".into()),
             expiry_control_id: Some("expiry".into()),
             reason_control_id: Some("reason".into()),
+            max_devices_control_id: None,
             verification_token: Some("verification-token".into()),
             encrypt_key: Some("encrypt-key".into()),
         };

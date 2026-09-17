@@ -426,11 +426,14 @@ impl PeerService {
             Vec::new()
         };
 
-        // 被强制下线的网关可能已由其他 peer 接管相同网段；恢复前必须重新
-        // 做碰撞校验，不能让重注册静默抢回 AllowedIPs。
+        // 重连时保留 VPN 地址保护，并记录其他节点的重叠提示。
         if matched_existing {
-            self.ensure_no_subnet_collision(&routed_subnets, target_id.as_deref(), None)
-                .await?;
+            for warning in self
+                .validate_site_routes(&routed_subnets, target_id.as_deref(), None)
+                .await?
+            {
+                tracing::warn!(peer_id = ?target_id, warning, "站点网段重叠，继续注册");
+            }
         }
 
         let vpn_ip: String = match target {
@@ -683,20 +686,15 @@ impl PeerService {
             .collect())
     }
 
-    /// 校验拟声明的站点网段不与**其他**活跃网关 peer 已声明的网段重叠。
-    ///
-    /// WireGuard 同一接口的 allowed-ips 必须各 peer 互不重叠：若两个网关都声明同一/重叠
-    /// CIDR，`wg set` 会把该前缀从先前 peer 抢到后者，导致前一站点 LAN 静默不可达。
-    /// 此处在注册 / 改路由的写入前主动拒绝重叠，避免无声黑洞。
-    /// `exclude_peer_id` / `exclude_user_id`：排除“自己”（改路由按 peer、重注册按 user）。
-    async fn ensure_no_subnet_collision(
+    /// 保留 VPN 地址保护；其他节点的网段重叠只返回提示，不阻止保存或重连。
+    async fn validate_site_routes(
         &self,
         new_subnets: &[String],
         exclude_peer_id: Option<&str>,
         exclude_user_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         if new_subnets.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let news: Vec<Ipv4Net> = new_subnets.iter().filter_map(|s| s.parse().ok()).collect();
         // 站点网段不得落在 VPN 子网内部或等于 VPN 子网。VPN 子网的超网仍可放行:
@@ -709,6 +707,7 @@ impl PeerService {
                 )));
             }
         }
+        let mut warnings = Vec::new();
         for (pid, uid, csv) in self.peer_repo.list_active_gateway_routes().await? {
             if exclude_peer_id == Some(pid.as_str()) || exclude_user_id == Some(uid.as_str()) {
                 continue;
@@ -717,15 +716,22 @@ impl PeerService {
                 if let Ok(other) = s.parse::<Ipv4Net>() {
                     for n in &news {
                         if Self::nets_overlap(n, &other) {
-                            return Err(AppError::Validation(format!(
-                                "站点网段 {n} 与另一节点已声明的 {other} 冲突，请避免重叠"
-                            )));
+                            let behavior = if n == &other {
+                                "网段完全相同，后配置或重连的节点可能接管流量"
+                            } else {
+                                "按最长前缀匹配转发，更具体的网段优先"
+                            };
+                            warnings.push(format!(
+                                "站点网段 {n} 与节点 {pid} 的 {other} 重叠；{behavior}"
+                            ));
                         }
                     }
                 }
             }
         }
-        Ok(())
+        warnings.sort();
+        warnings.dedup();
+        Ok(warnings)
     }
 
     /// Story 4.6：心跳。无活跃 peer → PeerNotFound。
@@ -1092,7 +1098,11 @@ impl PeerService {
     ///
     /// 校验/归一化 CIDR → 持久化 → 重新下发 WireGuard 配置（更新 allowed-ips 与路由）。
     /// peer 不存在 → PeerNotFound；非法 CIDR → Config。
-    pub async fn update_peer_routes(&self, peer_id: &str, subnets: &[String]) -> Result<()> {
+    pub async fn update_peer_routes(
+        &self,
+        peer_id: &str,
+        subnets: &[String],
+    ) -> Result<Vec<String>> {
         let _route_guard = self.peer_route_lock.lock().await;
         let peer = self
             .peer_repo
@@ -1100,8 +1110,8 @@ impl PeerService {
             .await?
             .ok_or(AppError::PeerNotFound)?;
         let normalized = normalize_subnets(subnets)?;
-        // 不得与其他节点的站点网段重叠（否则 wg allowed-ips 互抢、站点静默不可达）。
-        self.ensure_no_subnet_collision(&normalized, Some(peer_id), None)
+        let warnings = self
+            .validate_site_routes(&normalized, Some(peer_id), None)
             .await?;
         let old_routed: Vec<String> = peer
             .routed_subnets
@@ -1137,7 +1147,7 @@ impl PeerService {
                 }
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Story 5.5：admin peer 列表（JOIN users）。
@@ -2094,7 +2104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_routes_reject_overlapping_site_subnet() {
+    async fn admin_routes_allow_overlapping_site_subnet_with_warning() {
         let svc = service(setup_pool().await);
         svc.register("user-2", &reg_named("PKB", "GW-B"))
             .await
@@ -2118,12 +2128,33 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // 管理员为另一节点配置重叠网段（更大范围覆盖之）→ 拒绝。
-        let err = svc
+        let warnings = svc
             .update_peer_routes(&gateway_c.id, &["192.168.0.0/16".to_string()])
             .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)));
+            .unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("更具体的网段优先"));
+        let saved = svc
+            .peer_repo
+            .find_by_id(&gateway_c.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.routed_subnets, "192.168.0.0/16");
+        svc.register("user-1", &reg_named("PKC2", "GW-C"))
+            .await
+            .unwrap();
+        let warnings = svc
+            .update_peer_routes(&gateway_c.id, &["192.168.20.0/24".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("网段完全相同"));
+        let warnings = svc
+            .update_peer_routes(&gateway_c.id, &["192.168.30.0/24".to_string()])
+            .await
+            .unwrap();
+        assert!(warnings.is_empty());
     }
 
     #[tokio::test]
@@ -2918,7 +2949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_removed_gateway_cannot_reclaim_route_assigned_to_another_peer() {
+    async fn force_removed_gateway_can_reregister_with_overlapping_route() {
         let svc = service(setup_pool().await);
         svc.register("user-1", &reg_named("PK1", "Gateway"))
             .await
@@ -2947,10 +2978,10 @@ mod tests {
             .await
             .unwrap();
 
-        let err = svc
+        let registered = svc
             .register("user-1", &reg_named("PK1b", "Gateway"))
             .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)));
+            .unwrap();
+        assert_eq!(registered.vpn_ip, old_gateway.vpn_ip);
     }
 }
