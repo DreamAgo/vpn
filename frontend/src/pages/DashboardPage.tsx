@@ -15,6 +15,7 @@ import {
 } from 'antd';
 import {
   ApiOutlined,
+  AndroidOutlined,
   BellOutlined,
   ClusterOutlined,
   ExclamationCircleOutlined,
@@ -278,7 +279,10 @@ export function DashboardPage() {
             实时查看用户、节点、站点网关与服务端路由状态。
           </Text>
         </div>
-        <Space>
+        <Space wrap>
+          <Button icon={<AndroidOutlined />} href="/downloads.html#android">
+            Android 下载
+          </Button>
           <Button onClick={() => navigate('/peers')}>节点管理</Button>
           <Button icon={<BellOutlined />} onClick={() => navigate('/notifications')}>
             通知设置
