@@ -280,7 +280,7 @@ export function DashboardPage() {
           </Text>
         </div>
         <Space wrap>
-          <Button icon={<AndroidOutlined />} href="/downloads.html#android">
+          <Button icon={<AndroidOutlined />} href="/updates/downloads.html#android">
             Android 下载
           </Button>
           <Button onClick={() => navigate('/peers')}>节点管理</Button>

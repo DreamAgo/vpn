@@ -260,6 +260,10 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(public_routes)
         .merge(authed_routes)
+        .route(
+            "/updates/downloads.html",
+            get(handlers::static_files::downloads_page),
+        )
         .nest_service("/updates", ServeDir::new(&updates_dir))
         .layer(axum::Extension(update_service))
         .with_state(state)

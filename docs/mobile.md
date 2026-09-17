@@ -142,4 +142,4 @@ VPN 前台通知使用易链盾牌 Y 的单色图标，系统自带的 VPN 钥�
 
 新增主机测试覆盖 AppLink 参数编码不失真、优先飞书、浏览器兜底、无处理应用与不可信地址拒绝。`node mobile/scripts/test-feishu-callback.cjs` 验证自动回跳、未跳转时不关闭页面、失败页、桌面关闭、飞书关闭与地址清理。Rust 测试验证 Android 返回标记绑定到一次性流程，回调重放和非法 state 不触发自动返回。实际唤起与授权仍需要安装飞书的真机验证。
 
-下载页位于 `frontend/public/downloads.html`，随服务端前端资源内嵌，通过 `/downloads.html` 访问。它从同源 `/updates/latest.json` 展示 Windows、macOS 和 Android；未同步 APK 时明确显示“暂未提供”。独立 Nginx 下载站也可使用此 HTML，但必须代理同源更新清单和 `/updates/releases/` 安装包路径。
+下载页位于 `frontend/public/downloads.html`，随服务端前端资源内嵌，通过 `/updates/downloads.html` 访问；该精确路由优先于数据目录中的旧静态文件。它从同源 `/updates/latest.json` 展示 Windows、macOS 和 Android；未同步 APK 时明确显示“暂未提供”。独立 Nginx 下载站也可使用此 HTML，但必须代理同源更新清单和 `/updates/releases/` 安装包路径。
