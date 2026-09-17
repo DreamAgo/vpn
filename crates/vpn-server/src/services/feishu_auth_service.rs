@@ -170,6 +170,7 @@ enum PollState {
 }
 
 struct Flow {
+    return_to_android: bool,
     expires_at: i64,
     state: PollState,
 }
@@ -220,6 +221,14 @@ impl FeishuAuthService {
     }
 
     pub async fn start(&self, client_key: &str) -> Result<FeishuAuthStartResponse> {
+        self.start_for_client(client_key, false).await
+    }
+
+    pub async fn start_for_client(
+        &self,
+        client_key: &str,
+        return_to_android: bool,
+    ) -> Result<FeishuAuthStartResponse> {
         if !self.enabled() {
             return Err(disabled());
         }
@@ -243,6 +252,7 @@ impl FeishuAuthService {
         flows.polls.insert(
             poll_hash,
             Flow {
+                return_to_android,
                 expires_at,
                 state: PollState::Pending,
             },
@@ -295,8 +305,8 @@ impl FeishuAuthService {
         state: &str,
         code: Option<&str>,
         oauth_error: Option<&str>,
-    ) -> Result<()> {
-        let poll_hash = {
+    ) -> Result<bool> {
+        let (poll_hash, return_to_android) = {
             let mut flows = self.flows.lock().await;
             cleanup_flows(&mut flows, Utc::now().timestamp());
             let poll_hash = flows
@@ -306,7 +316,8 @@ impl FeishuAuthService {
             if !flows.polls.contains_key(&poll_hash) {
                 return Err(AppError::Validation("飞书登录已过期".into()));
             }
-            poll_hash
+            let return_to_android = flows.polls[&poll_hash].return_to_android;
+            (poll_hash, return_to_android)
         };
 
         let result = if let Some(error) = oauth_error {
@@ -327,7 +338,7 @@ impl FeishuAuthService {
                 Err(error) => PollState::Rejected(error.to_string()),
             };
         }
-        result.map(|_| ())
+        result.map(|_| return_to_android)
     }
 
     /// pending 可重复查看；完成、失败、过期均原子消费 poll token。
@@ -648,6 +659,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn android_return_is_bound_to_one_time_flow() {
+        let (service, _, _) = setup(FeishuIdentity {
+            subject: "union-mobile".into(),
+            email: "mobile@example.com".into(),
+        })
+        .await;
+        for android in [false, true] {
+            let started = service
+                .start_for_client("127.0.0.1", android)
+                .await
+                .unwrap();
+            let state = state_from_url(&started.authorization_url);
+            assert_eq!(
+                service.callback(&state, Some("code"), None).await.unwrap(),
+                android
+            );
+            assert!(service.callback(&state, Some("code"), None).await.is_err());
+        }
+        assert!(service
+            .callback("unknown", Some("code"), None)
+            .await
+            .is_err());
+        let denied = service.start_for_client("127.0.0.1", true).await.unwrap();
+        assert!(service
+            .callback(
+                &state_from_url(&denied.authorization_url),
+                None,
+                Some("access_denied")
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn flow_creates_user_and_rejects_callback_and_poll_replays() {
         let (service, provider, pool) = setup(FeishuIdentity {
             subject: "union-1".into(),
@@ -854,6 +899,7 @@ mod tests {
         flows.polls.insert(
             "poll".into(),
             Flow {
+                return_to_android: false,
                 expires_at: Utc::now().timestamp() - 1,
                 state: PollState::Verified(FeishuIdentity {
                     subject: "secret".into(),

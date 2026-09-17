@@ -270,7 +270,20 @@ class MainActivity : Activity() {
         val host = server.text.toString()
         work("飞书登录") { client -> FeishuLogin(client).run(host) { url ->
             val latch = java.util.concurrent.CountDownLatch(1); var failure: Exception? = null
-            ui { try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)); state.text = "在浏览器授权后返回，可点击取消当前操作" } catch (e: Exception) { failure = e } finally { latch.countDown() } }
+            ui {
+                try {
+                    val inFeishu = FeishuAuthorization.open(url) { target, packageName ->
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(target))
+                                .addCategory(Intent.CATEGORY_BROWSABLE).setPackage(packageName))
+                            true
+                        } catch (_: ActivityNotFoundException) { false }
+                    }
+                    state.text = if (inFeishu) "请在飞书中确认授权，完成后将返回易链"
+                        else "已打开浏览器授权，完成后将返回易链"
+                } catch (e: Exception) { failure = e }
+                finally { latch.countDown() }
+            }
             check(latch.await(5, java.util.concurrent.TimeUnit.SECONDS)); failure?.let { throw it }
         }; ui { reloadAccount(); if (api.saved().optBoolean("mustChange")) passwordDialog() } }
     }

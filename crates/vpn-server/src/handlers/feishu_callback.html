@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light">
+<title>{{TITLE}} · 易链</title>
+<script>
+// Remove the one-time OAuth parameters before loading any external resource.
+try { history.replaceState(null, '', location.pathname); } catch (_) {}
+</script>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f8ff;color:#15233d;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;min-height:100vh;min-height:100svh;display:flex;flex-direction:column;padding:32px 24px;padding-top:max(32px,env(safe-area-inset-top));padding-bottom:max(24px,env(safe-area-inset-bottom))}.brand{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:650;color:#2563eb;max-width:440px;width:100%;margin:0 auto}.brand svg{width:30px;height:30px}main{width:100%;max-width:440px;margin:auto;padding:48px 0;text-align:center}.symbol{display:grid;place-items:center;width:88px;height:88px;margin:0 auto 28px;border-radius:50%;background:#e8efff;color:#2563eb}.symbol svg{width:40px;height:40px}h1{font-size:28px;letter-spacing:-.5px;line-height:1.35;margin:0 0 14px;font-weight:650}.message{color:#61708a;font-size:15px;line-height:1.8;margin:0 auto;max-width:310px}.actions{margin-top:36px;display:grid;gap:12px}a,button{font:inherit;-webkit-tap-highlight-color:transparent}a.primary{display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:14px;background:#2563eb;color:#fff;text-decoration:none;font-size:16px;font-weight:600;box-shadow:0 6px 20px #2563eb20}a.primary:active{background:#1d4ed8}button{min-height:44px;border:0;background:transparent;color:#61708a;cursor:pointer;border-radius:12px}a:focus-visible,button:focus-visible{outline:3px solid #93b4ff;outline-offset:4px}.hint{font-size:13px;color:#77849a;line-height:1.7;min-height:44px;margin:22px 0 0}footer{text-align:center;font-size:12px;color:#8b97ac;letter-spacing:1px}.failure-mark{display:none}body[data-result="failure"] .success-mark{display:none}body[data-result="failure"] .failure-mark{display:block}body[data-result="failure"] .symbol{background:#fff0e7;color:#b65a22}[hidden]{display:none!important}@media(max-height:680px){main{padding:24px 0}.symbol{margin-bottom:16px;width:64px;height:64px}.actions{margin-top:20px}}
+</style>
+</head>
+<body data-result="{{RESULT}}" data-android="{{ANDROID}}">
+<header class="brand"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M16 2 28 7v9c0 7-6 11-12 14C10 27 4 23 4 16V7L16 2Z" fill="currentColor"/><path d="m10 10 6 6 6-6M16 16v8" stroke="white" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>易链</header>
+<main>
+<div class="symbol" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path class="success-mark" d="m10 20 7 7 14-15" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/><g class="failure-mark" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M20 10v12"/><path d="M20 29h.01"/></g></svg></div>
+<h1>{{TITLE}}</h1>
+<p class="message">{{MESSAGE}}</p>
+<div class="actions"><a class="primary" id="return" href="yilian://auth/feishu-return">返回易链</a><button id="close" type="button">关闭此页面</button></div>
+<p class="hint" id="hint" role="status" aria-live="polite">可返回易链，或关闭此页面。</p>
+<noscript><p class="hint">请点击“返回易链”继续。</p></noscript>
+</main>
+<footer>易链 · 安全连接工作网络</footer>
+<script>
+(function () {
+  'use strict';
+  var ok = document.body.dataset.result === 'success';
+  var android = document.body.dataset.android === 'true';
+  var hint = document.getElementById('hint');
+  var returning = false;
+  var closeRequested = false;
+  var isAndroid = /Android/i.test(navigator.userAgent);
+  var isFeishu = /Lark|Feishu/i.test(navigator.userAgent);
+  // The link only wakes the app. No OAuth code, state, or session is passed to it.
+  function closePage() {
+    closeRequested = true;
+    if (window.tt && typeof window.tt.closeWindow === 'function') {
+      try { window.tt.closeWindow({fail: function () { try { window.close(); } catch (_) {} }}); } catch (_) {}
+    } else { try { window.close(); } catch (_) {} }
+  }
+  if (isFeishu) {
+    var sdk = document.createElement('script');
+    sdk.src = 'https://lf-scm-cn.feishucdn.com/lark/op/h5-js-sdk-1.5.30.js';
+    sdk.onload = function () {
+      if (window.h5sdk && typeof window.h5sdk.ready === 'function') {
+        window.h5sdk.ready(function () { if (closeRequested) closePage(); });
+      }
+    };
+    document.head.appendChild(sdk);
+  }
+  // Never auto-close until the page becomes hidden after requesting an app return.
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && returning) closePage();
+  });
+  document.getElementById('return').addEventListener('click', function () {
+    returning = true;
+    hint.textContent = '若出现打开应用提示，请选择“打开”。';
+  });
+  document.getElementById('close').addEventListener('click', function () {
+    closePage();
+    hint.textContent = '若页面仍未关闭，请使用右上角关闭按钮或浏览器返回键。';
+  });
+  if (!isAndroid && !android) {
+    document.getElementById('return').hidden = true;
+    hint.textContent = ok ? '请切回易链客户端完成登录，然后关闭本页。' : '请切回易链客户端重新发起登录。';
+  }
+  if (ok && !android && !isAndroid) { window.setTimeout(closePage, 1000); }
+  if (ok && android) {
+    hint.textContent = '正在返回易链… 若未跳转，请点击上方按钮。';
+    window.setTimeout(function () {
+      returning = true;
+      location.href = document.getElementById('return').href;
+    }, 650);
+  }
+})();
+</script>
+</body>
+</html>
