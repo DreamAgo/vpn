@@ -1,9 +1,9 @@
 name: Docker Build
+# main/PR validation images only. Official version images are built by Release.
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
     paths:

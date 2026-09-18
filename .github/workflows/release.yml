@@ -8,6 +8,10 @@ on:
       - 'v*'
   workflow_dispatch: {}
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write   # 创建 Release / 上传产物
   packages: write   # 推送容器镜像到 GHCR
@@ -17,17 +21,39 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
+  validate-source:
+    name: Validate unified main release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 packaging/test_release_source.py
+      - run: git fetch origin main
+      - run: python3 packaging/check-release-source.py
+      - name: Reject changes to an existing release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(curl --silent --show-error --output "$RUNNER_TEMP/release-check.json" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          test "$status" = 404 || { echo "Release exists or could not be checked (HTTP $status). Publish a new version from main."; exit 1; }
+
   build-android:
+    needs: validate-source
     name: Android signed APK and AAB
     uses: ./.github/workflows/mobile.yml
     with:
-      release: true
+      release: ${{ startsWith(github.ref, 'refs/tags/v') }}
     secrets: inherit
 
   # ============================================================
   # CLI 客户端：Windows exe、macOS amd64/arm、Linux amd64/arm
   # ============================================================
   build-cli:
+    needs: validate-source
     name: CLI ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -107,6 +133,7 @@ jobs:
   # Linux 服务端：只发布 Linux amd64/arm
   # ============================================================
   build-linux-server:
+    needs: validate-source
     name: Server ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -170,6 +197,7 @@ jobs:
   # Windows CLI 安装器（Inno Setup）：vpn-cli.exe + wintun.dll + PATH/服务注册
   # ============================================================
   windows-cli-installer:
+    needs: validate-source
     name: Windows CLI installer
     runs-on: windows-latest
     steps:
@@ -228,6 +256,7 @@ jobs:
   # Windows 桌面 GUI 客户端（Tauri 2）：MSI + NSIS 安装器（内置 wintun.dll + UAC 自提权）
   # ============================================================
   windows-desktop:
+    needs: validate-source
     name: Windows desktop app
     runs-on: windows-latest
     steps:
@@ -291,6 +320,7 @@ jobs:
   # macOS 桌面 GUI 客户端（Tauri 2）：DMG amd64 + arm64
   # ============================================================
   macos-desktop:
+    needs: validate-source
     name: macOS desktop app ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -372,6 +402,7 @@ jobs:
   # Linux 桌面 GUI 客户端（Tauri 2）：AppImage + deb amd64/arm64
   # ============================================================
   linux-desktop:
+    needs: validate-source
     name: Linux desktop app ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -533,6 +564,20 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --assets-dir release-assets
 
+      - name: Record common build source
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json, os
+          from pathlib import Path
+          folder = Path('release-assets')
+          (folder / 'release-provenance.json').write_text(json.dumps({
+              'tag': os.environ['GITHUB_REF_NAME'],
+              'commit': os.environ['GITHUB_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(folder.iterdir()) if p.is_file()},
+          }, indent=2) + '\n')
+          PYCODE
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -544,6 +589,7 @@ jobs:
   # Docker 镜像（服务端）推送到 GHCR
   # ============================================================
   docker:
+    needs: release
     name: Docker image
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
