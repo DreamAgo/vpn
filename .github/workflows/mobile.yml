@@ -16,12 +16,7 @@ on:
         required: true
       ANDROID_KEY_PASSWORD:
         required: true
-  workflow_dispatch:
-    inputs:
-      release:
-        description: Build signed release APK and AAB (requires signing secrets)
-        type: boolean
-        default: false
+  workflow_dispatch: {} # Debug validation only; signed builds belong to Release.
 permissions:
   contents: read
 jobs:
@@ -29,6 +24,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require unified release for signing
+        if: inputs.release
+        env:
+          CALLER_WORKFLOW: ${{ github.workflow }}
+        run: |
+          [[ "$GITHUB_REF" == refs/tags/v* && "$CALLER_WORKFLOW" == Release ]] || { echo 'Signed Android builds must use the unified Release workflow'; exit 1; }
+          git fetch origin main
+          python3 packaging/check-release-source.py
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

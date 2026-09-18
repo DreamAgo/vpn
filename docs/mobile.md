@@ -97,7 +97,7 @@ Android 从配置服务器的 `/updates/latest.json` 读取 `downloads`，选择
 | `ANDROID_KEY_ALIAS` | 签名 key alias |
 | `ANDROID_KEY_PASSWORD` | 签名 key 密码 |
 
-本机发布可设置 `ANDROID_KEYSTORE_PATH`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 后执行 `./gradlew assembleRelease bundleRelease`。签名构建产物标准名为 `vpn-android-universal-<version>.apk` / `.aab`，供后续审核发布。Release 工作流会在版本标签发布时构建并上传 APK/AAB；手动 Android 工作流只产生 Actions 工件，不发布商店。生产密钥通过四个 ANDROID_* GitHub Secrets 注入，失败时不发布未签名包；密钥不提交版本控制。
+本机发布可设置 `ANDROID_KEYSTORE_PATH`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 后执行 `./gradlew assembleRelease bundleRelease`。签名构建产物标准名为 `vpn-android-universal-<version>.apk` / `.aab`，供后续审核发布。Release 工作流会在版本标签发布时构建并上传 APK/AAB；手动 Android 工作流仅构建调试版；正式 APK/AAB 只能由合入 main 后的统一标签 Release 构建，不允许单独补充到旧 Release。生产密钥通过四个 ANDROID_* GitHub Secrets 注入，失败时不发布未签名包；密钥不提交版本控制。
 
 ## 验证记录（2026-09-16）
 
