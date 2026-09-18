@@ -49,6 +49,7 @@ reqwest = { workspace = true }
 hickory-proto = { workspace = true }
 
 semver = "1"
+socket2 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

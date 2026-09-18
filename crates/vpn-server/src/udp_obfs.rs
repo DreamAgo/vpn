@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use socket2::SockRef;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use vpn_obfs::{Codec, Direction, Mode, ReplayCache};
@@ -75,6 +76,7 @@ impl UdpObfsServer {
                 .await
                 .with_context(|| format!("绑定混淆 UDP 地址 {} 失败", config.bind_addr))?,
         );
+        configure_udp_buffers(&public_socket, "public");
         let mode = map_mode(config.mode);
         let ip_udp_overhead = if public_socket.local_addr()?.is_ipv6() {
             48
@@ -200,6 +202,38 @@ impl UdpObfsServer {
     }
 }
 
+// 每个 socket 单独设置，避免依赖宿主机默认值；内核可能按系统上限裁剪。
+const UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+fn configure_udp_buffers(socket: &UdpSocket, role: &'static str) {
+    let socket = SockRef::from(socket);
+    let configure = || -> std::io::Result<(usize, usize)> {
+        if socket.recv_buffer_size()? < UDP_SOCKET_BUFFER_BYTES {
+            socket.set_recv_buffer_size(UDP_SOCKET_BUFFER_BYTES)?;
+        }
+        if socket.send_buffer_size()? < UDP_SOCKET_BUFFER_BYTES {
+            socket.set_send_buffer_size(UDP_SOCKET_BUFFER_BYTES)?;
+        }
+        Ok((socket.recv_buffer_size()?, socket.send_buffer_size()?))
+    };
+    match configure() {
+        Ok((recv_bytes, send_bytes)) => {
+            if recv_bytes < UDP_SOCKET_BUFFER_BYTES || send_bytes < UDP_SOCKET_BUFFER_BYTES {
+                tracing::warn!(
+                    role,
+                    recv_bytes,
+                    send_bytes,
+                    requested_bytes = UDP_SOCKET_BUFFER_BYTES,
+                    "混淆 UDP 缓冲区受系统上限限制"
+                );
+            } else {
+                tracing::debug!(role, recv_bytes, send_bytes, "混淆 UDP 缓冲区已设置");
+            }
+        }
+        Err(error) => tracing::warn!(role, %error, "设置混淆 UDP 缓冲区失败，继续使用可用缓冲区"),
+    }
+}
+
 async fn bind_internal(endpoint: SocketAddr) -> anyhow::Result<UdpSocket> {
     let bind = if endpoint.is_ipv6() {
         "[::1]:0"
@@ -209,6 +243,7 @@ async fn bind_internal(endpoint: SocketAddr) -> anyhow::Result<UdpSocket> {
     let socket = UdpSocket::bind(bind)
         .await
         .context("创建内部 WG socket 失败")?;
+    configure_udp_buffers(&socket, "internal");
     socket
         .connect(endpoint)
         .await

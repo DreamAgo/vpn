@@ -35,26 +35,29 @@ use zeroize::Zeroizing;
 use crate::daemon::{RoutePolicy, SharedState, TunnelTransport};
 use crate::error::{CliError, CliResult};
 
-/// 恢复只依赖认证握手，不用业务网站响应，避免权限/目标停机引发重连。
+/// 恢复只依赖认证后的 WireGuard 报文，不依赖业务网站或控制面心跳。
 #[derive(Default)]
 struct TunnelRecovery {
+    last_authenticated_rx: Option<Duration>,
     last_attempt: Option<Duration>,
     attempts: u32,
 }
 impl TunnelRecovery {
-    fn healthy(&self, now: Duration, age: Option<Duration>, expired: bool) -> bool {
-        !expired
-            && age.is_some_and(|age| {
-                age < Duration::from_secs(180)
-                    && self
-                        .last_attempt
-                        .is_none_or(|last| now.saturating_sub(age) > last)
-            })
+    fn authenticated_received(&mut self, now: Duration) {
+        // 使用转发循环的同一个时钟。boringtun 的握手时间来自上一轮定时器，
+        // 不能用它推算握手是否发生在本次恢复之后。
+        self.last_authenticated_rx = Some(now);
+        self.last_attempt = None;
+        self.attempts = 0;
     }
-    fn tick(&mut self, now: Duration, age: Option<Duration>, expired: bool) -> (bool, bool) {
-        if self.healthy(now, age, expired) {
-            self.attempts = 0;
-            self.last_attempt = None;
+
+    fn tick(&mut self, now: Duration, expired: bool) -> (bool, bool) {
+        if !expired
+            && self.last_attempt.is_none()
+            && self
+                .last_authenticated_rx
+                .is_some_and(|last| now.saturating_sub(last) < Duration::from_secs(180))
+        {
             return (true, false);
         }
         let delay = Duration::from_secs((15u64 << self.attempts.min(2)).min(60));
@@ -774,7 +777,10 @@ async fn forward_loop(
                             packet_buffer_size,
                             &mut send_state,
                         ).await {
-                            Ok((rx_bytes, tx_bytes, send_failures)) => {
+                            Ok(IncomingStats { rx_bytes, tx_bytes, send_failures, authenticated }) => {
+                                if authenticated {
+                                    recovery.authenticated_received(loop_started.elapsed());
+                                }
                                 rx_acc = rx_acc.saturating_add(rx_bytes);
                                 tx_acc = tx_acc.saturating_add(tx_bytes);
                                 udp_send_failures = udp_send_failures.saturating_add(send_failures);
@@ -841,7 +847,7 @@ async fn forward_loop(
                     }
                     _ => {}
                 }
-                let (healthy, retry) = recovery.tick(loop_started.elapsed(), tunn.time_since_last_handshake(), expired);
+                let (healthy, retry) = recovery.tick(loop_started.elapsed(), expired);
                 if let Some(state) = &traffic { state.set_channel_health(true, healthy).await; }
                 if retry && !*shutdown.borrow() {
                     // 新 socket 更新源端口/NAT 映射；保留 TUN、路由与密钥，不与退出清理竞态。
@@ -1025,9 +1031,30 @@ async fn stop_data_plane(
     let _ = shutdown.send(true);
 }
 
+#[derive(Default)]
+struct IncomingStats {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    send_failures: u64,
+    authenticated: bool,
+}
+
+/// 只有解密/认证成功的响应和传输包能确认数据通道恢复。
+/// Cookie、握手请求、错误和排空队列的空输入均不能作为连接成功的证据。
+fn authenticated_receive(packet: &[u8], result: &TunnResult<'_>) -> bool {
+    match (wireguard_packet_type(packet), result) {
+        (Some(2), TunnResult::WriteToNetwork(reply)) => wireguard_packet_type(reply) == Some(4),
+        (
+            Some(4),
+            TunnResult::Done | TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..),
+        ) => true,
+        _ => false,
+    }
+}
+
 /// 处理一个入站 UDP 数据报：解密后写回 TUN；握手响应回送网络；并排空队列。
 ///
-/// 返回写回 TUN 的明文字节数（用于流量统计）；握手 / keepalive / 错误返回 0。
+/// 返回流量统计和认证结果；握手 / keepalive 不计入明文流量。
 #[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     tunn: &mut Tunn,
@@ -1037,9 +1064,11 @@ async fn handle_incoming(
     obfs: Option<&ObfsRuntime>,
     packet_buffer_size: usize,
     send_state: &mut SendState,
-) -> CliResult<(u64, u64, u64)> {
+) -> CliResult<IncomingStats> {
     let mut out = vec![0u8; packet_buffer_size];
-    match tunn.decapsulate(None, packet, &mut out) {
+    let result = tunn.decapsulate(None, packet, &mut out);
+    let authenticated = authenticated_receive(packet, &result);
+    match result {
         TunnResult::WriteToNetwork(p) => {
             let mut send_failures = 0u64;
             let mut tx_bytes = 0u64;
@@ -1081,7 +1110,12 @@ async fn handle_incoming(
                     _ => break,
                 }
             }
-            Ok((0, tx_bytes, send_failures))
+            Ok(IncomingStats {
+                tx_bytes,
+                send_failures,
+                authenticated,
+                ..Default::default()
+            })
         }
         TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
             let n = p.len() as u64;
@@ -1089,12 +1123,19 @@ async fn handle_incoming(
                 .send(p)
                 .await
                 .map_err(|e| CliError::Other(format!("写入 TUN 失败: {e}")))?;
-            Ok((n, 0, 0))
+            Ok(IncomingStats {
+                rx_bytes: n,
+                authenticated,
+                ..Default::default()
+            })
         }
-        TunnResult::Done => Ok((0, 0, 0)),
+        TunnResult::Done => Ok(IncomingStats {
+            authenticated,
+            ..Default::default()
+        }),
         TunnResult::Err(e) => {
             tracing::debug!(?e, "decapsulate 错误（忽略单包）");
-            Ok((0, 0, 0))
+            Ok(IncomingStats::default())
         }
     }
 }
@@ -1422,29 +1463,50 @@ mod tests {
     }
 
     #[test]
-    fn recovery_is_bounded_and_requires_a_new_authenticated_handshake() {
+    fn recovery_is_bounded_and_requires_new_authenticated_traffic() {
         let secs = Duration::from_secs;
         let mut recovery = TunnelRecovery::default();
-        assert_eq!(recovery.tick(secs(0), None, false), (false, false));
-        assert_eq!(recovery.tick(secs(15), None, false), (false, true));
-        assert_eq!(recovery.tick(secs(16), None, true), (false, false));
-        assert_eq!(recovery.tick(secs(44), None, true), (false, false));
-        assert_eq!(recovery.tick(secs(45), None, true), (false, true));
-        // 旧的握手记录不能把本轮恢复误报为成功。
-        assert_eq!(
-            recovery.tick(secs(46), Some(secs(20)), false),
-            (false, false)
-        );
-        assert_eq!(recovery.tick(secs(47), Some(secs(1)), false), (true, false));
+        assert_eq!(recovery.tick(secs(0), false), (false, false));
+        assert_eq!(recovery.tick(secs(15), false), (false, true));
+        assert_eq!(recovery.tick(secs(16), true), (false, false));
+        assert_eq!(recovery.tick(secs(44), true), (false, false));
+        assert_eq!(recovery.tick(secs(45), true), (false, true));
+        assert_eq!(recovery.tick(secs(104), true), (false, false));
+        assert_eq!(recovery.tick(secs(105), true), (false, true));
+        recovery.authenticated_received(secs(105));
+        assert_eq!(recovery.tick(secs(105), false), (true, false));
         assert_eq!(recovery.attempts, 0);
-        assert_eq!(
-            recovery.tick(secs(228), Some(secs(182)), false),
-            (false, true)
-        );
-        for now in 229..288 {
-            assert!(!recovery.tick(secs(now), None, true).0);
+        // 连接过期后，缓存的认证记录不能结束新一轮恢复。
+        assert_eq!(recovery.tick(secs(106), true), (false, true));
+        assert_eq!(recovery.tick(secs(107), false), (false, false));
+        recovery.authenticated_received(secs(108));
+        assert_eq!(recovery.tick(secs(287), false), (true, false));
+        assert_eq!(recovery.tick(secs(288), false), (false, true));
+    }
+
+    #[test]
+    fn only_authenticated_transport_heals_recovery() {
+        let (mut client, mut server) = establish_tunn_pair();
+        let mut buffer = [0u8; 2048];
+        for payload in [Vec::new(), ipv4_packet_84_bytes().to_vec()] {
+            let packet = match server.encapsulate(&payload, &mut buffer) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("{other:?}"),
+            };
+            let mut tampered = packet.clone();
+            *tampered.last_mut().unwrap() ^= 1;
+            let result = client.decapsulate(None, &tampered, &mut buffer);
+            assert!(!authenticated_receive(&tampered, &result));
+            let result = client.decapsulate(None, &packet, &mut buffer);
+            assert!(authenticated_receive(&packet, &result));
+            let result = client.decapsulate(None, &packet, &mut buffer);
+            assert!(
+                !authenticated_receive(&packet, &result),
+                "replay must not heal recovery"
+            );
         }
-        assert!(recovery.attempts < 4);
+        assert!(!authenticated_receive(&[], &TunnResult::Done));
+        assert!(!authenticated_receive(&[3, 0, 0, 0], &TunnResult::Done));
     }
 
     #[tokio::test]
@@ -1481,11 +1543,18 @@ mod tests {
             TunnResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("{other:?}"),
         };
-        assert!(matches!(
-            client.decapsulate(None, &response, &mut buffer),
-            TunnResult::WriteToNetwork(_)
-        ));
-        assert!(client.time_since_last_handshake().unwrap() < Duration::from_secs(1));
+        let mut recovery = TunnelRecovery::default();
+        let now = Duration::from_secs(15);
+        assert_eq!(recovery.tick(now, false), (false, true));
+        // 故意不推进 boringtun 定时器：短 RTT 响应的握手时间仍是旧 tick。
+        let result = client.decapsulate(None, &response, &mut buffer);
+        assert!(authenticated_receive(&response, &result));
+        recovery.authenticated_received(now);
+        assert_eq!(recovery.tick(now, false), (true, false));
+        assert_eq!(
+            recovery.tick(now + Duration::from_secs(60), false),
+            (true, false)
+        );
     }
 
     fn establish_tunn_pair() -> (Tunn, Tunn) {
