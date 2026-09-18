@@ -1,0 +1,98 @@
+name: Android
+on:
+  pull_request:
+    paths: ['mobile/**', 'crates/vpn-mobile/**', 'crates/vpn-obfs/**', 'crates/vpn-api-types/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/mobile.yml']
+  workflow_call:
+    inputs:
+      release:
+        type: boolean
+        default: true
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: true
+      ANDROID_KEYSTORE_PASSWORD:
+        required: true
+      ANDROID_KEY_ALIAS:
+        required: true
+      ANDROID_KEY_PASSWORD:
+        required: true
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Build signed release APK and AAB (requires signing secrets)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          components: clippy
+      - name: Install Android targets for repository toolchain
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: gradle/actions/setup-gradle@v4
+      - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+      - run: cargo install cargo-ndk --version 4.1.2 --locked
+      - run: cargo test --locked -p vpn-mobile -p vpn-obfs
+      - run: cargo clippy --locked -p vpn-mobile --all-targets -- -D warnings
+      - run: mobile/scripts/build-android.sh assembleDebug
+      - name: Check Android lint
+        run: mobile/android/gradlew -p mobile/android testDebugUnitTest lintDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-debug
+          path: mobile/android/app/build/outputs/apk/debug/*.apk
+      - name: Prepare signing key
+        if: inputs.release
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          umask 077
+          test -n "$KEYSTORE_BASE64" || { echo 'ANDROID_KEYSTORE_BASE64 is required'; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/android-release.jks"
+      - name: Signed release
+        if: inputs.release
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/android-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          mobile/android/gradlew -p mobile/android --no-daemon assembleRelease bundleRelease
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify mobile/android/app/build/outputs/apk/release/app-release.apk
+      - name: Validate release alignment
+        if: inputs.release
+        run: '"$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 4 mobile/android/app/build/outputs/apk/release/app-release.apk'
+      - name: Name release artifacts
+        if: inputs.release
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
+            echo 'Tag and Android version must match'; exit 1
+          fi
+          mkdir -p mobile/android/app/build/distribution
+          cp mobile/android/app/build/outputs/apk/release/app-release.apk "mobile/android/app/build/distribution/vpn-android-universal-$VERSION.apk"
+          cp mobile/android/app/build/outputs/bundle/release/app-release.aab "mobile/android/app/build/distribution/vpn-android-universal-$VERSION.aab"
+      - uses: actions/upload-artifact@v4
+        if: inputs.release
+        with:
+          name: vpn-android
+          path: |
+            mobile/android/app/build/distribution/*
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/android-release.jks"

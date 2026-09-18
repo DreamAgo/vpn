@@ -76,6 +76,9 @@ pub async fn openapi_json() -> Json<Value> {
             "/api/v1/auth/feishu/start": {
                 "post": {
                     "tags": ["Auth"], "summary": "发起飞书 OAuth 登录", "security": [],
+                    "parameters": [
+                        { "name": "client", "in": "query", "required": false, "description": "Android 客户端传 android，授权完成后回跳易链；省略时保留桌面端流程", "schema": { "type": "string", "enum": ["android"] } }
+                    ],
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
                 }
             },

@@ -58,15 +58,24 @@ pub async fn feishu_config(
     success(&state, FeishuAuthConfigResponse { enabled })
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct FeishuStartQuery {
+    client: Option<String>,
+}
+
 #[tracing::instrument(skip(state))]
 pub async fn feishu_start(
     State(state): State<AppState>,
+    Query(query): Query<FeishuStartQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<FeishuAuthStartResponse>>, ApiError> {
     let (ip, _) = extract_client_info(&headers);
     let response = state
         .feishu_auth_service()?
-        .start(ip.as_deref().unwrap_or("unknown"))
+        .start_for_client(
+            ip.as_deref().unwrap_or("unknown"),
+            query.client.as_deref() == Some("android"),
+        )
         .await?;
     Ok(success(&state, response))
 }
@@ -78,36 +87,26 @@ pub struct FeishuCallbackQuery {
     error: Option<String>,
 }
 
-const FEISHU_CALLBACK_SUCCESS_HTML: &str = r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>授权成功</title>
-</head>
-<body>
-<p>飞书授权成功。</p>
-<p>授权结果已发送到易链客户端。</p>
-<p>受浏览器安全限制，本页面无法自动关闭；若客户端未自动回到前台，请手动切回，确认登录后即可关闭本页。</p>
-</body>
-</html>"#;
-
-const FEISHU_CALLBACK_FAILURE_HTML: &str = r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>授权失败</title>
-</head>
-<body>
-<p>飞书授权失败或已过期，请关闭此窗口后在客户端重试。</p>
-</body>
-</html>"#;
-
-fn feishu_callback_html(ok: bool) -> &'static str {
-    if ok {
-        FEISHU_CALLBACK_SUCCESS_HTML
-    } else {
-        FEISHU_CALLBACK_FAILURE_HTML
-    }
+fn feishu_callback_html(ok: bool, android: bool) -> String {
+    include_str!("feishu_callback.html")
+        .replace("{{RESULT}}", if ok { "success" } else { "failure" })
+        .replace("{{ANDROID}}", if android { "true" } else { "false" })
+        .replace(
+            "{{TITLE}}",
+            if ok {
+                "飞书授权成功"
+            } else {
+                "未能完成授权"
+            },
+        )
+        .replace(
+            "{{MESSAGE}}",
+            if ok {
+                "授权结果已送达，请返回易链完成登录。"
+            } else {
+                "授权已取消、失效或暂时不可用，请返回易链重新发起登录。"
+            },
+        )
 }
 
 /// 回调页只显示结果，不携带本站或飞书 token。
@@ -115,16 +114,25 @@ fn feishu_callback_html(ok: bool) -> &'static str {
 pub async fn feishu_callback(
     State(state): State<AppState>,
     Query(query): Query<FeishuCallbackQuery>,
-) -> Html<&'static str> {
-    let ok = match state.feishu_auth_service() {
-        Ok(service) => service
-            .callback(&query.state, query.code.as_deref(), query.error.as_deref())
-            .await
-            .is_ok(),
-        Err(_) => false,
+) -> impl axum::response::IntoResponse {
+    let outcome = match state.feishu_auth_service() {
+        Ok(service) => {
+            service
+                .callback(&query.state, query.code.as_deref(), query.error.as_deref())
+                .await
+        }
+        Err(error) => Err(error),
     };
+    let ok = outcome.is_ok();
+    let android = outcome.unwrap_or(false);
     tracing::Span::current().record("outcome", if ok { "success" } else { "failed" });
-    Html(feishu_callback_html(ok))
+    (
+        [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        Html(feishu_callback_html(ok, android)),
+    )
 }
 
 #[tracing::instrument(skip(state, headers, body))]
@@ -285,27 +293,27 @@ fn _hasher_type_marker(_: Box<dyn PasswordHasher>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{feishu_callback_html, FEISHU_CALLBACK_FAILURE_HTML, FEISHU_CALLBACK_SUCCESS_HTML};
+    use super::feishu_callback_html;
 
     #[test]
-    fn feishu_callback_success_page_explains_browser_close_limit() {
-        assert!(FEISHU_CALLBACK_SUCCESS_HTML.contains("授权结果已发送到易链客户端"));
-        assert!(FEISHU_CALLBACK_SUCCESS_HTML.contains("若客户端未自动回到前台"));
-        assert!(FEISHU_CALLBACK_SUCCESS_HTML.contains("浏览器安全限制"));
-        assert!(!FEISHU_CALLBACK_SUCCESS_HTML.contains("window.close"));
+    fn only_valid_android_success_auto_returns() {
+        assert!(feishu_callback_html(true, true).contains("data-android=\"true\""));
+        assert!(feishu_callback_html(true, false).contains("data-android=\"false\""));
+        let failed = feishu_callback_html(false, false);
+        assert!(failed.contains("data-result=\"failure\""));
+        assert!(failed.contains("重新发起登录"));
     }
 
     #[test]
-    fn feishu_callback_failure_page_remains_visible() {
-        assert!(FEISHU_CALLBACK_FAILURE_HTML.contains("授权失败"));
-        assert!(FEISHU_CALLBACK_FAILURE_HTML.contains("在客户端重试"));
-        assert!(!FEISHU_CALLBACK_FAILURE_HTML.contains("window.close"));
-        assert!(!FEISHU_CALLBACK_FAILURE_HTML.contains("window.setTimeout"));
-    }
-
-    #[test]
-    fn feishu_callback_result_selects_matching_page() {
-        assert_eq!(feishu_callback_html(true), FEISHU_CALLBACK_SUCCESS_HTML);
-        assert_eq!(feishu_callback_html(false), FEISHU_CALLBACK_FAILURE_HTML);
+    fn result_pages_have_mobile_layout_and_no_oauth_parameters() {
+        for ok in [true, false] {
+            let page = feishu_callback_html(ok, false);
+            assert!(page.contains("name=\"viewport\""));
+            assert!(page.contains("返回易链"));
+            assert!(page.contains("history.replaceState"));
+            assert!(!page.contains("{{"));
+            assert!(!page.contains("access_token"));
+            assert!(!page.contains("poll_token"));
+        }
     }
 }

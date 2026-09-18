@@ -1,0 +1,13 @@
+<resources>
+    <style name="Base.Theme.Yilian" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#2563EB</item>
+        <item name="android:colorControlActivated">#2563EB</item>
+        <item name="android:windowBackground">#F8FAFC</item>
+        <item name="android:statusBarColor">#F8FAFC</item>
+        <item name="android:navigationBarColor">#111827</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <style name="Theme.Yilian" parent="Base.Theme.Yilian" />
+</resources>

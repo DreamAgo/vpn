@@ -8,6 +8,7 @@ members = [
     "crates/vpn-server",
     "crates/vpn-cli",
     "crates/vpn-obfs",
+    "crates/vpn-mobile",
 ]
 
 [workspace.package]

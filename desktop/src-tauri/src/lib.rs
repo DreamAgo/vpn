@@ -6,11 +6,11 @@
 //! Disconnect / Quit。所有 VPN 工作进程内完成（库调用 `vpn-cli`），见 `manager.rs`。
 
 mod commands;
-mod updates;
 #[cfg(target_os = "macos")]
 mod macos_helper;
 mod manager;
 mod observability;
+mod updates;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},

@@ -17,6 +17,13 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
+  build-android:
+    name: Android signed APK and AAB
+    uses: ./.github/workflows/mobile.yml
+    with:
+      release: true
+    secrets: inherit
+
   # ============================================================
   # CLI 客户端：Windows exe、macOS amd64/arm、Linux amd64/arm
   # ============================================================
@@ -446,6 +453,7 @@ jobs:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
+      - build-android
       - build-cli
       - build-linux-server
       - windows-cli-installer
@@ -510,6 +518,10 @@ jobs:
 
           copy_one "artifacts/vpn-server-linux-amd64/vpn-server-linux-amd64.tar.gz" "vpn-server-linux-amd64-${tag}.tar.gz"
           copy_one "artifacts/vpn-server-linux-arm64/vpn-server-linux-arm64.tar.gz" "vpn-server-linux-arm64-${tag}.tar.gz"
+
+          version="${tag#v}"
+          copy_one "artifacts/vpn-android/vpn-android-universal-${version}.apk" "vpn-android-universal-${version}.apk"
+          copy_one "artifacts/vpn-android/vpn-android-universal-${version}.aab" "vpn-android-universal-${version}.aab"
 
           find "$out" -type f | sort
 
