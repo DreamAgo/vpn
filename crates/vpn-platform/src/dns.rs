@@ -107,6 +107,10 @@ async fn run_commands(commands: Vec<CommandSpec>) -> Result<()> {
     for spec in commands {
         let mut command = Command::new(spec.program);
         command.args(&spec.args);
+        // DNS maintenance runs in the background, including cleanup on every connection.
+        // Redirecting stdio alone does not prevent PowerShell from opening a console.
+        #[cfg(target_os = "windows")]
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         if spec.stdin.is_some() {
             command.stdin(std::process::Stdio::piped());
         }
@@ -229,6 +233,17 @@ fn interface_name(_ifindex: u32) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_dns_commands_run_without_a_console() {
+        // Exercise the actual process runner without changing system DNS or requiring elevation.
+        run_commands(vec![powershell(
+            "$ErrorActionPreference='Stop'; Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ConsoleProbe { [DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow(); }'; if ([ConsoleProbe]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'DNS command has a console window' }".into(),
+        )])
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn disabled_or_absent_policy_cleanup_only_removes_product_persistent_state() {
