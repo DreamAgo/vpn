@@ -154,7 +154,7 @@ fn build_email(from: &str, message: &NotificationMessage) -> Result<Message> {
                 .singlepart(SinglePart::html(html.clone())),
         )
     } else {
-        builder.body(message.body.clone())
+        builder.singlepart(SinglePart::plain(message.body.clone()))
     }
     .map_err(|e| AppError::Internal(Box::new(e)))
 }
@@ -162,6 +162,37 @@ fn build_email(from: &str, message: &NotificationMessage) -> Result<Message> {
 #[cfg(test)]
 mod html_mail_tests {
     use super::*;
+
+    #[test]
+    fn chinese_plain_mail_declares_mime_and_round_trips_utf8() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let message = NotificationMessage {
+            event_type: "gateway_offline".into(),
+            target: "user@example.com".into(),
+            subject: "站点网关离线 - szjx-gateway".into(),
+            body: "易链检测到站点网关离线。\n受影响网关：szjx-gateway\n请检查客户端网络、管理员权限、隧道进程和服务端连通性。".into(),
+            html_body: None,
+            metadata: None,
+        };
+        let mime = String::from_utf8(
+            build_email("vpn@example.com", &message)
+                .unwrap()
+                .formatted(),
+        )
+        .unwrap();
+        let (headers, encoded_body) = mime.split_once("\r\n\r\n").unwrap();
+        assert!(headers.contains("MIME-Version: 1.0"));
+        assert!(headers.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(headers.contains("Content-Transfer-Encoding: base64"));
+        let decoded = STANDARD
+            .decode(encoded_body.split_whitespace().collect::<String>())
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            message.body.replace('\n', "\r\n")
+        );
+    }
 
     #[test]
     fn html_mail_has_plain_alternative_and_legacy_mail_stays_plain() {
