@@ -89,6 +89,7 @@ export default function App() {
   const [server, setServer] = useState<string>("");
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
   const [tick, setTick] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
@@ -289,6 +290,8 @@ export default function App() {
 
   const onDisconnect = async () => {
     setBusy(true);
+    setDisconnecting(true);
+    setLastError(null);
     addActivity("正在断开连接");
     try {
       await disconnect();
@@ -299,6 +302,7 @@ export default function App() {
       addActivity("断开失败", detail);
       void notify("断开失败", detail);
     } finally {
+      setDisconnecting(false);
       setBusy(false);
       refresh();
     }
@@ -466,11 +470,12 @@ export default function App() {
             disabled={busy || connecting}
             onClick={tunnelUp ? onDisconnect : onConnect}
           >
-            {busy || connecting ? <span className="spinner" /> : tunnelUp ? "断开连接" : "建立安全链路"}
+            {disconnecting ? <><span className="spinner" /> 正在断开…</> : busy || connecting ? <span className="spinner" /> : tunnelUp ? "断开连接" : "建立安全链路"}
           </button>
         </section>
 
         {reconnecting && <div className="notice">网络异常,正在自动恢复连接。</div>}
+        {lastError && <div className="notice" role="alert">{lastError}</div>}
         {backendUnavailable && <div className="notice">无法读取实时状态，请重新打开客户端并查看本地日志。</div>}
 
         <section className="metric-grid">

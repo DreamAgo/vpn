@@ -27,6 +27,61 @@ fn err_envelope(code: i32, message: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn disconnect_cancels_a_stalled_heartbeat() {
+    use std::{sync::Arc, time::Duration};
+    use vpn_cli::daemon::{run_heartbeat, RoutePolicy};
+
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/auth/login"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(LoginResponse {
+                access_token: "atk".into(),
+                refresh_token: "rtk".into(),
+                access_expires_in: 900,
+                must_change_password: false,
+            })),
+        )
+        .mount(&server)
+        .await;
+    let received = Arc::new(tokio::sync::Notify::new());
+    let signal = received.clone();
+    Mock::given(path("/api/v1/peers/heartbeat"))
+        .respond_with(move |_: &wiremock::Request| {
+            signal.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_json(ok_envelope(serde_json::Value::Null))
+                .set_delay(Duration::from_secs(60))
+        })
+        .mount(&server)
+        .await;
+    let api = Arc::new(ApiClient::new(server.uri()).unwrap());
+    api.login("alice", "pw").await.unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let mut task = tokio::spawn(run_heartbeat(
+        api,
+        None,
+        None,
+        receiver,
+        None,
+        RoutePolicy {
+            allowed_routes: vec![],
+            local_route_bypass: vec![],
+        },
+        None,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), received.notified())
+        .await
+        .unwrap();
+    stop.send(true).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+    task.abort();
+    result
+        .expect("disconnect waited for the stalled HTTP response")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn login_stores_tokens() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

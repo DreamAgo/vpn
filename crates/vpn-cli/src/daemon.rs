@@ -536,6 +536,9 @@ pub async fn run_heartbeat(
     current_policy.allowed_routes.sort();
     current_policy.allowed_routes.dedup();
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
             res = shutdown.changed() => {
                 // sender 被 drop（主循环退出/连接被替换）或显式置位 true → 退出心跳循环，
@@ -557,7 +560,12 @@ pub async fn run_heartbeat(
                     loss_pct,
                 };
                 let started = Instant::now();
-                let result = api.heartbeat(&req).await;
+                // A stalled HTTP request must not prevent an explicit disconnect.
+                let result = tokio::select! {
+                    biased;
+                    _ = shutdown.wait_for(|stop| *stop) => break,
+                    result = api.heartbeat(&req) => result,
+                };
                 if samples.len() >= HEARTBEAT_LOSS_WINDOW {
                     samples.pop_front();
                 }
