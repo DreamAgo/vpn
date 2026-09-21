@@ -591,29 +591,13 @@ impl UserspaceTunnel {
             "VPN 路由应用完成"
         );
 
-        // DNS 必须在连接被标记为 ready 前完成；失败时先撤销已添加路由，再返回错误。
-        let dns_session = if let Some(settings) = dns_settings {
-            tracing::info!(stage = "dns_apply", result = "started", ?settings.mode, "开始应用客户端 DNS");
-            match vpn_platform::apply_dns(ifindex, settings).await {
-                Ok(session) => session,
-                Err(error) => {
-                    if crate::route_reconcile::cleanup(&handle, &mut added).await > 0 {
-                        return Err(CliError::Cleanup("DNS 配置失败且路由回滚未完成".into()));
-                    }
-                    tracing::warn!(stage = "dns_apply", result = "failed", error = %error, "应用客户端 DNS 失败，连接已回滚");
-                    return Err(CliError::Other(format!("应用客户端 DNS 失败：{error}")));
-                }
+        // 此处只清理旧配置；新 DNS 由转发循环中的健康检测任务延迟应用。
+        if let Err(error) = vpn_platform::cleanup_stale_dns(ifindex).await {
+            if crate::route_reconcile::cleanup(&handle, &mut added).await > 0 {
+                return Err(CliError::Cleanup("DNS 清理失败且路由回滚未完成".into()));
             }
-        } else {
-            if let Err(error) = vpn_platform::cleanup_stale_dns(ifindex).await {
-                if crate::route_reconcile::cleanup(&handle, &mut added).await > 0 {
-                    return Err(CliError::Cleanup("DNS 清理失败且路由回滚未完成".into()));
-                }
-                tracing::warn!(stage = "dns_cleanup", result = "failed", error = %error, "清理上次遗留的客户端 DNS 失败，连接已回滚");
-                return Err(CliError::Other(format!("清理遗留客户端 DNS 失败：{error}")));
-            }
-            None
-        };
+            return Err(CliError::Other(format!("清理遗留客户端 DNS 失败：{error}")));
+        }
 
         tracing::info!(
             stage = "data_plane_ready",
@@ -639,7 +623,8 @@ impl UserspaceTunnel {
                 traffic,
                 routes_rx,
                 obfs,
-                dns_session,
+                dns_settings.cloned(),
+                vpn_ip,
                 route_policy,
                 vpn_subnet,
                 usize::from(mtu) + usize::from(WG_OVERHEAD) + 64,
@@ -664,11 +649,27 @@ async fn forward_loop(
     traffic: Option<SharedState>,
     mut routes_rx: Option<watch::Receiver<RoutePolicy>>,
     mut obfs: Option<ObfsRuntime>,
-    mut dns_session: Option<vpn_platform::DnsSession>,
+    dns_settings: Option<ClientDnsSettings>,
+    vpn_ip: Ipv4Addr,
     mut route_policy: RoutePolicy,
     vpn_subnet: ipnet::Ipv4Net,
     packet_buffer_size: usize,
 ) -> CliResult<()> {
+    // 独立运行探测，避免等待 DNS 时阻塞 TUN 转发。sender 随本任务销毁，
+    // 即使 forward_loop panic，monitor 也能收到关闭并恢复 DNS。
+    let (dns_stop, dns_rx) = watch::channel(false);
+    let dns_task = dns_settings
+        .filter(|settings| settings.mode != vpn_api_types::system::ClientDnsMode::Disabled)
+        .map(|settings| {
+            let stop_connection = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let result = vpn_platform::monitor_dns(ifindex, vpn_ip, settings, dns_rx).await;
+                if result.is_err() {
+                    let _ = stop_connection.send(true);
+                }
+                result
+            })
+        });
     let loop_started = std::time::Instant::now();
     tracing::info!(
         stage = "forward_loop",
@@ -899,10 +900,14 @@ async fn forward_loop(
 
     let mut cleanup_failures = 0;
     // 清理：先恢复 DNS，再删除本任务加的路由（TUN 设备随 device drop 关闭）。
-    if let Some(session) = dns_session.as_mut() {
-        if let Err(error) = session.restore().await {
-            cleanup_failures += 1;
-            tracing::warn!(stage = "dns_restore", result = "failed", error = %error, "恢复客户端 DNS 失败");
+    let _ = dns_stop.send(true);
+    if let Some(task) = dns_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            result => {
+                cleanup_failures += 1;
+                tracing::warn!(stage = "dns_restore", ?result, "DNS 维护任务失败");
+            }
         }
     }
     cleanup_failures += crate::route_reconcile::cleanup(&handle, &mut added_routes).await;

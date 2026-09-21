@@ -1,11 +1,22 @@
 //! 在产品自有 TUN 接口上应用、恢复服务端下发的 DNS 策略。
 
-use std::net::Ipv4Addr;
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
-use tokio::{io::AsyncWriteExt, process::Command};
+use hickory_proto::{
+    op::{Message, MessageType, OpCode, Query, ResponseCode},
+    rr::{Name, RecordType},
+};
+use tokio::{io::AsyncWriteExt, net::UdpSocket, process::Command, sync::watch, time::timeout};
 use vpn_api_types::{peer::ClientDnsSettings, system::ClientDnsMode};
 
 use crate::{PlatformError, Result};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+// 允许服务端最多 8 个上游依次故障切换（每个总预算 2 秒），另留 2 秒隧道开销。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(18);
 
 const OWNER: &str = "com.xeflow.yilian.vpn";
 
@@ -30,12 +41,25 @@ pub struct DnsSession {
     ifindex: u32,
     interface_name: String,
     active: bool,
+    #[cfg(target_os = "windows")]
+    lease: Option<tokio::process::Child>,
 }
 
 impl DnsSession {
     pub async fn restore(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(mut lease) = self.lease.take() {
+            drop(lease.stdin.take());
+            // Reap the lease before a replacement can reuse the interface.
+            match timeout(COMMAND_TIMEOUT, lease.wait()).await {
+                Ok(Ok(status)) if status.success() => {}
+                _ => {
+                    let _ = lease.kill().await;
+                }
+            }
         }
         run_commands(cleanup_commands(
             self.platform,
@@ -65,8 +89,14 @@ pub async fn apply_dns(ifindex: u32, settings: &ClientDnsSettings) -> Result<Opt
     let platform = current_platform()?;
     let interface_name = interface_name(ifindex)?;
     run_commands(cleanup_commands(platform, ifindex, &interface_name)).await?;
-    let commands = apply_commands(platform, ifindex, &interface_name, server);
-    if let Err(error) = run_commands(commands).await {
+    #[cfg(target_os = "windows")]
+    let (applied, lease) = match start_windows_lease(ifindex, server).await {
+        Ok(child) => (Ok(()), Some(child)),
+        Err(error) => (Err(error), None),
+    };
+    #[cfg(not(target_os = "windows"))]
+    let applied = run_commands(apply_commands(platform, ifindex, &interface_name, server)).await;
+    if let Err(error) = applied {
         let rollback = run_commands(cleanup_commands(platform, ifindex, &interface_name)).await;
         return match rollback {
             Ok(()) => Err(error),
@@ -82,7 +112,53 @@ pub async fn apply_dns(ifindex: u32, settings: &ClientDnsSettings) -> Result<Opt
         ifindex,
         interface_name,
         active: true,
+        #[cfg(target_os = "windows")]
+        lease,
     }))
+}
+
+fn windows_lease_script(ifindex: u32, server: Ipv4Addr) -> String {
+    include_str!("dns/windows_lease.ps1")
+        .replace("__IFINDEX__", &ifindex.to_string())
+        .replace("__SERVER__", &server.to_string())
+}
+
+#[cfg(target_os = "windows")]
+async fn start_windows_lease(ifindex: u32, server: Ipv4Addr) -> Result<tokio::process::Child> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let spec = apply_commands(DnsPlatform::Windows, ifindex, "", server).remove(0);
+    let mut child = Command::new(spec.program)
+        .args(spec.args)
+        .creation_flags(0x0800_0000)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Once ready, EOF (including client death) must execute PowerShell finally.
+        .kill_on_drop(false)
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    match timeout(COMMAND_TIMEOUT, reader.read_line(&mut line)).await {
+        Ok(Ok(_)) if line.trim() == "ready" => Ok(child),
+        _ => {
+            drop(child.stdin.take());
+            // Do not return while an old worker could still reset a new interface.
+            let _ = child.kill().await;
+            let mut detail = String::new();
+            if let Some(stderr) = child.stderr.take() {
+                let _ = timeout(
+                    COMMAND_TIMEOUT,
+                    stderr.take(4096).read_to_string(&mut detail),
+                )
+                .await;
+            }
+            Err(PlatformError::command(
+                "dns lease",
+                format!("Windows DNS 租约启动失败或超时：{}", detail.trim()),
+            ))
+        }
+    }
 }
 
 /// 清理上次进程异常退出可能遗留的持久产品状态。Linux link DNS 随 TUN 消失，无需处理。
@@ -90,6 +166,167 @@ pub async fn cleanup_stale_dns(ifindex: u32) -> Result<()> {
     let platform = current_platform()?;
     let interface_name = interface_name(ifindex)?;
     run_commands(stale_cleanup_commands(platform, ifindex, &interface_name)).await
+}
+
+/// 在控制面请求/域名解析之前调用；调用者必须保证没有本进程的活动隧道。
+/// 不依赖 TUN 是否存在，也不更改物理网卡 DNS。
+pub async fn cleanup_dns_before_connect() -> Result<()> {
+    match current_platform()? {
+        DnsPlatform::Windows => run_commands(vec![powershell(windows_policy_cleanup())]).await,
+        // macOS 的动态配置由特权 helper 管理；Linux 配置随 link 消失。
+        DnsPlatform::Macos => run_commands(cleanup_commands(DnsPlatform::Macos, 0, "")).await,
+        DnsPlatform::Linux => Ok(()),
+    }
+}
+
+fn windows_policy_cleanup() -> String {
+    include_str!("dns/windows_cleanup.ps1").to_string()
+}
+
+/// 转发循环启动后并行运行。只有实际解析成功才接管系统 DNS；故障时恢复原解析器。
+/// 此任务必须通过 shutdown 退出并等待完成，不能 abort，否则无法等待系统清理。
+pub async fn monitor_dns(
+    ifindex: u32,
+    local_ip: Ipv4Addr,
+    settings: ClientDnsSettings,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    if settings.mode == ClientDnsMode::Disabled {
+        return Ok(());
+    }
+    let server: Ipv4Addr = settings
+        .server
+        .parse()
+        .map_err(|_| PlatformError::InvalidArgument("非法 DNS 地址".into()))?;
+    let mut backend = SystemDns {
+        ifindex,
+        local_ip,
+        server,
+        settings,
+        session: None,
+    };
+    maintain_dns(&mut backend, shutdown).await
+}
+
+#[async_trait::async_trait]
+trait DnsMaintenance: Send {
+    async fn probe(&mut self) -> Result<()>;
+    async fn apply(&mut self) -> Result<()>;
+    async fn restore(&mut self) -> Result<()>;
+}
+
+struct SystemDns {
+    ifindex: u32,
+    local_ip: Ipv4Addr,
+    server: Ipv4Addr,
+    settings: ClientDnsSettings,
+    session: Option<DnsSession>,
+}
+
+#[async_trait::async_trait]
+impl DnsMaintenance for SystemDns {
+    async fn probe(&mut self) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        if let Some(session) = self.session.as_mut() {
+            if let Some(lease) = session.lease.as_mut() {
+                if lease.try_wait()?.is_some() {
+                    return Err(PlatformError::command("dns lease", "DNS 租约进程意外退出"));
+                }
+            }
+        }
+        probe_dns(self.local_ip, SocketAddr::from((self.server, 53))).await
+    }
+    async fn apply(&mut self) -> Result<()> {
+        self.session = apply_dns(self.ifindex, &self.settings).await?;
+        Ok(())
+    }
+    async fn restore(&mut self) -> Result<()> {
+        if let Some(active) = self.session.as_mut() {
+            active.restore().await?;
+        }
+        self.session = None;
+        Ok(())
+    }
+}
+
+async fn maintain_dns(
+    backend: &mut impl DnsMaintenance,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut active = false;
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let outcome = async {
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = ticker.tick() => {}
+            }
+            let healthy = tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                result = backend.probe() => result.is_ok(),
+            };
+            if healthy && !active {
+                backend.apply().await?;
+                active = true;
+            } else if !healthy && active {
+                backend.restore().await?;
+                active = false;
+                tracing::warn!(
+                    stage = "dns_health",
+                    "VPN DNS 解析失败，已恢复系统原有 DNS，等待恢复"
+                );
+            } else if !healthy {
+                tracing::debug!(stage = "dns_health", "VPN DNS 尚未就绪，保留系统原有 DNS");
+            }
+        }
+        Ok(())
+    }
+    .await;
+    // 错误退出也执行恢复；失败的 restore 会在这里再尝试一次。
+    backend.restore().await?;
+    outcome
+}
+
+async fn probe_dns(local_ip: Ipv4Addr, server: SocketAddr) -> Result<()> {
+    timeout(PROBE_TIMEOUT, async {
+        let mut query = Message::query();
+        query.metadata.id = rand::random();
+        query.metadata.recursion_desired = true;
+        // 根 NS 查询检验默认上游，避免只测到网关静态记录或泄露用户域名。
+        query.add_query(Query::query(Name::root(), RecordType::NS));
+        let packet = query
+            .to_vec()
+            .map_err(|e| PlatformError::command("dns probe", e.to_string()))?;
+        let socket = UdpSocket::bind((local_ip, 0)).await?;
+        socket.connect(server).await?;
+        socket.send(&packet).await?;
+        let mut buffer = [0u8; 4096];
+        let size = socket.recv(&mut buffer).await?;
+        let reply = Message::from_vec(&buffer[..size])
+            .map_err(|e| PlatformError::command("dns probe", e.to_string()))?;
+        if reply.id != query.id
+            || reply.message_type != MessageType::Response
+            || reply.op_code != OpCode::Query
+            || reply.queries != query.queries
+            || reply.response_code != ResponseCode::NoError
+            || reply.truncation
+            || reply.answers.is_empty()
+        {
+            return Err(PlatformError::command(
+                "dns probe",
+                "DNS 未返回有效解析结果",
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| PlatformError::command("dns probe", "DNS 查询超时"))?
 }
 
 fn stale_cleanup_commands(
@@ -107,6 +344,7 @@ async fn run_commands(commands: Vec<CommandSpec>) -> Result<()> {
     for spec in commands {
         let mut command = Command::new(spec.program);
         command.args(&spec.args);
+        command.kill_on_drop(true);
         // DNS maintenance runs in the background, including cleanup on every connection.
         // Redirecting stdio alone does not prevent PowerShell from opening a console.
         #[cfg(target_os = "windows")]
@@ -117,15 +355,19 @@ async fn run_commands(commands: Vec<CommandSpec>) -> Result<()> {
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
-        if let Some(input) = spec.stdin {
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| PlatformError::command(spec.program, "无法打开 stdin"))?
-                .write_all(input.as_bytes())
-                .await?;
-        }
-        let output = child.wait_with_output().await?;
+        let output = timeout(COMMAND_TIMEOUT, async {
+            if let Some(input) = spec.stdin {
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| PlatformError::command(spec.program, "无法打开 stdin"))?
+                    .write_all(input.as_bytes())
+                    .await?;
+            }
+            Ok::<_, PlatformError>(child.wait_with_output().await?)
+        })
+        .await
+        .map_err(|_| PlatformError::command(spec.program, "DNS 命令超时，已终止子进程"))??;
         if !output.status.success() {
             return Err(PlatformError::command(
                 spec.program,
@@ -145,7 +387,7 @@ fn cleanup_commands(platform: DnsPlatform, ifindex: u32, interface: &str) -> Vec
             stdin: Some(format!("remove State:/Network/Service/{OWNER}/DNS\nquit\n")),
         }],
         DnsPlatform::Windows => vec![powershell(format!(
-            "$ErrorActionPreference='Stop'; Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{OWNER}' }} | Remove-DnsClientNrptRule -Force; if (Get-NetAdapter -InterfaceIndex {ifindex} -ErrorAction SilentlyContinue) {{ Set-DnsClientServerAddress -InterfaceIndex {ifindex} -ResetServerAddresses }}"
+            "{}; if (Get-NetAdapter -InterfaceIndex {ifindex} -ErrorAction SilentlyContinue) {{ Set-DnsClientServerAddress -InterfaceIndex {ifindex} -ResetServerAddresses }}", windows_policy_cleanup()
         ))],
     }
 }
@@ -169,9 +411,7 @@ fn apply_commands(
                     "d.init\nd.add ServerAddresses * {server}\nd.add InterfaceName {interface}\nd.add SearchOrder # 1\nd.add SupplementalMatchDomains * \"\"\nd.add SupplementalMatchDomainsNoSearch # 1\nset State:/Network/Service/{OWNER}/DNS\nquit\n"
                 )),
             }],
-        DnsPlatform::Windows => vec![powershell(format!(
-            "$ErrorActionPreference='Stop'; Set-DnsClientServerAddress -InterfaceIndex {ifindex} -ServerAddresses '{server}'; Add-DnsClientNrptRule -Namespace '.' -NameServers '{server}' -Comment '{OWNER}'"
-        ))],
+        DnsPlatform::Windows => vec![powershell(windows_lease_script(ifindex, server))],
     }
 }
 
@@ -273,7 +513,7 @@ mod tests {
                         + command.stdin.as_ref().map_or(0, String::len)
                 })
                 .sum();
-            assert!(size < 1024);
+            assert!(size < 8192);
         }
     }
 
@@ -311,9 +551,157 @@ mod tests {
         assert!(!script.contains("Set-NetIPInterface"));
         assert!(!script.contains("InterfaceMetric"));
         assert_eq!(script.matches("Add-DnsClientNrptRule").count(), 1);
-        assert!(script.len() < 1024);
+        assert!(script.len() < 8192);
         let cleanup = cleanup_commands(DnsPlatform::Windows, 12, "12");
         assert!(cleanup[0].args[3].contains(&format!("$_.Comment -eq '{OWNER}'")));
         assert!(cleanup[0].args[3].contains("-InterfaceIndex 12 -ResetServerAddresses"));
+    }
+    struct FakeDns {
+        health: tokio::sync::mpsc::UnboundedReceiver<bool>,
+        events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+        active: bool,
+        fail_restore_once: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsMaintenance for FakeDns {
+        async fn probe(&mut self) -> Result<()> {
+            self.events.send("probe").unwrap();
+            match self.health.recv().await {
+                Some(true) => Ok(()),
+                _ => Err(PlatformError::command("probe", "unavailable")),
+            }
+        }
+        async fn apply(&mut self) -> Result<()> {
+            self.active = true;
+            self.events.send("apply").unwrap();
+            Ok(())
+        }
+        async fn restore(&mut self) -> Result<()> {
+            if self.active {
+                self.events.send("restore").unwrap();
+                if self.fail_restore_once {
+                    self.fail_restore_once = false;
+                    return Err(PlatformError::command("restore", "temporary failure"));
+                }
+                self.active = false;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_is_applied_only_after_probe_and_restored_on_failure_recovery_and_owner_loss() {
+        let (health, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut log) = tokio::sync::mpsc::unbounded_channel();
+        let (stop, shutdown) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut backend = FakeDns {
+                health: rx,
+                events,
+                active: false,
+                fail_restore_once: false,
+            };
+            maintain_dns(&mut backend, shutdown).await
+        });
+        assert_eq!(log.recv().await, Some("probe"));
+        health.send(false).unwrap();
+        // An unavailable DNS never installs a system policy.
+        assert_eq!(log.recv().await, Some("probe"));
+        health.send(true).unwrap();
+        assert_eq!(log.recv().await, Some("apply"));
+        assert_eq!(log.recv().await, Some("probe"));
+        health.send(false).unwrap();
+        assert_eq!(log.recv().await, Some("restore"));
+        assert_eq!(log.recv().await, Some("probe"));
+        health.send(true).unwrap();
+        assert_eq!(log.recv().await, Some("apply"));
+        assert_eq!(log.recv().await, Some("probe"));
+        // Cancel a pending network probe by dropping the forwarding task's sender.
+        drop(stop);
+        assert_eq!(log.recv().await, Some("restore"));
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_restore_failure_is_retried_and_reported() {
+        let (health, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut log) = tokio::sync::mpsc::unbounded_channel();
+        let (_stop, shutdown) = watch::channel(false);
+        health.send(true).unwrap();
+        health.send(false).unwrap();
+        let mut backend = FakeDns {
+            health: rx,
+            events,
+            active: false,
+            fail_restore_once: true,
+        };
+        assert!(maintain_dns(&mut backend, shutdown).await.is_err());
+        assert!(!backend.active);
+        let mut observed = Vec::new();
+        while let Ok(event) = log.try_recv() {
+            observed.push(event);
+        }
+        assert_eq!(observed, ["probe", "apply", "probe", "restore", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn probe_checks_reply_identity_and_resolution_result() {
+        use hickory_proto::rr::{rdata::NS, RData, Record};
+        for case in 0..5 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server = socket.local_addr().unwrap();
+            let worker = tokio::spawn(async move {
+                let mut buffer = [0; 512];
+                let (size, source) = socket.recv_from(&mut buffer).await.unwrap();
+                let query = Message::from_vec(&buffer[..size]).unwrap();
+                let mut response = Message::response(query.id, query.op_code);
+                response.add_queries(query.queries.clone());
+                response.add_answer(Record::from_rdata(
+                    Name::root(),
+                    0,
+                    RData::NS(NS(Name::from_ascii("a.root-servers.net.").unwrap())),
+                ));
+                match case {
+                    1 => response.metadata.id = query.id.wrapping_add(1),
+                    2 => response.metadata.response_code = ResponseCode::ServFail,
+                    3 => response.queries.clear(),
+                    4 => response.answers.clear(),
+                    _ => {}
+                }
+                socket
+                    .send_to(&response.to_vec().unwrap(), source)
+                    .await
+                    .unwrap();
+            });
+            assert_eq!(
+                probe_dns(Ipv4Addr::LOCALHOST, server).await.is_ok(),
+                case == 0
+            );
+            worker.await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_command_timeout_is_bounded() {
+        let result = run_commands(vec![spec("/bin/sleep", ["60"])]).await;
+        assert!(result.unwrap_err().to_string().contains("超时"));
+    }
+
+    #[test]
+    fn windows_lease_is_volatile_and_cleans_exact_rule_on_pipe_eof() {
+        let script = windows_lease_script(12, Ipv4Addr::new(10, 9, 0, 1));
+        assert!(script.contains("RegistryOptions]::Volatile"));
+        assert!(script.contains("[Console]::In.ReadLine()"));
+        assert!(script.contains("DeleteSubKey($rule.Name, $false)"));
+        assert!(script.contains("yilian-dns-lease:{0}:{1}"));
+        assert!(script.contains("Global\\com.xeflow.yilian.vpn.dns"));
+        assert!(!script.contains("__IFINDEX__"));
+        assert!(!script.contains("__SERVER__"));
+        let cleanup = windows_policy_cleanup();
+        assert!(cleanup.contains("StartTime.ToUniversalTime().Ticks"));
+        assert!(cleanup.contains("if (-not $live)"));
+        assert!(!cleanup.contains("Remove-Item"));
     }
 }

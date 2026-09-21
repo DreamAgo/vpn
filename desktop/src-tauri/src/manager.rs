@@ -22,7 +22,7 @@ use vpn_cli::ipc::{ConnState, StatusResponse};
 use vpn_wireguard::{generate_keypair, WgKeypair};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -151,6 +151,18 @@ impl VpnManager {
         let connection_started = Instant::now();
         tracing::info!(attempt_id, iface = %self.iface, stage = "connect", result = "started", "开始建立 VPN 连接");
 
+        // 保留活动连接的 DNS；无隧道时先恢复解析，再刷新 token/注册。
+        if self
+            .supervisor
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|task| task.is_finished())
+        {
+            daemon::cleanup_dns_before_connect()
+                .await
+                .map_err(|error| format!("连接前清理 DNS 失败：{error}"))?;
+        }
         let api = Arc::new(ApiClient::new(&server).map_err(|error| {
             tracing::warn!(stage = "credentials", result = "failed", error = %error.safe_diagnostic(), "初始化控制面客户端失败");
             error.to_string()

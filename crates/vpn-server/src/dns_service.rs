@@ -10,7 +10,7 @@ use std::{
 use anyhow::{anyhow, Context};
 use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
-    rr::{rdata::A, RData, Record, RecordType},
+    rr::{rdata::A, DNSClass, RData, Record, RecordType},
 };
 use ipnet::Ipv4Net;
 use tokio::{
@@ -120,6 +120,16 @@ impl DnsServer {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
+        loop {
+            if let Err(error) = self.clone().run_listener().await {
+                // DNS 故障不能结束包含 HTTP 控制面的主 select，允许管理员在线修复配置。
+                tracing::error!(%error, "VPN DNS 监听失败，2 秒后重试；控制面继续运行");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn run_listener(self) -> anyhow::Result<()> {
         if self.settings.read().await.mode == ClientDnsMode::Disabled {
             tracing::info!(gateway = %self.gateway, "VPN 内置 DNS 当前关闭，等待后台启用");
             loop {
@@ -244,10 +254,11 @@ impl DnsServer {
             .trim_end_matches('.')
             .to_ascii_lowercase();
 
-        if query.query_type() == RecordType::A {
+        if query.query_class() == DNSClass::IN {
             if let Some(record) = settings.static_records.iter().find(|record| {
                 normalize_dns_domain(&record.name).is_ok_and(|candidate| candidate == name)
             }) {
+                // 静态名称的 AAAA 等查询返回 NODATA，不能泄漏给公网或混入公网地址。
                 return static_response(&request, record.address, record.ttl);
             }
         }
@@ -265,7 +276,13 @@ impl DnsServer {
             request: cache_request,
             upstreams: upstreams.join(","),
         };
-        if let Some(packet) = self.cache.lock().await.get(&key, request.id) {
+        // 客户端用根 NS 检测默认上游；不能由旧缓存掩盖上游中断。
+        let cacheable_query = !(query.name().is_root() && query.query_type() == RecordType::NS);
+        if let Some(packet) = if cacheable_query {
+            self.cache.lock().await.get(&key, request.id)
+        } else {
+            None
+        } {
             tracing::debug!(record_type = ?query.query_type(), result = "cache_hit", "DNS 查询完成");
             return packet;
         }
@@ -281,11 +298,19 @@ impl DnsServer {
                     };
                     if response.id != request.id
                         || response.message_type != MessageType::Response
+                        || response.op_code != request.op_code
                         || response.queries != request.queries
                     {
                         continue;
                     }
-                    if let Some(ttl) = cache_ttl(&response) {
+                    if !matches!(
+                        response.response_code,
+                        ResponseCode::NoError | ResponseCode::NXDomain
+                    ) {
+                        tracing::warn!(upstream = %address, code = ?response.response_code, "DNS 上游返回错误，尝试下一个");
+                        continue;
+                    }
+                    if let Some(ttl) = cache_ttl(&response).filter(|_| cacheable_query) {
                         self.cache
                             .lock()
                             .await
@@ -325,11 +350,13 @@ fn static_response(request: &Message, address: Ipv4Addr, ttl: u32) -> Vec<u8> {
     response.metadata.authoritative = true;
     response.edns = request.edns.clone();
     response.add_query(query.clone());
-    response.add_answer(Record::from_rdata(
-        query.name().clone(),
-        ttl,
-        RData::A(A(address)),
-    ));
+    if matches!(query.query_type(), RecordType::A | RecordType::ANY) {
+        response.add_answer(Record::from_rdata(
+            query.name().clone(),
+            ttl,
+            RData::A(A(address)),
+        ));
+    }
     response
         .to_vec()
         .unwrap_or_else(|_| error_response(request, ResponseCode::ServFail))
@@ -372,8 +399,7 @@ fn cache_ttl(response: &Message) -> Option<Duration> {
             .find_map(|record| match &record.data {
                 RData::SOA(soa) => Some(record.ttl.min(soa.minimum)),
                 _ => None,
-            })
-            .unwrap_or(30)
+            })?
             .min(300)
     } else {
         response
@@ -383,12 +409,18 @@ fn cache_ttl(response: &Message) -> Option<Duration> {
             .min()
             .unwrap_or(30)
             .min(3_600)
-    }
-    .max(1);
-    Some(Duration::from_secs(u64::from(seconds)))
+    };
+    (seconds > 0).then(|| Duration::from_secs(u64::from(seconds)))
 }
 
 async fn query_upstream(request: &[u8], upstream: SocketAddr) -> anyhow::Result<Vec<u8>> {
+    // 包括 UDP、TCP 建连和读写的总预算，避免多个上游叠加超时无限拖长查询。
+    timeout(UPSTREAM_TIMEOUT, query_upstream_inner(request, upstream))
+        .await
+        .context("DNS 上游总查询超时")?
+}
+
+async fn query_upstream_inner(request: &[u8], upstream: SocketAddr) -> anyhow::Result<Vec<u8>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(upstream).await?;
     socket.send(request).await?;
@@ -563,5 +595,151 @@ mod tests {
         tcp_worker.await.unwrap();
         assert!(!response.truncation);
         assert_eq!(response.answers.len(), 1);
+    }
+    #[tokio::test]
+    async fn upstream_servfail_and_refused_try_backup_but_nxdomain_is_final() {
+        for code in [
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::NXDomain,
+        ] {
+            let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let backup = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let settings = Arc::new(RwLock::new(DnsNetworkSettings {
+                mode: ClientDnsMode::Global,
+                default_upstreams: vec![
+                    primary.local_addr().unwrap().to_string(),
+                    backup.local_addr().unwrap().to_string(),
+                ],
+                ..Default::default()
+            }));
+            let first = tokio::spawn(async move {
+                let mut buf = [0; 512];
+                let (len, source) = primary.recv_from(&mut buf).await.unwrap();
+                let request = Message::from_vec(&buf[..len]).unwrap();
+                primary
+                    .send_to(&error_response(&request, code), source)
+                    .await
+                    .unwrap();
+            });
+            let second = tokio::spawn(async move {
+                let mut buf = [0; 512];
+                let (len, source) = backup.recv_from(&mut buf).await.unwrap();
+                backup
+                    .send_to(
+                        &answer(&buf[..len], Ipv4Addr::new(10, 1, 2, 3), false),
+                        source,
+                    )
+                    .await
+                    .unwrap();
+            });
+            let server = DnsServer::new("10.9.0.0/24".parse().unwrap(), settings).unwrap();
+            let result = timeout(
+                Duration::from_secs(1),
+                server.process(&query(10, "failover.example.")),
+            )
+            .await
+            .unwrap();
+            let response = Message::from_vec(&result).unwrap();
+            first.await.unwrap();
+            if code == ResponseCode::NXDomain {
+                assert_eq!(response.response_code, code);
+                assert!(!second.is_finished());
+                second.abort();
+                let _ = second.await;
+            } else {
+                assert_eq!(response.response_code, ResponseCode::NoError);
+                assert_eq!(response.answers.len(), 1);
+                second.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn static_aaaa_returns_nodata_without_upstream_queries() {
+        let settings = Arc::new(RwLock::new(DnsNetworkSettings {
+            mode: ClientDnsMode::Global,
+            default_upstreams: vec![],
+            static_records: vec![DnsStaticRecord {
+                name: "internal.example".into(),
+                address: Ipv4Addr::new(10, 2, 3, 4),
+                ttl: 60,
+            }],
+            ..Default::default()
+        }));
+        let server = DnsServer::new("10.9.0.0/24".parse().unwrap(), settings).unwrap();
+        let mut request = Message::query();
+        request.add_query(Query::query(
+            Name::from_ascii("internal.example.").unwrap(),
+            RecordType::AAAA,
+        ));
+        let response =
+            Message::from_vec(&server.process(&request.to_vec().unwrap()).await).unwrap();
+        assert_eq!(response.response_code, ResponseCode::NoError);
+        assert!(response.authoritative);
+        assert!(response.answers.is_empty());
+        assert_eq!(response.queries, request.queries);
+    }
+
+    #[tokio::test]
+    async fn root_health_probe_bypasses_cached_upstream_answers() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let settings = Arc::new(RwLock::new(DnsNetworkSettings {
+            mode: ClientDnsMode::Global,
+            default_upstreams: vec![upstream.local_addr().unwrap().to_string()],
+            ..Default::default()
+        }));
+        let worker = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            for index in 0..2 {
+                let (len, source) = upstream.recv_from(&mut buf).await.unwrap();
+                let request = Message::from_vec(&buf[..len]).unwrap();
+                let response = if index == 0 {
+                    let mut response = Message::response(request.id, request.op_code);
+                    response.add_queries(request.queries.clone());
+                    response.add_answer(Record::from_rdata(
+                        Name::root(),
+                        3600,
+                        RData::NS(hickory_proto::rr::rdata::NS(
+                            Name::from_ascii("a.root-servers.net").unwrap(),
+                        )),
+                    ));
+                    response.to_vec().unwrap()
+                } else {
+                    error_response(&request, ResponseCode::ServFail)
+                };
+                upstream.send_to(&response, source).await.unwrap();
+            }
+        });
+        let server = DnsServer::new("10.9.0.0/24".parse().unwrap(), settings).unwrap();
+        let mut request = Message::query();
+        request.add_query(Query::query(Name::root(), RecordType::NS));
+        let packet = request.to_vec().unwrap();
+        let first = Message::from_vec(&server.process(&packet).await).unwrap();
+        assert_eq!(first.response_code, ResponseCode::NoError);
+        let second = timeout(Duration::from_secs(1), server.process(&packet))
+            .await
+            .unwrap();
+        assert_eq!(
+            Message::from_vec(&second).unwrap().response_code,
+            ResponseCode::ServFail
+        );
+        worker.await.unwrap();
+        assert!(server.cache.lock().await.entries.is_empty());
+    }
+
+    #[test]
+    fn zero_ttl_and_negative_without_soa_are_not_cached() {
+        let mut response = Message::from_vec(&answer(
+            &query(1, "ttl.example"),
+            Ipv4Addr::LOCALHOST,
+            false,
+        ))
+        .unwrap();
+        response.answers[0].ttl = 0;
+        assert_eq!(cache_ttl(&response), None);
+        response.answers.clear();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        assert_eq!(cache_ttl(&response), None);
     }
 }

@@ -23,7 +23,7 @@ pub mod error;
 pub mod tun;
 
 // === 主要类型 re-export ===
-pub use dns::{apply_dns, cleanup_stale_dns, DnsSession};
+pub use dns::{apply_dns, cleanup_dns_before_connect, cleanup_stale_dns, monitor_dns, DnsSession};
 pub use error::{PlatformError, Result};
 
 pub use tun::{open_tun, Cidr, TunDevice};

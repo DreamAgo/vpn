@@ -249,6 +249,10 @@ pub fn run() {
             sync_tray_state,
         ])
         .setup(|app| {
+            // Windows GUI 以管理员身份运行；在页面登录请求之前恢复上次遗留 DNS。
+            #[cfg(target_os = "windows")]
+            tauri::async_runtime::block_on(vpn_cli::daemon::cleanup_dns_before_connect())?;
+
             // Windows:把随包分发的 wintun.dll 绝对路径告诉数据面(vpn-cli 据此显式 load),
             // 避免依赖工作目录搜索 DLL。dev / 未打包场景两处候选都不存在时,回退 tun 默认
             // 的 "wintun.dll" 搜索(由 wg_userspace.rs 处理 VPN_WINTUN_PATH 未设置的情况)。

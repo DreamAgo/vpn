@@ -15,6 +15,8 @@
 //! 单测覆盖**纯逻辑**（状态转移、心跳间隔常量、allowed-ips 计算、CIDR 推断）；
 //! 真正建隧道需 root + TUN 设备 + 真实对端，在真机/容器验证。
 
+pub use vpn_platform::cleanup_dns_before_connect;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -769,6 +771,9 @@ pub fn detect_os_info() -> String {
 ///
 /// 真机验证：需要凭证、网络与设备权限。失败时把错误写入共享状态并返回。
 pub async fn run(config: DaemonConfig) -> CliResult<()> {
+    vpn_platform::cleanup_dns_before_connect()
+        .await
+        .map_err(|error| CliError::Cleanup(format!("启动时清理 DNS 失败：{error}")))?;
     let state = SharedState::new();
     let api = Arc::new(ApiClient::new(&config.server_url)?);
     if let Some(rt) = &config.refresh_token {
@@ -818,6 +823,17 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         .await;
                     continue 'control;
                 }
+                if active_supervisor
+                    .as_ref()
+                    .is_none_or(|task| task.is_finished())
+                {
+                    if let Err(error) = vpn_platform::cleanup_dns_before_connect().await {
+                        state
+                            .set_error(format!("连接前清理 DNS 失败：{error}"), now_unix())
+                            .await;
+                        continue 'control;
+                    }
+                }
                 state.set_state(ConnState::Connecting, now_unix()).await;
                 match connect_once(&api, &keypair, &config.device_name).await {
                     Ok(params) => {
@@ -832,7 +848,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                             let _ = tx.send(true);
                         }
                         if let Some(mut old) = active_supervisor.take() {
-                            match tokio::time::timeout(Duration::from_secs(5), &mut old).await {
+                            match tokio::time::timeout(Duration::from_secs(45), &mut old).await {
                                 Ok(Ok(Ok(()))) => {}
                                 Ok(Ok(Err(error))) => {
                                     let diagnostic = error.safe_diagnostic();
@@ -931,7 +947,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                     let _ = tx.send(true);
                 }
                 if let Some(mut old) = active_supervisor.take() {
-                    match tokio::time::timeout(Duration::from_secs(5), &mut old).await {
+                    match tokio::time::timeout(Duration::from_secs(45), &mut old).await {
                         Ok(Ok(Ok(()))) => {}
                         Ok(Ok(Err(error))) => {
                             let diagnostic = error.safe_diagnostic();
