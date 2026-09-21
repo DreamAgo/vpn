@@ -120,14 +120,6 @@ async fn setup_admin() -> (axum::Router, tempfile::TempDir, String, String) {
     (app, tmp, access, admin_id)
 }
 
-/// 审计是异步 spawn 写入，给后台任务一点时间落库。
-async fn settle() {
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-}
-
 #[tokio::test]
 async fn write_ops_are_audited_and_queryable() {
     let (app, _tmp, access, _admin_id) = setup_admin().await;
@@ -143,8 +135,6 @@ async fn write_ops_are_audited_and_queryable() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    settle().await;
-
     // 查询审计日志（默认最近 7 天）。
     let (status, body) = req(&app, "GET", "/api/v1/admin/audit-logs", None, Some(&access)).await;
     assert_eq!(status, StatusCode::OK, "audit query body: {body}");
@@ -154,9 +144,20 @@ async fn write_ops_are_audited_and_queryable() {
     // 应能找到 user_create / resource 正确。
     let has_user_create = items.iter().any(|it| {
         it["action"] == json!("user_create")
-            && it["resource"] == json!("/api/v1/admin/users")
+            && it["resource"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("users/"))
+            && it["username"] == "admin"
             && it["status_code"] == json!(200)
     });
+    assert_eq!(
+        items
+            .iter()
+            .filter(|it| it["action"] == "user_create")
+            .count(),
+        1
+    );
+    assert!(!body.to_string().contains("$argon2"));
     assert!(has_user_create, "缺少 user_create 审计: {body}");
 
     // 应有登录成功审计（first-time-setup 不走 login，但我们显式登录一次）。
@@ -168,7 +169,6 @@ async fn write_ops_are_audited_and_queryable() {
         None,
     )
     .await;
-    settle().await;
     let (_, body) = req(
         &app,
         "GET",
@@ -195,7 +195,6 @@ async fn failed_login_is_audited() {
     )
     .await;
     assert_eq!(body["code"], json!(1001));
-    settle().await;
 
     let (_, body) = req(
         &app,

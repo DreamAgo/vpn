@@ -281,6 +281,7 @@ impl ServerConfig {
         let audit_retention_days = env::var("VPN_AUDIT_RETENTION_DAYS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
+            .filter(|days| *days > 0)
             .unwrap_or(180);
 
         let network_settings_seed = NetworkSettingsSeed {

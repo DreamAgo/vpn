@@ -211,15 +211,9 @@ impl IntegrationSettingsService {
         }
 
         let serialized = serialize_settings(&next).map_err(AppError::Validation)?;
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| AppError::Database(Box::new(error)))?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| AppError::Database(Box::new(error)))?;
+        let (mut connection, audit_before) =
+            crate::middleware::audit_context::begin(&self.pool, "system_config", SETTINGS_KEY)
+                .await?;
         if !next.feishu_approval.enabled {
             let count: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM users WHERE access_mode = 'approval_required'",
@@ -228,7 +222,6 @@ impl IntegrationSettingsService {
             .await
             .map_err(|error| AppError::Database(Box::new(error)))?;
             if count.0 > 0 {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
                 return Err(AppError::Validation(format!(
                     "仍有 {} 个审批管控用户，迁移后才能关闭飞书审批",
                     count.0
@@ -247,13 +240,15 @@ impl IntegrationSettingsService {
         .execute(&mut *connection)
         .await;
         if let Err(error) = result {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
             return Err(AppError::Database(Box::new(error)));
         }
-        sqlx::query("COMMIT")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| AppError::Database(Box::new(error)))?;
+        crate::middleware::audit_context::finish(
+            connection,
+            "system_config",
+            SETTINGS_KEY,
+            audit_before,
+        )
+        .await?;
         Ok(IntegrationSettingsView {
             applied: self.applied.public_view(),
             desired: next.public_view(),

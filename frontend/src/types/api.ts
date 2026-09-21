@@ -469,6 +469,9 @@ export interface AuditLogDto {
 }
 
 export interface AuditLogQuery {
+  resource?: string;
+  outcome?: string;
+  category?: string;
   from?: number;
   to?: number;
   userId?: string;

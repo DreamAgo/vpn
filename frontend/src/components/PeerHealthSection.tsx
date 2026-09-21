@@ -21,6 +21,7 @@ const FIELD_LABELS: Record<string, string> = {
   os_info: 'OS',
   endpoint: 'Endpoint',
   vpn_ip: '虚拟 IP',
+  status: '在线状态',
   device_name: '设备名',
   client_version: '客户端版本',
 };

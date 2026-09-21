@@ -1,5 +1,6 @@
 //! SQLite 实现的 UserGroupRepository(用户组 + 组级可路由网段)。
 
+use crate::middleware::audit_context;
 use chrono::Utc;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use vpn_core::{AppError, Result};
@@ -90,6 +91,7 @@ impl SqliteUserGroupRepository {
 
     /// 插入新组。名称冲突返回 DuplicateResource。
     pub async fn insert(&self, id: &str, name: &str, routes_csv: &str) -> Result<UserGroupRow> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "user_groups", id).await?;
         let now = Utc::now().timestamp_millis();
         let res = sqlx::query(
             r#"INSERT INTO user_groups (id, name, routes, created_at, updated_at)
@@ -99,16 +101,19 @@ impl SqliteUserGroupRepository {
         .bind(name)
         .bind(routes_csv)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
         match res {
-            Ok(_) => Ok(UserGroupRow {
-                id: id.to_string(),
-                name: name.to_string(),
-                routes: routes_csv.to_string(),
-                created_at: now,
-                updated_at: now,
-            }),
+            Ok(_) => {
+                audit_context::finish(tx, "user_groups", id, audit_before).await?;
+                Ok(UserGroupRow {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    routes: routes_csv.to_string(),
+                    created_at: now,
+                    updated_at: now,
+                })
+            }
             Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
                 Err(AppError::DuplicateResource("用户组名称".to_string()))
             }
@@ -124,6 +129,7 @@ impl SqliteUserGroupRepository {
         name: Option<&str>,
         routes_csv: Option<&str>,
     ) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "user_groups", id).await?;
         if name.is_none() && routes_csv.is_none() {
             return Ok(0);
         }
@@ -141,9 +147,12 @@ impl SqliteUserGroupRepository {
         }
         qb.push(" WHERE id = ");
         qb.push_bind(id);
-        let res = qb.build().execute(&self.pool).await;
+        let res = qb.build().execute(&mut *tx).await;
         match res {
-            Ok(r) => Ok(r.rows_affected()),
+            Ok(r) => {
+                audit_context::finish(tx, "user_groups", id, audit_before).await?;
+                Ok(r.rows_affected())
+            }
             Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
                 Err(AppError::DuplicateResource("用户组名称".to_string()))
             }
@@ -153,11 +162,7 @@ impl SqliteUserGroupRepository {
 
     /// 删除组:同事务删除其所有成员关联,再删组。返回删除的组行数。
     pub async fn delete(&self, id: &str) -> Result<u64> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(Box::new(e)))?;
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "user_groups", id).await?;
         sqlx::query("DELETE FROM user_group_members WHERE group_id = ?1")
             .bind(id)
             .execute(&mut *tx)
@@ -168,9 +173,7 @@ impl SqliteUserGroupRepository {
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "user_groups", id, audit_before).await?;
         Ok(res.rows_affected())
     }
 
@@ -245,11 +248,8 @@ impl SqliteUserGroupRepository {
 
     /// 全量覆盖某用户的组关联:同事务清空旧关联,插入新集合(去重)。
     pub async fn set_groups(&self, user_id: &str, group_ids: &[String]) -> Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(Box::new(e)))?;
+        let (mut tx, audit_before) =
+            audit_context::begin(&self.pool, "user_group_members", user_id).await?;
         sqlx::query("DELETE FROM user_group_members WHERE user_id = ?1")
             .bind(user_id)
             .execute(&mut *tx)
@@ -268,9 +268,7 @@ impl SqliteUserGroupRepository {
                 .await
                 .map_err(|e| AppError::Database(Box::new(e)))?;
         }
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "user_group_members", user_id, audit_before).await?;
         Ok(())
     }
 }

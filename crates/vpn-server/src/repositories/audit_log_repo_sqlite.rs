@@ -66,6 +66,9 @@ impl From<AuditLogRowTuple> for AuditLogRow {
 /// 列表查询过滤条件（已归一化：page/page_size 已套用默认值，时间窗已套用默认值）。
 #[derive(Debug, Clone)]
 pub struct AuditLogFilter {
+    pub resource: Option<String>,
+    pub outcome: Option<String>,
+    pub category: Option<String>,
     /// 起始时间（unix ms，含）
     pub from: i64,
     /// 结束时间（unix ms，含）
@@ -91,6 +94,18 @@ pub struct SqliteAuditLogRepository {
 impl SqliteAuditLogRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn actor_name(&self, id: &str) -> Result<Option<String>> {
+        let (sql, id) = match id.strip_prefix("api_key:") {
+            Some(key) => ("SELECT name FROM api_keys WHERE id=?", key),
+            None => ("SELECT username FROM users WHERE id=?", id),
+        };
+        sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(Box::new(e)))
     }
 
     /// 写入一条审计日志。
@@ -137,7 +152,7 @@ impl SqliteAuditLogRepository {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {SELECT_COLUMNS} FROM audit_logs"));
         Self::push_where(&mut qb, filter);
-        qb.push(" ORDER BY created_at DESC LIMIT ");
+        qb.push(" ORDER BY created_at DESC, id DESC LIMIT ");
         qb.push_bind(page_size as i64);
         qb.push(" OFFSET ");
         qb.push_bind(offset);
@@ -167,6 +182,27 @@ impl SqliteAuditLogRepository {
         qb.push(" AND created_at <= ");
         qb.push_bind(filter.to);
 
+        if let Some(resource) = filter.resource.as_deref().filter(|s| !s.is_empty()) {
+            qb.push(" AND instr(resource, ");
+            qb.push_bind(resource.to_string());
+            qb.push(") > 0");
+        }
+        if let Some(category) = filter.category.as_deref().filter(|s| !s.is_empty()) {
+            qb.push(" AND (action LIKE ");
+            qb.push_bind(format!("{category}.%"));
+            qb.push(" OR action LIKE ");
+            qb.push_bind(format!(r"{category}\_%"));
+            qb.push(" ESCAPE '\\')");
+        }
+        match filter.outcome.as_deref() {
+            Some("success") => {
+                qb.push(" AND (status_code BETWEEN 200 AND 399 OR action IN ('login_success','external_login_success'))");
+            }
+            Some("failed") => {
+                qb.push(" AND (status_code >= 400 OR action IN ('login_failed','external_login_failed'))");
+            }
+            _ => {}
+        }
         if let Some(user_id) = filter.user_id.as_deref().filter(|s| !s.is_empty()) {
             qb.push(" AND user_id = ");
             qb.push_bind(user_id.to_string());
@@ -218,6 +254,9 @@ mod tests {
 
     fn filter_default() -> AuditLogFilter {
         AuditLogFilter {
+            resource: None,
+            outcome: None,
+            category: None,
             from: 0,
             to: i64::MAX,
             user_id: None,

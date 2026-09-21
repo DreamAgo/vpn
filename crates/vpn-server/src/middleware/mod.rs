@@ -1,6 +1,7 @@
 //! Tower 中间件集合。
 
 pub mod audit;
+pub mod audit_context;
 pub mod auth;
 pub mod https_redirect;
 

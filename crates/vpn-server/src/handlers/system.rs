@@ -257,6 +257,23 @@ pub async fn restart_server(
         .restart_tx
         .as_ref()
         .ok_or_else(|| AppError::Config("当前运行环境不支持在线重启".to_string()))?;
+    let pool = state.db_pool()?;
+    let mut audit_tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+    crate::middleware::audit_context::record(
+        &mut audit_tx,
+        "system/restart-request",
+        serde_json::Value::Null,
+        serde_json::json!({"restart_requested":true}),
+    )
+    .await?;
+    audit_tx
+        .commit()
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+    crate::middleware::audit_context::committed();
     tx.send(true)
         .map_err(|_| AppError::Config("服务正在关闭，请稍后检查运行状态".to_string()))?;
     tracing::info!("管理员请求重启服务端");

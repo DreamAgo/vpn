@@ -46,7 +46,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/auth/first-time-setup",
-            post(handlers::auth::first_time_setup),
+            post(handlers::auth::first_time_setup)
+                .layer(from_fn_with_state(state.clone(), middleware::audit_layer)),
         )
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route(
@@ -230,6 +231,10 @@ pub fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/admin/peer-events",
                 get(handlers::peers::list_peer_events),
+            )
+            .route(
+                "/api/v1/admin/audit-health",
+                get(handlers::audit::audit_health),
             )
             // 审计中间件（内层）：在 require_auth 之后运行，故 extensions 已含 CurrentUser。
             .layer(from_fn_with_state(state.clone(), middleware::audit_layer))

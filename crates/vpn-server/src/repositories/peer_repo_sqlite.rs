@@ -1,5 +1,6 @@
 //! SQLite 实现的 PeerRepository（Epic 4：节点注册 / 心跳 / 注销 / 离线扫描）。
 
+use crate::middleware::audit_context;
 use chrono::Utc;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use vpn_core::{AppError, Result};
@@ -313,15 +314,17 @@ impl SqlitePeerRepository {
     /// 保留记录与 vpn_ip；IP 释放交由后续清理任务处理。
     // TODO(Epic 4): 增加清理任务，对 deleted 超过 24h 的 peer 释放其 vpn_ip 回 IpPool。
     pub async fn mark_deleted_by_user(&self, user_id: &str) -> Result<u64> {
+        let (mut tx, before) = audit_context::begin(&self.pool, "peers_by_user", user_id).await?;
         let now = Utc::now().timestamp_millis();
         let result = sqlx::query(
             "UPDATE peers SET status = 'deleted', online_since = NULL, updated_at = ?1 WHERE user_id = ?2 AND status != 'deleted'",
         )
         .bind(now)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "peers_by_user", user_id, before).await?;
         Ok(result.rows_affected())
     }
 
@@ -372,28 +375,32 @@ impl SqlitePeerRepository {
 
     /// 更新指定 peer 的 routed_subnets（异地组网网段编辑）。返回受影响行数。
     pub async fn update_routed_subnets(&self, id: &str, routed_subnets: &str) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "peers", id).await?;
         let now = Utc::now().timestamp_millis();
         let result =
             sqlx::query("UPDATE peers SET routed_subnets = ?1, updated_at = ?2 WHERE id = ?3")
                 .bind(routed_subnets)
                 .bind(now)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "peers", id, audit_before).await?;
         Ok(result.rows_affected())
     }
 
     /// Story 5.5：把指定 peer 标记为 'force_removed'。返回受影响行数。
     pub async fn mark_force_removed(&self, id: &str) -> Result<u64> {
+        let (mut tx, before) = audit_context::begin(&self.pool, "peers", id).await?;
         let now = Utc::now().timestamp_millis();
         let result =
             sqlx::query("UPDATE peers SET status = 'force_removed', online_since = NULL, updated_at = ?1 WHERE id = ?2")
                 .bind(now)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "peers", id, before).await?;
         Ok(result.rows_affected())
     }
 
@@ -402,27 +409,31 @@ impl SqlitePeerRepository {
     /// 与 `mark_force_removed` / `mark_deleted_by_user` 的软删除不同，这里物理删除记录，
     /// 调用方需同时摘除 WireGuard peer 并回收 VPN IP。
     pub async fn delete_by_id(&self, id: &str) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "peers", id).await?;
         let result = sqlx::query("DELETE FROM peers WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "peers", id, audit_before).await?;
         Ok(result.rows_affected())
     }
 
     /// 硬删某用户的**全部** peer 行（任意状态，含历史 'deleted' 行），返回被删行的 vpn_ip
     /// 以便调用方回收 IP。删除用户前调用以满足 `peers.user_id -> users.id` 外键（无级联）。
     pub async fn delete_all_by_user(&self, user_id: &str) -> Result<Vec<String>> {
+        let (mut tx, before) = audit_context::begin(&self.pool, "peers_by_user", user_id).await?;
         let ips: Vec<(String,)> = sqlx::query_as("SELECT vpn_ip FROM peers WHERE user_id = ?1")
             .bind(user_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
         sqlx::query("DELETE FROM peers WHERE user_id = ?1")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "peers_by_user", user_id, before).await?;
         Ok(ips.into_iter().map(|r| r.0).collect())
     }
 
@@ -860,5 +871,43 @@ mod tests {
         // p2 (has last_seen) 排前，p1 (NULL) 排后
         assert_eq!(rows[0].id, "p2");
         assert_eq!(rows[1].id, "p1");
+    }
+}
+
+#[cfg(test)]
+mod transition_audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn repeated_heartbeats_only_record_status_transitions() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,role,status,must_change_password,created_at,updated_at) VALUES('u','a','a@b.c','hash','user','active',0,0,0)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO peers(id,user_id,device_name,wg_public_key,vpn_ip,status,created_at,updated_at) VALUES('p','u','d','key','10.8.0.2','offline',0,0)").execute(&pool).await.unwrap();
+        let repo = SqlitePeerRepository::new(pool.clone());
+        repo.touch_heartbeat_by_id("p", None, None, None, 100)
+            .await
+            .unwrap();
+        repo.touch_heartbeat_by_id("p", None, None, None, 200)
+            .await
+            .unwrap();
+        repo.mark_stale_offline(201).await.unwrap();
+        repo.mark_stale_offline(201).await.unwrap();
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT old_value,new_value FROM peer_events WHERE field='status' ORDER BY created_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ("offline".into(), "online".into()),
+                ("online".into(), "offline".into())
+            ]
+        );
     }
 }

@@ -1,264 +1,121 @@
-/**
- * Story 5.8：审计日志页（ProTable）。
- *
- * - ProTable request 模式调 GET /admin/audit-logs（分页）。
- * - 筛选：时间范围 RangePicker（默认最近 7 天）+ 类型下拉 + 用户名搜索。
- * - 筛选条件同步到 URL query（useSearchParams），便于分享。
- * - 列：时间（绝对 + 相对悬停）/ 用户 / 类型（Tag 着色）/ 资源 / 状态码。
- * - 展开行显示完整 metadata（JSON.parse 后美化，失败则原样显示）。
- */
-import { useCallback, useMemo, useRef, useState } from 'react';
-import { Input, Select, DatePicker, Space, Tag, Typography, App } from 'antd';
+import { useMemo, useRef, useState } from 'react';
+import { Alert, App, Button, DatePicker, Descriptions, Input, Select, Space, Table, Tag, Typography } from 'antd';
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components';
 import { useSearchParams } from 'react-router-dom';
 import dayjs from 'dayjs';
-import relativeTime from 'dayjs/plugin/relativeTime';
-import 'dayjs/locale/zh-cn';
+import { auditApi, auditActionLabels as labels } from '@/services/audit';
+import type { AuditLogDto, AuditLogQuery } from '@/types/api';
 
-import { auditApi } from '@/services/audit';
-import { ApiError } from '@/services/http';
-import type { AuditLogDto } from '@/types/api';
-import { codeFontFamily } from '@/theme';
 
-dayjs.extend(relativeTime);
-dayjs.locale('zh-cn');
-
-const { Title, Text } = Typography;
-const { RangePicker } = DatePicker;
-
-/** action → Tag 颜色。未知类型用默认色。 */
-function actionColor(action: string): string {
-  const a = action.toLowerCase();
-  if (a.includes('login') || a.includes('logout') || a.includes('auth')) return 'blue';
-  if (a.includes('create') || a.includes('register') || a.includes('add')) return 'green';
-  if (a.includes('delete') || a.includes('remove') || a.includes('force')) return 'red';
-  if (a.includes('update') || a.includes('change') || a.includes('reset') || a.includes('patch'))
-    return 'orange';
-  return 'default';
+function metadata(record: AuditLogDto): Record<string, unknown> {
+  try { const value = JSON.parse(record.metadata ?? '{}'); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
+  catch { return {}; }
 }
-
-function describeError(err: unknown, fallback: string): string {
-  if (err instanceof ApiError) return err.message || fallback;
-  return fallback;
+function outcome(record: AuditLogDto): string {
+  const data = metadata(record);
+  if (data.outcome === 'committed') return '已提交';
+  if (data.outcome === 'failed' || (record.statusCode ?? 0) >= 400 || record.action.endsWith('_failed')) return '失败';
+  if (data.outcome === 'success' || (record.statusCode != null && record.statusCode >= 200 && record.statusCode < 400) || record.action.endsWith('_success')) return '成功';
+  return '历史记录未提供';
 }
-
-/** 美化 metadata：JSON 则缩进展示，否则原样。 */
-function MetadataView({ metadata }: { metadata: string | null }) {
-  if (!metadata) return <Text type="secondary">无附加信息</Text>;
-  let display: string;
-  try {
-    display = JSON.stringify(JSON.parse(metadata), null, 2);
-  } catch {
-    display = metadata;
-  }
-  return (
-    <pre
-      style={{
-        fontFamily: codeFontFamily,
-        fontSize: 12,
-        margin: 0,
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-all',
-        background: 'var(--code-bg)',
-        border: '1px solid var(--code-border)',
-        color: 'var(--code-text)',
-        padding: 12,
-        borderRadius: 4,
-      }}
-    >
-      {display}
-    </pre>
-  );
+const display = (value: unknown) => value === undefined ? '—' : JSON.stringify(value);
+function Details({ record }: { record: AuditLogDto }) {
+  const data = metadata(record);
+  const changes = data.changes && typeof data.changes === 'object' && !Array.isArray(data.changes)
+    ? Object.entries(data.changes).map(([field, value]) => ({field, ...(value && typeof value === 'object' ? value : {})})) as {field:string;before?:unknown;after?:unknown;changed?:boolean}[] : [];
+  return <Space direction="vertical" style={{width:'100%'}}>
+    <Descriptions size="small" column={2} items={[
+      {key:'actor',label:'操作者 ID',children:record.userId ?? '未提供'},
+      {key:'ip',label:'来源 IP',children:record.ipAddr ?? '未提供'},
+      {key:'request',label:'请求 ID',children:String(data.request_id ?? '历史记录未提供')},
+      {key:'status',label:'HTTP 状态',children:record.statusCode ?? '未提供'},
+      {key:'agent',label:'客户端',children:record.userAgent ?? '未提供'},
+      {key:'reason',label:'结果说明',children:String(data.reason ?? data.reason_code ?? (data.outcome === 'committed' ? '数据库变更已提交；运行时应用失败会另记失败记录' : '—'))},
+    ]}/>
+    {changes.length > 0 ? <Table size="small" pagination={false} rowKey="field" dataSource={changes} columns={[
+      {title:'变更字段',dataIndex:'field'},
+      {title:'变更前',render:(_,r)=>r.changed ? '敏感值不记录' : display(r.before)},
+      {title:'变更后',render:(_,r)=>r.changed ? '已变更' : display(r.after)},
+    ]}/> : <Space direction="vertical"><Typography.Text type="secondary">此记录未提供字段差异。</Typography.Text>
+      {record.action === 'grant.expiry.update' && data.before !== undefined && <pre>{JSON.stringify({before:data.before,expires_at:data.expires_at},null,2)}</pre>}</Space>}
+  </Space>;
 }
-
-const DEFAULT_DAYS = 7;
+// Export only an explicit safe column set; raw metadata and HTTP headers are never exported.
+function csvCell(value: unknown): string {
+  let text = String(value ?? '');
+  if (/^[\s]*[=+@-]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"','""')}"`;
+}
 
 export function AuditLogsPage() {
   const { message } = App.useApp();
+  const [params,setParams] = useSearchParams();
   const actionRef = useRef<ActionType>(null);
-  const [searchParams, setSearchParams] = useSearchParams();
-
-  // 从 URL 初始化筛选状态（默认最近 7 天）。
-  const initFrom = searchParams.get('from');
-  const initTo = searchParams.get('to');
-  const [range, setRange] = useState<[dayjs.Dayjs, dayjs.Dayjs] | null>(() => {
-    if (initFrom && initTo) {
-      return [dayjs(Number(initFrom)), dayjs(Number(initTo))];
-    }
-    return [dayjs().subtract(DEFAULT_DAYS, 'day').startOf('day'), dayjs().endOf('day')];
-  });
-  const [action, setAction] = useState<string | undefined>(
-    searchParams.get('action') ?? undefined
-  );
-  const [usernameInput, setUsernameInput] = useState(searchParams.get('username') ?? '');
-  const [username, setUsername] = useState<string>(searchParams.get('username') ?? '');
-  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const reload = useCallback(() => actionRef.current?.reload(), []);
-
-  // 将当前筛选写回 URL。
-  const syncUrl = useCallback(
-    (next: {
-      range?: [dayjs.Dayjs, dayjs.Dayjs] | null;
-      action?: string;
-      username?: string;
-    }) => {
-      const r = next.range !== undefined ? next.range : range;
-      const a = next.action !== undefined ? next.action : action;
-      const u = next.username !== undefined ? next.username : username;
-      const params: Record<string, string> = {};
-      if (r) {
-        params.from = String(r[0].valueOf());
-        params.to = String(r[1].valueOf());
-      }
-      if (a) params.action = a;
-      if (u) params.username = u;
-      setSearchParams(params, { replace: true });
-    },
-    [range, action, username, setSearchParams]
-  );
-
-  const handleUsernameChange = (value: string) => {
-    setUsernameInput(value);
-    if (debounceTimer.current) clearTimeout(debounceTimer.current);
-    debounceTimer.current = setTimeout(() => {
-      const v = value.trim();
-      setUsername(v);
-      syncUrl({ username: v });
-      reload();
-    }, 300);
+  const [healthWarning,setHealthWarning] = useState<string>();
+  const [exporting,setExporting] = useState(false);
+  const [defaults] = useState(()=>({from:dayjs().subtract(7,'day').startOf('day').valueOf(),to:dayjs().endOf('day').valueOf()}));
+  const query: AuditLogQuery = useMemo(()=>({
+    from:Number(params.get('from')) || defaults.from, to:Number(params.get('to')) || defaults.to,
+    action:params.get('action') || undefined, username:params.get('username') || undefined,
+    userId:params.get('userId') || undefined, resource:params.get('resource') || undefined,
+    outcome:params.get('outcome') || undefined, category:params.get('category') || undefined,
+  }),[params,defaults]);
+  const filter = (values: Record<string,string|undefined>) => {
+    const next = new URLSearchParams(params);
+    for (const [key,value] of Object.entries(values)) {if(value) next.set(key,value);else next.delete(key);}
+    setParams(next,{replace:true});
   };
-
-  const columns = useMemo<ProColumns<AuditLogDto>[]>(
-    () => [
-      {
-        title: '时间',
-        dataIndex: 'createdAt',
-        width: 180,
-        render: (_, record) => (
-          <span title={dayjs(record.createdAt).fromNow()}>
-            {dayjs(record.createdAt).format('YYYY-MM-DD HH:mm:ss')}
-          </span>
-        ),
-      },
-      {
-        title: '用户',
-        dataIndex: 'username',
-        width: 140,
-        ellipsis: true,
-        render: (_, record) => record.username ?? <Text type="secondary">—</Text>,
-      },
-      {
-        title: '类型',
-        dataIndex: 'action',
-        width: 160,
-        render: (_, record) => <Tag color={actionColor(record.action)}>{record.action}</Tag>,
-      },
-      {
-        title: '资源',
-        dataIndex: 'resource',
-        ellipsis: true,
-      },
-      {
-        title: '状态码',
-        dataIndex: 'statusCode',
-        width: 90,
-        render: (_, record) =>
-          record.statusCode != null ? (
-            <Tag color={record.statusCode < 400 ? 'success' : 'error'}>{record.statusCode}</Tag>
-          ) : (
-            <Text type="secondary">—</Text>
-          ),
-      },
-    ],
-    []
-  );
-
-  return (
-    <div>
-      <Title level={4} style={{ marginBottom: 16 }}>
-        审计日志
-      </Title>
-
-      <ProTable<AuditLogDto>
-        scroll={{ x: 960 }}
-        actionRef={actionRef}
-        rowKey="id"
-        columns={columns}
-        search={false}
-        options={{ reload: true, density: false, setting: false }}
-        pagination={{ defaultPageSize: 20, showSizeChanger: true }}
-        expandable={{
-          expandedRowRender: (record) => <MetadataView metadata={record.metadata} />,
-        }}
-        toolbar={{
-          search: (
-            <Space wrap>
-              <RangePicker
-                showTime
-                allowClear={false}
-                value={range}
-                style={{ width: 360 }}
-                onChange={(v) => {
-                  const next = v && v[0] && v[1] ? ([v[0], v[1]] as [dayjs.Dayjs, dayjs.Dayjs]) : null;
-                  setRange(next);
-                  syncUrl({ range: next });
-                  reload();
-                }}
-              />
-              <Select
-                allowClear
-                placeholder="类型"
-                value={action}
-                style={{ width: 160 }}
-                onChange={(v) => {
-                  setAction(v);
-                  syncUrl({ action: v });
-                  reload();
-                }}
-                options={[
-                  { value: 'login', label: '登录' },
-                  { value: 'logout', label: '登出' },
-                  { value: 'user.create', label: '创建用户' },
-                  { value: 'user.update', label: '更新用户' },
-                  { value: 'user.delete', label: '删除用户' },
-                  { value: 'peer.register', label: '节点注册' },
-                  { value: 'peer.force_remove', label: '强制下线' },
-                  { value: 'password.change', label: '修改密码' },
-                  { value: 'password.reset', label: '重置密码' },
-                ]}
-              />
-              <Input.Search
-                allowClear
-                placeholder="搜索用户名"
-                value={usernameInput}
-                onChange={(e) => handleUsernameChange(e.target.value)}
-                style={{ width: 200 }}
-              />
-            </Space>
-          ),
-        }}
-        request={async (params) => {
-          try {
-            const page = await auditApi.listAuditLogs({
-              page: params.current,
-              pageSize: params.pageSize,
-              from: range ? range[0].valueOf() : undefined,
-              to: range ? range[1].valueOf() : undefined,
-              action: action || undefined,
-              username: username || undefined,
-            });
-            return {
-              data: page.items,
-              total: page.total,
-              success: true,
-            };
-          } catch (err) {
-            message.error(describeError(err, '加载审计日志失败'));
-            return { data: [], total: 0, success: false };
-          }
-        }}
-      />
-    </div>
-  );
+  const columns: ProColumns<AuditLogDto>[] = [
+    {title:'时间',dataIndex:'createdAt',width:180,render:(_,r)=>dayjs(r.createdAt).format('YYYY-MM-DD HH:mm:ss')},
+    {title:'操作者',dataIndex:'username',render:(_,r)=>r.username ?? r.userId ?? '未识别'},
+    {title:'操作',dataIndex:'action',render:(_,r)=><span title={r.action}>{labels[r.action] ?? r.action}</span>},
+    {title:'目标',dataIndex:'resource',ellipsis:true},
+    {title:'来源 IP',dataIndex:'ipAddr'},
+    {title:'结果',render:(_,r)=><Tag color={outcome(r)==='失败'?'error':outcome(r)==='历史记录未提供'?'default':'success'}>{outcome(r)}</Tag>},
+  ];
+  const exportLogs = async () => {
+    setExporting(true);
+    try {
+      const rows: AuditLogDto[]=[];
+      const frozen = {...query,to:Math.min(query.to ?? Date.now(),Date.now())};
+      for(let page=1;page<=100;page++) {
+        const data=await auditApi.listAuditLogs({...frozen,page,pageSize:100});
+        if(data.total>10000) throw new Error('结果超过 10000 条，请缩小筛选范围后导出');
+        rows.push(...data.items);
+        if(rows.length>=data.total || !data.items.length) break;
+      }
+      const lines=[['时间','操作者','操作者ID','操作','目标','来源IP','结果','HTTP状态','请求ID'],...rows.map(r=>[
+        dayjs(r.createdAt).format('YYYY-MM-DD HH:mm:ss'),r.username,r.userId,labels[r.action] ?? r.action,r.resource,r.ipAddr,outcome(r),r.statusCode,metadata(r).request_id,
+      ])];
+      const url=URL.createObjectURL(new Blob(['\uFEFF'+lines.map(row=>row.map(csvCell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}));
+      const link=document.createElement('a');link.href=url;link.download='audit-logs.csv';link.click();
+      setTimeout(()=>URL.revokeObjectURL(url),1000);
+    } catch(error) {message.error(error instanceof Error?error.message:'导出失败');}
+    finally {setExporting(false);}
+  };
+  return <div>
+    <Typography.Title level={4}>审计日志</Typography.Title>
+    {healthWarning && <Alert type="warning" showIcon message={healthWarning} style={{marginBottom:12}}/>}
+    <ProTable<AuditLogDto,AuditLogQuery> rowKey="id" columns={columns} actionRef={actionRef} params={query}
+      search={false} scroll={{x:1100}} pagination={{defaultPageSize:20,showSizeChanger:true}}
+      expandable={{expandedRowRender:r=><Details record={r}/>}}
+      toolBarRender={()=>[<Button key="export" loading={exporting} onClick={exportLogs}>导出筛选结果（脱敏 CSV）</Button>]}
+      toolbar={{search:<Space wrap>
+        <DatePicker.RangePicker showTime allowClear={false} value={[dayjs(query.from),dayjs(query.to)]}
+          onChange={r=>r?.[0]&&r[1]&&filter({from:String(r[0].valueOf()),to:String(r[1].valueOf())})}/>
+        <Select allowClear showSearch optionFilterProp="label" placeholder="操作" style={{width:180}} value={query.action}
+          options={Object.entries(labels).map(([value,label])=>({value,label}))} onChange={value=>filter({action:value})}/>
+        <Select allowClear placeholder="结果" style={{width:100}} value={query.outcome} options={[{value:'success',label:'成功/已提交'},{value:'failed',label:'失败'}]} onChange={value=>filter({outcome:value})}/>
+        <Select allowClear placeholder="类别" style={{width:130}} value={query.category} options={[
+          ['network','网络/DNS'],['user','用户'],['group','用户组'],['peer','节点'],['backup','备份'],['api_key','API 密钥'],['notification','通知'],['integration','集成'],['system','系统'],['login','登录'],
+        ].map(([value,label])=>({value,label}))} onChange={value=>filter({category:value})}/>
+        <Input.Search key={`name-${query.username ?? ''}`} allowClear placeholder="用户名 / 密钥名称" defaultValue={query.username} onSearch={value=>filter({username:value})} style={{width:190}}/>
+        <Input.Search key={`id-${query.userId ?? ''}`} allowClear placeholder="操作者 ID" defaultValue={query.userId} onSearch={value=>filter({userId:value})} style={{width:170}}/>
+        <Input.Search key={`resource-${query.resource ?? ''}`} allowClear placeholder="目标 ID / 路径" defaultValue={query.resource} onSearch={value=>filter({resource:value})} style={{width:190}}/>
+      </Space>}}
+      request={async p=>{try{
+        try {const h=await auditApi.health();setHealthWarning(h.failedWrites || h.failedTransactionWrites || h.droppedEvents ? `本次运行：审计写入失败 ${h.failedWrites} 次，业务回滚 ${h.failedTransactionWrites} 次，过载丢弃 ${h.droppedEvents} 条，请检查服务端日志。` : undefined);} catch {setHealthWarning('无法读取审计健康状态');}
+        const page=await auditApi.listAuditLogs({...query,page:p.current,pageSize:p.pageSize});return {data:page.items,total:page.total,success:true};}
+        catch{message.error('加载审计日志失败');return {data:[],total:0,success:false};}}}/>
+  </div>;
 }

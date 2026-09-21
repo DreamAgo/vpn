@@ -415,6 +415,9 @@ pub async fn openapi_json() -> Json<Value> {
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
                 }
             },
+            "/api/v1/admin/audit-health": {
+                "get": {"tags":["Audit"],"summary":"审计写入健康计数（进程启动后累计，管理员）","responses":{"200":{"$ref":"#/components/responses/Envelope"}}}
+            },
             "/api/v1/admin/audit-logs": {
                 "get": {
                     "tags": ["Audit"],
@@ -422,10 +425,12 @@ pub async fn openapi_json() -> Json<Value> {
                     "parameters": [
                         { "$ref": "#/components/parameters/Page" },
                         { "$ref": "#/components/parameters/PageSize" },
-                        { "name": "actor_id", "in": "query", "schema": { "type": "string" } },
+                        { "name": "user_id", "in": "query", "schema": { "type": "string" } },
                         { "name": "action", "in": "query", "schema": { "type": "string" } },
                         { "name": "resource", "in": "query", "schema": { "type": "string" } },
-                        { "name": "status_code", "in": "query", "schema": { "type": "integer" } },
+                        { "name": "username", "in": "query", "schema": { "type": "string" } },
+                        { "name": "category", "in": "query", "schema": { "type": "string" } },
+                        { "name": "outcome", "in": "query", "schema": { "type": "string", "enum": ["success", "failed"] } },
                         { "name": "from", "in": "query", "schema": { "type": "integer", "format": "int64" } },
                         { "name": "to", "in": "query", "schema": { "type": "integer", "format": "int64" } }
                     ],

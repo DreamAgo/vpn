@@ -1,5 +1,6 @@
 //! SQLite 实现的 UserRepository。
 
+use crate::middleware::audit_context;
 use chrono::Utc;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::sync::Arc;
@@ -412,6 +413,7 @@ impl SqliteUserRepository {
         must_change_password: bool,
         max_devices: i64,
     ) -> Result<UserRow> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "users", id).await?;
         let now = Utc::now().timestamp_millis();
         let must_change = if must_change_password { 1 } else { 0 };
         let result = sqlx::query(
@@ -426,25 +428,28 @@ impl SqliteUserRepository {
         .bind(must_change)
         .bind(max_devices)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
 
         match result {
-            Ok(_) => Ok(UserRow {
-                id: id.to_string(),
-                username: username.to_string(),
-                email: email.to_string(),
-                password_hash: password_hash.to_string(),
-                role: role.to_string(),
-                status: "active".to_string(),
-                must_change_password,
-                last_login_at: None,
-                created_at: now,
-                updated_at: now,
-                max_devices,
-                access_mode: "legacy".to_string(),
-                group_ids: Vec::new(),
-            }),
+            Ok(_) => {
+                audit_context::finish(tx, "users", id, audit_before).await?;
+                Ok(UserRow {
+                    id: id.to_string(),
+                    username: username.to_string(),
+                    email: email.to_string(),
+                    password_hash: password_hash.to_string(),
+                    role: role.to_string(),
+                    status: "active".to_string(),
+                    must_change_password,
+                    last_login_at: None,
+                    created_at: now,
+                    updated_at: now,
+                    max_devices,
+                    access_mode: "legacy".to_string(),
+                    group_ids: Vec::new(),
+                })
+            }
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 Err(AppError::DuplicateResource("用户名或邮箱".to_string()))
             }
@@ -458,6 +463,7 @@ impl SqliteUserRepository {
         new_hash: &str,
         clear_must_change: bool,
     ) -> Result<()> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "users", id).await?;
         let now = Utc::now().timestamp_millis();
         let must_change = if clear_must_change { 0 } else { 1 };
         sqlx::query(
@@ -467,9 +473,10 @@ impl SqliteUserRepository {
         .bind(must_change)
         .bind(now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "users", id, audit_before).await?;
         Ok(())
     }
 
@@ -496,28 +503,32 @@ impl SqliteUserRepository {
 
     /// 更新终端数量上限。返回受影响行数（0 表示用户不存在）。
     pub async fn update_max_devices(&self, id: &str, max_devices: i64) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "users", id).await?;
         let now = Utc::now().timestamp_millis();
         let result =
             sqlx::query("UPDATE users SET max_devices = ?1, updated_at = ?2 WHERE id = ?3")
                 .bind(max_devices)
                 .bind(now)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "users", id, audit_before).await?;
         Ok(result.rows_affected())
     }
 
     /// 更新用户状态（"active" | "disabled"）。返回受影响行数（0 表示用户不存在）。
     pub async fn update_status(&self, id: &str, status: &str) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "users", id).await?;
         let now = Utc::now().timestamp_millis();
         let result = sqlx::query("UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(status)
             .bind(now)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "users", id, audit_before).await?;
         Ok(result.rows_affected())
     }
 
@@ -526,11 +537,7 @@ impl SqliteUserRepository {
     /// 任一步失败则回滚。
     // TODO(Epic 4): 级联删除该用户 peers + WireGuard runtime 清理
     pub async fn delete_with_sessions(&self, id: &str) -> Result<u64> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(Box::new(e)))?;
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "users", id).await?;
 
         sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
             .bind(id)
@@ -544,11 +551,33 @@ impl SqliteUserRepository {
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "users", id, audit_before).await?;
 
         Ok(result.rows_affected())
+    }
+
+    pub async fn update_admin_fields(
+        &self,
+        id: &str,
+        status: Option<&str>,
+        max_devices: Option<i64>,
+    ) -> Result<()> {
+        let (mut tx, before) = audit_context::begin(&self.pool, "users", id).await?;
+        let result = sqlx::query("UPDATE users SET status=COALESCE(?,status),max_devices=COALESCE(?,max_devices),updated_at=? WHERE id=?")
+            .bind(status).bind(max_devices).bind(Utc::now().timestamp_millis()).bind(id)
+            .execute(&mut *tx).await.map_err(|e|AppError::Database(Box::new(e)))?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::UserNotFound);
+        }
+        if status == Some("disabled") {
+            sqlx::query("UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL")
+                .bind(Utc::now().timestamp_millis())
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(Box::new(e)))?;
+        }
+        audit_context::finish(tx, "users", id, before).await
     }
 
     /// 统计符合过滤条件的用户总数（用于分页 total）。

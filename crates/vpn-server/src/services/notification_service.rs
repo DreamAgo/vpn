@@ -142,71 +142,61 @@ impl NotificationService {
             }
         }
 
-        config_store
-            .set_bool(KEY_NOTIFY_EMAIL_ENABLED, req.enabled)
-            .await?;
-        config_store
-            .set_string(KEY_NOTIFY_SMTP_HOST, smtp_host.as_deref())
-            .await?;
-        config_store
-            .set_u16(KEY_NOTIFY_SMTP_PORT, req.smtp_port)
-            .await?;
-        config_store
-            .set_string(KEY_NOTIFY_SMTP_USERNAME, smtp_username.as_deref())
-            .await?;
+        let mut values: Vec<(String, String)> = vec![
+            (KEY_NOTIFY_EMAIL_ENABLED.into(), req.enabled.to_string()),
+            (KEY_NOTIFY_SMTP_HOST.into(), smtp_host.unwrap_or_default()),
+            (KEY_NOTIFY_SMTP_PORT.into(), req.smtp_port.to_string()),
+            (
+                KEY_NOTIFY_SMTP_USERNAME.into(),
+                smtp_username.unwrap_or_default(),
+            ),
+            (KEY_NOTIFY_EMAIL_FROM.into(), from.unwrap_or_default()),
+            (KEY_NOTIFY_EMAIL_TO.into(), recipients.join(",")),
+            (KEY_NOTIFY_QUIET_MINUTES.into(), quiet_minutes.to_string()),
+            (
+                KEY_NOTIFY_GATEWAY_OFFLINE.into(),
+                req.gateway_offline_enabled.to_string(),
+            ),
+            (
+                KEY_NOTIFY_GATEWAY_RECOVERED.into(),
+                req.gateway_recovered_enabled.to_string(),
+            ),
+        ];
         if let Some(password) = req.smtp_password {
-            config_store
-                .set_string(KEY_NOTIFY_SMTP_PASSWORD, Some(password.trim()))
-                .await?;
+            values.push((KEY_NOTIFY_SMTP_PASSWORD.into(), password.trim().into()));
         } else if current.smtp_password.is_none() {
-            config_store
-                .set_string(KEY_NOTIFY_SMTP_PASSWORD, None)
-                .await?;
+            values.push((KEY_NOTIFY_SMTP_PASSWORD.into(), String::new()));
         }
-        config_store
-            .set_string(KEY_NOTIFY_EMAIL_FROM, from.as_deref())
-            .await?;
-        config_store
-            .set_csv(KEY_NOTIFY_EMAIL_TO, &recipients)
-            .await?;
-        config_store
-            .set_u32(KEY_NOTIFY_QUIET_MINUTES, quiet_minutes)
-            .await?;
-        config_store
-            .set_bool(KEY_NOTIFY_GATEWAY_OFFLINE, req.gateway_offline_enabled)
-            .await?;
-        config_store
-            .set_bool(KEY_NOTIFY_GATEWAY_RECOVERED, req.gateway_recovered_enabled)
-            .await?;
-        self.save_http_channel(
-            config_store,
-            KEY_NOTIFY_WEBHOOK_ENABLED,
-            KEY_NOTIFY_WEBHOOK_URL,
-            &req.webhook,
-        )
-        .await?;
-        self.save_http_channel(
-            config_store,
-            KEY_NOTIFY_FEISHU_ENABLED,
-            KEY_NOTIFY_FEISHU_URL,
-            &req.feishu,
-        )
-        .await?;
-        self.save_http_channel(
-            config_store,
-            KEY_NOTIFY_DINGTALK_ENABLED,
-            KEY_NOTIFY_DINGTALK_URL,
-            &req.dingtalk,
-        )
-        .await?;
-
+        for (enabled_key, url_key, channel) in [
+            (
+                KEY_NOTIFY_WEBHOOK_ENABLED,
+                KEY_NOTIFY_WEBHOOK_URL,
+                &req.webhook,
+            ),
+            (
+                KEY_NOTIFY_FEISHU_ENABLED,
+                KEY_NOTIFY_FEISHU_URL,
+                &req.feishu,
+            ),
+            (
+                KEY_NOTIFY_DINGTALK_ENABLED,
+                KEY_NOTIFY_DINGTALK_URL,
+                &req.dingtalk,
+            ),
+        ] {
+            values.push((enabled_key.into(), channel.enabled.to_string()));
+            values.push((
+                url_key.into(),
+                channel.url.as_deref().unwrap_or("").trim().into(),
+            ));
+        }
         if let Some(template) = &req.approval_email_template {
-            let json =
-                serde_json::to_string(template).map_err(|e| AppError::Internal(Box::new(e)))?;
-            config_store
-                .set_string(KEY_APPROVAL_TEMPLATE, Some(&json))
-                .await?;
+            values.push((
+                KEY_APPROVAL_TEMPLATE.into(),
+                serde_json::to_string(template).map_err(|e| AppError::Internal(Box::new(e)))?,
+            ));
         }
+        config_store.set_many(&values).await?;
         let updated = self.effective_config().await?;
         let rules = self.rules().await?;
         let channels = self.http_channels().await?;
@@ -549,19 +539,6 @@ impl NotificationService {
         let enabled = config_store.get_bool(enabled_key, false).await?;
         let url = config_store.get_string(url_key).await?;
         Ok(HttpNotificationChannelSettings { enabled, url })
-    }
-
-    async fn save_http_channel(
-        &self,
-        config_store: &ConfigService,
-        enabled_key: &str,
-        url_key: &str,
-        channel: &HttpNotificationChannelSettings,
-    ) -> Result<()> {
-        config_store.set_bool(enabled_key, channel.enabled).await?;
-        config_store
-            .set_string(url_key, channel.url.as_deref())
-            .await
     }
 
     fn event_repo(&self) -> Result<&SqliteNotificationEventRepository> {

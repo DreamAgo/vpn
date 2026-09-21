@@ -114,7 +114,7 @@ async fn setup_with_restart(
             SqliteSystemConfigRepository::new(pool.clone()),
             SqliteUserGroupRepository::new(pool.clone()),
             SqliteUserRepository::new(pool.clone()),
-            SqlitePeerEventRepository::new(pool),
+            SqlitePeerEventRepository::new(pool.clone()),
             Arc::new(vpn_wireguard::NoopWireGuardControl::new("SERVER_PUB")),
             vpn_wireguard::IpPool::new("10.8.0.0/24".parse().unwrap()),
             "vpn.example.com:51820".into(),
@@ -127,6 +127,11 @@ async fn setup_with_restart(
         .with_user_service(user_service)
         .with_peer_service(peer_service)
         .with_network_settings_service(network_settings_service);
+    state = state
+        .with_db_pool(pool.clone())
+        .with_audit_service(Arc::new(vpn_server::services::AuditService::new(
+            vpn_server::repositories::SqliteAuditLogRepository::new(pool.clone()),
+        )));
     state.restart_tx = restart_tx;
     let app = build_router(state);
     let (_, setup_body) = request(
@@ -362,6 +367,32 @@ async fn legacy_split_dns_api_saves_global_and_retains_server_resolution_rules()
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, audit) = request(
+        &app,
+        "GET",
+        "/api/v1/admin/audit-logs?category=network",
+        None,
+        Some(&admin_token),
+    )
+    .await;
+    let events = audit["data"]["items"].as_array().unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "one committed DNS change and one failed attempt: {audit}"
+    );
+    let change = events
+        .iter()
+        .find(|r| r["action"] == "network.dns.update")
+        .unwrap();
+    assert_eq!(change["username"], "admin");
+    let metadata: Value = serde_json::from_str(change["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        metadata["changes"]["system_config.network_settings_v3.settings.dns.mode"],
+        json!({"before":"disabled","after":"global"})
+    );
+    assert_eq!(events.iter().filter(|e| e["status_code"] == 200).count(), 1);
+
     let mut disabled = updated["data"]["desired"].clone();
     disabled["dns"]["mode"] = json!("disabled");
     let (status, response) = request(

@@ -5,7 +5,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
 
-import { auditApi } from '@/services/audit';
+import { auditApi, auditActionLabels } from '@/services/audit';
 import { peersApi } from '@/services/peers';
 import type { AuditLogDto, PeerEventView } from '@/types/api';
 
@@ -41,8 +41,8 @@ function auditToItem(item: AuditLogDto): NotificationItem {
   return {
     id: `audit:${item.id}`,
     type: 'audit',
-    title: failed ? `操作失败：${item.action}` : item.action,
-    detail: `${item.username ?? '系统'} · ${item.resource}`,
+    title: failed ? `操作失败：${auditActionLabels[item.action] ?? item.action}` : (auditActionLabels[item.action] ?? item.action),
+    detail: `${item.username ?? item.userId ?? '未识别'} · ${item.resource}`,
     createdAt: item.createdAt,
     tone: failed ? 'red' : actionTone(item.action),
   };

@@ -17,6 +17,7 @@ use crate::services::{
 #[derive(Clone)]
 pub struct AppState {
     pub clock: Arc<dyn Clock>,
+    pub trusted_proxies: Vec<std::net::IpAddr>,
     pub restart_tx: Option<tokio::sync::watch::Sender<bool>>,
     pub auth_service: Option<Arc<AuthService>>,
     pub feishu_directory_service: Option<Arc<crate::services::FeishuDirectoryService>>,
@@ -43,6 +44,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             clock: Arc::new(SystemClock),
+            trusted_proxies: Vec::new(),
             restart_tx: None,
             auth_service: None,
             feishu_auth_service: None,

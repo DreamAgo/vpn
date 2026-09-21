@@ -26,3 +26,15 @@ pub async fn list_audit_logs(
         state.clock.now_unix_ms(),
     )))
 }
+
+/// Process-local counters for best-effort auth/fallback audit delivery.
+pub async fn audit_health(
+    State(state): State<AppState>,
+    RequireAdmin(_): RequireAdmin,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    Ok(Json(ApiResponse::success(
+        state.audit_service()?.health(),
+        "n/a".into(),
+        state.clock.now_unix_ms(),
+    )))
+}

@@ -19,6 +19,53 @@ const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 /// 用法：`.layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))`
 pub async fn require_auth(
     axum::extract::State(state): axum::extract::State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let path = request.uri().path().to_string();
+    let ip = super::audit::client_ip(
+        request.headers(),
+        request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|p| p.0),
+        &state.trusted_proxies,
+    );
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().take(128).collect::<String>());
+    let user_agent = request
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().take(512).collect::<String>());
+    let result = authenticate(axum::extract::State(state.clone()), request, next).await;
+    if let (Err(error), Some(audit)) = (&result, &state.audit_service) {
+        audit
+            .log(
+                crate::repositories::AuditLogEntry {
+                    action: "auth.rejected".into(),
+                    resource: path,
+                    user_agent,
+                    ip_addr: ip,
+                    status_code: Some(crate::error::status_code(&error.inner).as_u16() as i32),
+                    metadata: Some(
+                        serde_json::json!({"outcome":"failed","reason_code":error.inner.code(),"request_id":request_id})
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+                state.clock.now_unix_ms(),
+            )
+            .await;
+    }
+    result
+}
+
+async fn authenticate(
+    axum::extract::State(state): axum::extract::State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {

@@ -2,6 +2,10 @@
 //!
 //! 写入是「尽力而为」：失败仅降级为 tracing::warn，不阻塞主请求路径。
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use uuid::Uuid;
 use vpn_api_types::{
     audit::{AuditLogDto, AuditLogQuery},
@@ -21,81 +25,60 @@ const MAX_PAGE_SIZE: u32 = 100;
 #[derive(Clone)]
 pub struct AuditService {
     repo: SqliteAuditLogRepository,
+    failed_writes: Arc<AtomicU64>,
+    dropped_events: Arc<AtomicU64>,
+    writers: Arc<tokio::sync::Semaphore>,
 }
 
 impl AuditService {
     pub fn new(repo: SqliteAuditLogRepository) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            failed_writes: Arc::new(AtomicU64::new(0)),
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            writers: Arc::new(tokio::sync::Semaphore::new(16)),
+        }
     }
 
-    /// 写入一条审计日志。失败不返回错误，仅 warn（审计不应阻塞业务）。
+    pub async fn actor_name(&self, id: &str) -> Option<String> {
+        self.repo.actor_name(id).await.ok().flatten()
+    }
+    pub fn health(&self) -> serde_json::Value {
+        serde_json::json!({"failed_writes":self.failed_writes.load(Ordering::Relaxed),"failed_transaction_writes":crate::middleware::audit_context::FAILED_TRANSACTION_WRITES.load(Ordering::Relaxed),"dropped_events":self.dropped_events.load(Ordering::Relaxed)})
+    }
+    /// Only fallback/auth events are best effort; critical changes use the business transaction.
     pub async fn log(&self, entry: AuditLogEntry, now_ms: i64) {
+        let Ok(_permit) = self.writers.try_acquire() else {
+            let count = self.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                tracing::warn!(dropped_events = count, "审计事件并发写入已达上限");
+            }
+            return;
+        };
         let id = Uuid::now_v7().to_string();
         if let Err(e) = self.repo.insert(&id, &entry, now_ms).await {
+            self.failed_writes.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(error = ?e, action = %entry.action, "审计日志写入失败（已降级，不影响主流程）");
         }
     }
 
-    /// 记录登录尝试（成功/失败）。username 总是已知；失败时 user_id 为 None。
-    pub async fn log_login_attempt(
+    pub async fn log_auth(
         &self,
-        username: &str,
+        mut entry: AuditLogEntry,
         success: bool,
-        reason: Option<&str>,
-        ip: Option<&str>,
-        now_ms: i64,
+        error: Option<&vpn_core::AppError>,
+        request_id: Option<&str>,
+        now: i64,
     ) {
-        let action = if success {
-            "login_success"
-        } else {
-            "login_failed"
-        };
-        let metadata = reason.map(|r| format!(r#"{{"reason":"{}"}}"#, r.replace('"', "'")));
-        let entry = AuditLogEntry {
-            user_id: None,
-            username: Some(username.to_string()),
-            action: action.to_string(),
-            resource: "/api/v1/auth/login".to_string(),
-            ip_addr: ip.map(|s| s.to_string()),
-            user_agent: None,
-            metadata,
-            status_code: None,
-        };
-        self.log(entry, now_ms).await;
-    }
-
-    pub async fn log_external_login_attempt(
-        &self,
-        provider: &str,
-        success: bool,
-        reason: Option<&str>,
-        ip: Option<&str>,
-        user_agent: Option<&str>,
-        now_ms: i64,
-    ) {
-        let metadata = serde_json::json!({
-            "provider": provider,
-            "reason": reason,
-        });
-        self.log(
-            AuditLogEntry {
-                user_id: None,
-                username: None,
-                action: if success {
-                    "external_login_success"
-                } else {
-                    "external_login_failed"
-                }
-                .to_string(),
-                resource: "/api/v1/auth/feishu/poll".to_string(),
-                ip_addr: ip.map(str::to_string),
-                user_agent: user_agent.map(str::to_string),
-                metadata: Some(metadata.to_string()),
-                status_code: None,
-            },
-            now_ms,
-        )
-        .await;
+        entry.status_code = Some(
+            error
+                .map(|e| crate::error::status_code(e).as_u16() as i32)
+                .unwrap_or(200),
+        );
+        let reason_code = error.map(|e| e.code());
+        entry.metadata = Some(serde_json::json!({"outcome":if success {"success"}else{"failed"},
+            "reason_code":reason_code,"request_id":request_id.map(|v|v.chars().take(128).collect::<String>()).unwrap_or_else(||Uuid::now_v7().to_string())}).to_string());
+        self.log(entry, now).await;
     }
 
     /// 删除早于 cutoff_ms 的日志。返回删除条数。
@@ -107,6 +90,18 @@ impl AuditService {
     ///
     /// 不传 from/to 时默认返回最近 7 天（now - 7d ..= now）。
     pub async fn query(&self, query: &AuditLogQuery, now_ms: i64) -> Result<Page<AuditLogDto>> {
+        if query.from.zip(query.to).is_some_and(|(f, t)| f > t)
+            || query
+                .outcome
+                .as_deref()
+                .is_some_and(|v| !matches!(v, "success" | "failed"))
+            || query
+                .category
+                .as_deref()
+                .is_some_and(|v| !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        {
+            return Err(vpn_core::AppError::Validation("审计筛选条件无效".into()));
+        }
         let filter = build_filter(query, now_ms);
         let total = self.repo.count(&filter).await? as u64;
         let rows = self.repo.list(&filter).await?;
@@ -125,8 +120,8 @@ fn build_filter(query: &AuditLogQuery, now_ms: i64) -> AuditLogFilter {
     let (from, to) = match (query.from, query.to) {
         (Some(f), Some(t)) => (f, t),
         (Some(f), None) => (f, now_ms),
-        (None, Some(t)) => (t - DEFAULT_WINDOW_MS, t),
-        (None, None) => (now_ms - DEFAULT_WINDOW_MS, now_ms),
+        (None, Some(t)) => (t.saturating_sub(DEFAULT_WINDOW_MS), t),
+        (None, None) => (now_ms.saturating_sub(DEFAULT_WINDOW_MS), now_ms),
     };
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query
@@ -134,6 +129,9 @@ fn build_filter(query: &AuditLogQuery, now_ms: i64) -> AuditLogFilter {
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
     AuditLogFilter {
+        resource: query.resource.clone(),
+        outcome: query.outcome.clone(),
+        category: query.category.clone(),
         from,
         to,
         user_id: query.user_id.clone(),
@@ -167,6 +165,26 @@ pub fn infer_action(method: &str, path: &str) -> String {
     // 归一化路径：去掉末尾斜杠，便于匹配。
     let p = path.trim_end_matches('/');
     match (m.as_str(), p) {
+        ("PUT", "/api/v1/admin/network/settings") => "network.settings.update".into(),
+        ("PUT", "/api/v1/admin/system/routes") => "network.routes.update".into(),
+        ("PUT", "/api/v1/admin/integrations/settings") => "integration.settings.update".into(),
+        ("PUT", "/api/v1/admin/notifications/email") => "notification.settings.update".into(),
+        ("POST", "/api/v1/admin/notifications/email/test") => "notification.test".into(),
+        ("POST", "/api/v1/admin/system/restart") => "system.restart.request".into(),
+        ("GET", "/api/v1/admin/backup") => "backup.download".into(),
+        ("POST", "/api/v1/admin/backup/restore") => "backup.restore".into(),
+        ("PUT", "/api/v1/admin/client-updates") => "client_update.configure".into(),
+        ("POST", "/api/v1/admin/client-updates/sync") => "client_update.sync".into(),
+        ("POST", "/api/v1/admin/integrations/feishu/approval-subscription") => {
+            "integration.approval.subscribe".into()
+        }
+        ("POST", "/api/v1/admin/integrations/feishu/users/lookup") => {
+            "integration.user.lookup".into()
+        }
+        ("POST", "/api/v1/admin/integrations/feishu/users/sync") => "integration.user.sync".into(),
+        ("POST", "/api/v1/admin/api-keys") => "api_key.create".into(),
+        ("POST", "/api/v1/admin/groups") => "group.create".into(),
+        ("POST", "/api/v1/admin/subnets") => "subnet.create".into(),
         ("POST", "/api/v1/admin/users") => "user_create".to_string(),
         ("POST", "/api/v1/auth/first-time-setup") => "first_time_setup".to_string(),
         ("POST", "/api/v1/auth/login") => "login".to_string(),
@@ -176,6 +194,40 @@ pub fn infer_action(method: &str, path: &str) -> String {
         ("POST", "/api/v1/peers/heartbeat") => "peer_heartbeat".to_string(),
         ("DELETE", "/api/v1/peers/me") => "peer_delete".to_string(),
         _ => {
+            if m == "PUT" && p.starts_with("/api/v1/admin/users/") && p.ends_with("/groups") {
+                return "user.groups.update".into();
+            }
+            if m == "PATCH" && p.contains("/approval-grants/") {
+                return "grant.expiry.update".into();
+            }
+            for (prefix, entity) in [
+                ("/api/v1/admin/api-keys/", "api_key"),
+                ("/api/v1/admin/groups/", "group"),
+                ("/api/v1/admin/subnets/", "subnet"),
+            ] {
+                if p.strip_prefix(prefix)
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+                {
+                    return format!(
+                        "{entity}.{}",
+                        if m == "DELETE" { "delete" } else { "update" }
+                    );
+                }
+            }
+            if m == "PATCH" && is_admin_peer_id(p) {
+                return "peer.routes.update".into();
+            }
+            if m == "DELETE" && p.starts_with("/api/v1/admin/peers/") && p.ends_with("/purge") {
+                return "peer.purge".into();
+            }
+            if m == "POST" && p.starts_with("/api/v1/admin/users/") {
+                if p.ends_with("/feishu-binding") {
+                    return "user.feishu.bind".into();
+                }
+                if p.ends_with("/feishu-sync") {
+                    return "user.feishu.sync".into();
+                }
+            }
             // 带路径参数的端点用前缀 + 后缀匹配。
             if m == "PATCH" && is_admin_user_id(p) {
                 return "user_update".to_string();
@@ -264,6 +316,9 @@ mod tests {
     #[test]
     fn build_filter_default_is_last_7_days() {
         let q = AuditLogQuery {
+            resource: None,
+            outcome: None,
+            category: None,
             from: None,
             to: None,
             user_id: None,
@@ -283,6 +338,9 @@ mod tests {
     #[test]
     fn build_filter_respects_explicit_range() {
         let q = AuditLogQuery {
+            resource: None,
+            outcome: None,
+            category: None,
             from: Some(100),
             to: Some(200),
             user_id: Some("u1".to_string()),
@@ -302,6 +360,9 @@ mod tests {
     #[test]
     fn build_filter_only_from_uses_now_as_to() {
         let q = AuditLogQuery {
+            resource: None,
+            outcome: None,
+            category: None,
             from: Some(500),
             to: None,
             user_id: None,
@@ -318,6 +379,9 @@ mod tests {
     #[test]
     fn build_filter_clamps_page_size() {
         let q = AuditLogQuery {
+            resource: None,
+            outcome: None,
+            category: None,
             from: None,
             to: None,
             user_id: None,

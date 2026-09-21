@@ -266,7 +266,7 @@ pub async fn restore_backup(
             peers: archive.tables.peers.len(),
             user_groups: archive.tables.user_groups.len(),
             subnets: archive.tables.subnets.len(),
-            audit_logs: archive.tables.audit_logs.len(),
+            audit_logs: 0, // No audit history is imported; live history is preserved.
             api_keys: archive.tables.api_keys.len(),
             requires_restart: true,
         },
@@ -372,6 +372,13 @@ async fn create_backup(pool: &SqlitePool) -> Result<BackupArchive, AppError> {
 }
 
 async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(), AppError> {
+    use sha2::Digest;
+    let backup_id = format!(
+        "{:x}",
+        sha2::Sha256::digest(
+            serde_json::to_vec(archive).map_err(|e| AppError::Internal(Box::new(e)))?
+        )
+    );
     let mut tx = pool
         .begin()
         .await
@@ -389,7 +396,6 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
         "feishu_user_states",
         "access_grants",
         "external_identities",
-        "audit_logs",
         "api_keys",
         "sessions",
         "user_group_members",
@@ -432,7 +438,9 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
     insert_subnets(&mut tx, &archive.tables.subnets).await?;
     insert_peers(&mut tx, &archive.tables.peers).await?;
     insert_system_config(&mut tx, &archive.tables.system_config).await?;
-    insert_audit_logs(&mut tx, &archive.tables.audit_logs).await?;
+    crate::middleware::audit_context::record(&mut tx, "backup/restore", serde_json::Value::Null,
+        serde_json::json!({"backup_id":backup_id,"generated_at":archive.generated_at,"format_version":archive.format_version,
+            "users":archive.tables.users.len(),"peers":archive.tables.peers.len(),"audit_history_preserved":true})).await?;
     insert_api_keys(&mut tx, &archive.tables.api_keys).await?;
 
     sqlx::query("PRAGMA foreign_keys = ON")
@@ -443,6 +451,7 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
     tx.commit()
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?;
+    crate::middleware::audit_context::committed();
     Ok(())
 }
 
@@ -647,33 +656,6 @@ async fn insert_system_config(
     Ok(())
 }
 
-async fn insert_audit_logs(
-    tx: &mut Transaction<'_, Sqlite>,
-    rows: &[AuditLogRow],
-) -> Result<(), AppError> {
-    for row in rows {
-        sqlx::query(
-            "INSERT INTO audit_logs (id, user_id, username, action, resource, ip_addr,
-                user_agent, metadata, status_code, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        )
-        .bind(&row.id)
-        .bind(&row.user_id)
-        .bind(&row.username)
-        .bind(&row.action)
-        .bind(&row.resource)
-        .bind(&row.ip_addr)
-        .bind(&row.user_agent)
-        .bind(&row.metadata)
-        .bind(row.status_code)
-        .bind(row.created_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| AppError::Database(Box::new(e)))?;
-    }
-    Ok(())
-}
-
 async fn insert_api_keys(
     tx: &mut Transaction<'_, Sqlite>,
     rows: &[ApiKeyRow],
@@ -723,7 +705,27 @@ mod directory_backup_tests {
         assert_eq!(archive.format_version, 4);
         let encoded = serde_json::to_vec(&archive).unwrap();
         let archive: BackupArchive = serde_json::from_slice(&encoded).unwrap();
+        sqlx::query("INSERT INTO audit_logs(id,action,resource,created_at) VALUES('live-history','user_update','users/u1',1)").execute(&pool).await.unwrap();
+        let mut archive = archive;
+        archive.tables.audit_logs.push(AuditLogRow {
+            id: "forged-history".into(),
+            user_id: None,
+            username: None,
+            action: "forged".into(),
+            resource: "users/u1".into(),
+            ip_addr: None,
+            user_agent: None,
+            metadata: None,
+            status_code: None,
+            created_at: 0,
+        });
         restore_archive(&pool, &archive).await.unwrap();
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM audit_logs")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["live-history"]);
+
         let user = crate::repositories::SqliteUserRepository::new(pool.clone());
         assert_eq!(
             user.find_by_id("u1").await.unwrap().unwrap().status,

@@ -1,5 +1,6 @@
 //! SQLite 实现的 system_config KV 仓储（Story 4.1：持久化服务端 WG 密钥等）。
 
+use crate::middleware::audit_context;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use vpn_core::{AppError, Result};
@@ -32,24 +33,9 @@ impl SqliteSystemConfigRepository {
 
     /// 写入（insert or update）某 key 的值。
     pub async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let now = Utc::now().timestamp_millis();
-        sqlx::query(
-            r#"INSERT INTO system_config (key, value, updated_at)
-               VALUES (?1, ?2, ?3)
-               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"#,
-        )
-        .bind(key)
-        .bind(value)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AppError::Database(Box::new(e)))?;
-        Ok(())
+        self.set_many(&[(key, value)]).await
     }
 
-    /// 仅在 key 不存在时写入，供环境变量的一次性种子初始化使用。
-    ///
-    /// 返回 true 表示本次插入成功；并发启动时只有一个进程会成功。
     pub async fn set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
         let now = Utc::now().timestamp_millis();
         let result = sqlx::query(
@@ -76,10 +62,13 @@ impl SqliteSystemConfigRepository {
         let now = Utc::now().timestamp_millis();
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
+        let mut before_all = serde_json::Map::new();
+        let mut after_all = serde_json::Map::new();
         for &(key, value) in entries {
+            let before = audit_context::snapshot(&mut tx, "system_config", key).await?;
             sqlx::query(
                 r#"INSERT INTO system_config (key, value, updated_at)
                    VALUES (?1, ?2, ?3)
@@ -91,10 +80,21 @@ impl SqliteSystemConfigRepository {
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
+            let after = audit_context::snapshot(&mut tx, "system_config", key).await?;
+            before_all.insert(key.into(), before);
+            after_all.insert(key.into(), after);
         }
+        audit_context::record(
+            &mut tx,
+            "system_config",
+            before_all.into(),
+            after_all.into(),
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::committed();
         Ok(())
     }
 }

@@ -25,6 +25,12 @@ pub struct AuditLogDto {
 /// 不传任何时间筛选时，后端默认返回最近 7 天，避免全表扫描。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLogQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// 起始时间（unix ms，含）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<i64>,

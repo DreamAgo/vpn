@@ -1,5 +1,6 @@
 //! SQLite repository for service account API keys.
 
+use crate::middleware::audit_context;
 use sqlx::SqlitePool;
 use vpn_core::{AppError, Result};
 
@@ -63,6 +64,7 @@ impl SqliteApiKeyRepository {
         created_by: &str,
         now_ms: i64,
     ) -> Result<()> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "api_keys", id).await?;
         sqlx::query(
             r#"INSERT INTO api_keys (id, name, key_hash, scopes, status, created_by, created_at)
                VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)"#,
@@ -73,9 +75,10 @@ impl SqliteApiKeyRepository {
         .bind(scopes)
         .bind(created_by)
         .bind(now_ms)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "api_keys", id, audit_before).await?;
         Ok(())
     }
 
@@ -116,14 +119,16 @@ impl SqliteApiKeyRepository {
     }
 
     pub async fn revoke(&self, id: &str, now_ms: i64) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "api_keys", id).await?;
         let res = sqlx::query(
             "UPDATE api_keys SET status = 'revoked', revoked_at = ?1 WHERE id = ?2 AND status = 'active'",
         )
         .bind(now_ms)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "api_keys", id, audit_before).await?;
         Ok(res.rows_affected())
     }
 }

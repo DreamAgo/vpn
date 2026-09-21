@@ -47,28 +47,30 @@ impl From<AppError> for ApiError {
     }
 }
 
+#[derive(Clone)]
+pub struct AuditFailure(pub i32);
+
+pub fn status_code(error: &AppError) -> StatusCode {
+    if !error.is_client_error() {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    match error.code() {
+        1001..=1099 => StatusCode::UNAUTHORIZED,
+        2001..=2099 => StatusCode::FORBIDDEN,
+        c if c == error_codes::DUPLICATE_RESOURCE => StatusCode::CONFLICT,
+        3001..=3099 => StatusCode::NOT_FOUND,
+        4001..=4099 => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = if self.inner.is_client_error() {
-            // 认证错误用 401，权限用 403，重复资源用 409，资源不存在用 404，限速用 429，
-            // 校验/其他客户端错误用 400
-            match self.inner.code() {
-                1001..=1099 => StatusCode::UNAUTHORIZED,
-                2001..=2099 => StatusCode::FORBIDDEN,
-                c if c == error_codes::DUPLICATE_RESOURCE => StatusCode::CONFLICT,
-                3001..=3099 => StatusCode::NOT_FOUND,
-                4001..=4099 => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::BAD_REQUEST,
-            }
-        } else {
-            // 服务端错误：记录详细日志但只返回通用消息
-            tracing::error!(
-                error = ?self.inner,
-                request_id = %self.request_id,
-                "Internal server error"
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
+        let status = status_code(&self.inner);
+        if status.is_server_error() {
+            tracing::error!(error=?self.inner,request_id=%self.request_id,"Internal server error");
+        }
+        let failure = AuditFailure(self.inner.code());
 
         let body: ApiResponse<()> = ApiResponse::error(
             self.inner.code(),
@@ -77,7 +79,9 @@ impl IntoResponse for ApiError {
             self.timestamp_ms,
         );
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        response.extensions_mut().insert(failure);
+        response
     }
 }
 

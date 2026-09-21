@@ -113,10 +113,24 @@ impl UserService {
         .map_err(db)?;
         let metadata = serde_json::json!({"target_user_id":user_id,"group_id":group_id,
             "before":before,"previous_expires_at":current,"expires_at":expires_at});
-        sqlx::query("INSERT INTO audit_logs(id,user_id,username,action,resource,metadata,created_at) VALUES(?1,?2,(SELECT username FROM users WHERE id=?2),'grant.expiry.update',?3,?4,?5)")
+        if crate::middleware::audit_context::CONTEXT
+            .try_with(|_| ())
+            .is_ok()
+        {
+            crate::middleware::audit_context::record(
+                &mut tx,
+                &format!("users/{user_id}/approval-grants/{group_id}"),
+                serde_json::json!({"expires_at":current}),
+                serde_json::json!({"expires_at":expires_at}),
+            )
+            .await?;
+        } else {
+            sqlx::query("INSERT INTO audit_logs(id,user_id,username,action,resource,metadata,created_at) VALUES(?1,?2,(SELECT username FROM users WHERE id=?2),'grant.expiry.update',?3,?4,?5)")
             .bind(Uuid::new_v4().to_string()).bind(actor).bind(format!("users/{user_id}/approval-grants/{group_id}"))
             .bind(metadata.to_string()).bind(now).execute(&mut *tx).await.map_err(db)?;
+        }
         tx.commit().await.map_err(db)?;
+        crate::middleware::audit_context::committed();
         Ok(())
     }
 
@@ -204,6 +218,29 @@ impl UserService {
             .collect();
         self.populate_approval_grants(&mut items).await?;
         Ok(Page::new(items, total, page, page_size))
+    }
+
+    pub async fn update_admin_fields(
+        &self,
+        user_id: &str,
+        status: Option<&str>,
+        max_devices: Option<i64>,
+    ) -> Result<UserDto> {
+        if let Some(value) = max_devices {
+            validate_max_devices(value)?;
+        }
+        if status.is_some_and(|s| !matches!(s, "active" | "disabled")) {
+            return Err(AppError::Validation("非法用户状态".into()));
+        }
+        self.user_repo
+            .update_admin_fields(user_id, status, max_devices)
+            .await?;
+        let row = self
+            .user_repo
+            .find_by_id(user_id)
+            .await?
+            .ok_or(AppError::UserNotFound)?;
+        self.user_dto(row).await
     }
 
     /// Story 3.3：启用 / 禁用用户。禁用时撤销其所有 session。

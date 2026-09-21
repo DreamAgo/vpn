@@ -9,12 +9,20 @@ use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{Name, RecordType},
 };
-use tokio::{io::AsyncWriteExt, net::UdpSocket, process::Command, sync::watch, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UdpSocket,
+    process::Command,
+    sync::watch,
+    time::timeout,
+};
 use vpn_api_types::{peer::ClientDnsSettings, system::ClientDnsMode};
 
 use crate::{PlatformError, Result};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+// Each Windows operation gets its own budget, including PowerShell/CIM cold start.
+const WINDOWS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 // 允许服务端最多 8 个上游依次故障切换（每个总预算 2 秒），另留 2 秒隧道开销。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(18);
 
@@ -30,6 +38,7 @@ enum DnsPlatform {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandSpec {
+    stage: &'static str,
     program: &'static str,
     args: Vec<String>,
     stdin: Option<String>,
@@ -54,7 +63,7 @@ impl DnsSession {
         if let Some(mut lease) = self.lease.take() {
             drop(lease.stdin.take());
             // Reap the lease before a replacement can reuse the interface.
-            match timeout(COMMAND_TIMEOUT, lease.wait()).await {
+            match timeout(WINDOWS_COMMAND_TIMEOUT, lease.wait()).await {
                 Ok(Ok(status)) if status.success() => {}
                 _ => {
                     let _ = lease.kill().await;
@@ -139,7 +148,7 @@ async fn start_windows_lease(ifindex: u32, server: Ipv4Addr) -> Result<tokio::pr
     let stdout = child.stdout.take().expect("piped stdout");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    match timeout(COMMAND_TIMEOUT, reader.read_line(&mut line)).await {
+    match timeout(WINDOWS_COMMAND_TIMEOUT, reader.read_line(&mut line)).await {
         Ok(Ok(_)) if line.trim() == "ready" => Ok(child),
         _ => {
             drop(child.stdin.take());
@@ -172,11 +181,26 @@ pub async fn cleanup_stale_dns(ifindex: u32) -> Result<()> {
 /// 不依赖 TUN 是否存在，也不更改物理网卡 DNS。
 pub async fn cleanup_dns_before_connect() -> Result<()> {
     match current_platform()? {
-        DnsPlatform::Windows => run_commands(vec![powershell(windows_policy_cleanup())]).await,
+        DnsPlatform::Windows => run_commands(vec![windows_policy_cleanup_command()]).await,
         // macOS 的动态配置由特权 helper 管理；Linux 配置随 link 消失。
         DnsPlatform::Macos => run_commands(cleanup_commands(DnsPlatform::Macos, 0, "")).await,
         DnsPlatform::Linux => Ok(()),
     }
+}
+
+fn windows_policy_cleanup_command() -> CommandSpec {
+    let mut command = powershell(windows_policy_cleanup());
+    command.stage = "清理 NRPT 策略/刷新缓存";
+    command
+}
+
+fn windows_interface_cleanup(ifindex: u32) -> CommandSpec {
+    let mut command = powershell(
+        include_str!("dns/windows_interface_cleanup.ps1")
+            .replace("__IFINDEX__", &ifindex.to_string()),
+    );
+    command.stage = "重置 VPN 网卡 DNS";
+    command
 }
 
 fn windows_policy_cleanup() -> String {
@@ -355,7 +379,13 @@ async fn run_commands(commands: Vec<CommandSpec>) -> Result<()> {
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
-        let output = timeout(COMMAND_TIMEOUT, async {
+        let duration = if spec.program == "powershell.exe" {
+            WINDOWS_COMMAND_TIMEOUT
+        } else {
+            COMMAND_TIMEOUT
+        };
+        let stderr = child.stderr.take();
+        let output = timeout(duration, async {
             if let Some(input) = spec.stdin {
                 child
                     .stdin
@@ -364,31 +394,70 @@ async fn run_commands(commands: Vec<CommandSpec>) -> Result<()> {
                     .write_all(input.as_bytes())
                     .await?;
             }
-            Ok::<_, PlatformError>(child.wait_with_output().await?)
+            let (status, stderr) = tokio::join!(child.wait(), drain_stderr(stderr));
+            Ok::<_, PlatformError>(std::process::Output {
+                status: status?,
+                stdout: Vec::new(),
+                stderr: stderr?,
+            })
         })
-        .await
-        .map_err(|_| PlatformError::command(spec.program, "DNS 命令超时，已终止子进程"))??;
+        .await;
+        let output = match output {
+            Ok(result) => result?,
+            Err(_) => {
+                // Explicitly kill AND reap before another attempt can reuse the interface.
+                child.kill().await.map_err(|error| {
+                    PlatformError::command(
+                        spec.program,
+                        format!("{}超时，终止子进程失败：{error}", spec.stage),
+                    )
+                })?;
+                return Err(PlatformError::command(spec.program,format!("{}超时（{} 秒），已终止并回收子进程；请检查 Windows DNS Client/WMI 服务后重试",spec.stage,duration.as_secs())));
+            }
+        };
         if !output.status.success() {
             return Err(PlatformError::command(
                 spec.program,
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                format!(
+                    "{}失败：{}",
+                    spec.stage,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
             ));
         }
     }
     Ok(())
 }
 
+/// Drain the pipe even beyond the diagnostic limit, so a noisy child cannot deadlock.
+async fn drain_stderr(stderr: Option<tokio::process::ChildStderr>) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    if let Some(mut stderr) = stderr {
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stderr.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count.min(4096 - output.len())]);
+        }
+    }
+    Ok(output)
+}
+
 fn cleanup_commands(platform: DnsPlatform, ifindex: u32, interface: &str) -> Vec<CommandSpec> {
     match platform {
         DnsPlatform::Linux => vec![spec("resolvectl", ["revert", interface])],
         DnsPlatform::Macos => vec![CommandSpec {
+            stage: "macOS DNS 配置",
             program: "/usr/sbin/scutil",
             args: vec![],
             stdin: Some(format!("remove State:/Network/Service/{OWNER}/DNS\nquit\n")),
         }],
-        DnsPlatform::Windows => vec![powershell(format!(
-            "{}; if (Get-NetAdapter -InterfaceIndex {ifindex} -ErrorAction SilentlyContinue) {{ Set-DnsClientServerAddress -InterfaceIndex {ifindex} -ResetServerAddresses }}", windows_policy_cleanup()
-        ))],
+        DnsPlatform::Windows => vec![
+            windows_policy_cleanup_command(),
+            windows_interface_cleanup(ifindex),
+        ],
     }
 }
 
@@ -405,7 +474,8 @@ fn apply_commands(
         ],
         // 空 match domain 将产品自有 VPN DNS 注册为默认解析器。
         DnsPlatform::Macos => vec![CommandSpec {
-                program: "/usr/sbin/scutil",
+                stage: "macOS DNS 配置",
+            program: "/usr/sbin/scutil",
                 args: vec![],
                 stdin: Some(format!(
                     "d.init\nd.add ServerAddresses * {server}\nd.add InterfaceName {interface}\nd.add SearchOrder # 1\nd.add SupplementalMatchDomains * \"\"\nd.add SupplementalMatchDomainsNoSearch # 1\nset State:/Network/Service/{OWNER}/DNS\nquit\n"
@@ -417,6 +487,7 @@ fn apply_commands(
 
 fn spec<const N: usize>(program: &'static str, args: [&str; N]) -> CommandSpec {
     CommandSpec {
+        stage: "DNS 配置",
         program,
         args: args.into_iter().map(str::to_string).collect(),
         stdin: None,
@@ -425,6 +496,7 @@ fn spec<const N: usize>(program: &'static str, args: [&str; N]) -> CommandSpec {
 
 fn powershell(script: String) -> CommandSpec {
     CommandSpec {
+        stage: "Windows DNS 配置",
         program: "powershell.exe",
         args: vec![
             "-NoProfile".to_string(),
@@ -483,6 +555,52 @@ mod tests {
         )])
         .await
         .unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn empty_nrpt_store_skips_dns_cim_commands() {
+        // Exercise the real PowerShell control flow with an isolated HKCU key.
+        // No elevation, real NRPT policy, or network adapter changes are required.
+        let key = format!("Software\\YilianDnsCleanupTest{}", std::process::id());
+        let cleanup = windows_policy_cleanup()
+            .replace("Registry]::LocalMachine", "Registry]::CurrentUser")
+            .replace(
+                r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig",
+                &key,
+            );
+        let script = format!(
+            r#"
+$ErrorActionPreference='Stop'
+function Get-DnsClientNrptRule {{ throw 'Unnecessary NRPT enumeration' }}
+function Clear-DnsClientCache {{ throw 'Unnecessary cache flush' }}
+try {{
+    & {{ {cleanup} }}
+    $testKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('{key}')
+    $testKey.Dispose()
+    & {{ {cleanup} }}
+}} finally {{ [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey('{key}', $false) }}
+"#
+        );
+        run_commands(vec![powershell(script)]).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_command_diagnostics_are_bounded_and_identify_stage() {
+        let error = run_commands(vec![spec(
+            "/bin/sh",
+            [
+                "-c",
+                "i=0; while [ $i -lt 5000 ]; do echo diagnostic >&2; i=$((i+1)); done; exit 1",
+            ],
+        )])
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("DNS 配置失败"));
+        assert!(error.contains("diagnostic"));
+        assert!(error.len() < 4500);
     }
 
     #[test]
@@ -554,7 +672,7 @@ mod tests {
         assert!(script.len() < 8192);
         let cleanup = cleanup_commands(DnsPlatform::Windows, 12, "12");
         assert!(cleanup[0].args[3].contains(&format!("$_.Comment -eq '{OWNER}'")));
-        assert!(cleanup[0].args[3].contains("-InterfaceIndex 12 -ResetServerAddresses"));
+        assert!(cleanup[1].args[3].contains("-InterfaceIndex 12 -ResetServerAddresses"));
     }
     struct FakeDns {
         health: tokio::sync::mpsc::UnboundedReceiver<bool>,
@@ -702,6 +820,7 @@ mod tests {
         let cleanup = windows_policy_cleanup();
         assert!(cleanup.contains("StartTime.ToUniversalTime().Ticks"));
         assert!(cleanup.contains("if (-not $live)"));
+        assert!(cleanup.contains("if (-not $hasRules) { return }"));
         assert!(!cleanup.contains("Remove-Item"));
     }
 }

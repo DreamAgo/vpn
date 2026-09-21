@@ -27,11 +27,13 @@ use vpn_core::service::PasswordHasher;
 
 use crate::{auth::CurrentUser, error::ApiError, services::AuthService, state::AppState};
 
-fn extract_client_info(headers: &HeaderMap) -> (Option<String>, Option<String>) {
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+fn extract_client_info(
+    headers: &HeaderMap,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    state: &AppState,
+) -> (Option<String>, Option<String>) {
+    let ip =
+        crate::middleware::audit::client_ip(headers, peer.map(|p| p.0 .0), &state.trusted_proxies);
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -67,9 +69,10 @@ pub struct FeishuStartQuery {
 pub async fn feishu_start(
     State(state): State<AppState>,
     Query(query): Query<FeishuStartQuery>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<FeishuAuthStartResponse>>, ApiError> {
-    let (ip, _) = extract_client_info(&headers);
+    let (ip, _) = extract_client_info(&headers, peer, &state);
     let response = state
         .feishu_auth_service()?
         .start_for_client(
@@ -138,10 +141,11 @@ pub async fn feishu_callback(
 #[tracing::instrument(skip(state, headers, body))]
 pub async fn feishu_poll(
     State(state): State<AppState>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     Json(body): Json<FeishuAuthPollRequest>,
 ) -> Result<Json<ApiResponse<FeishuAuthPollResponse>>, ApiError> {
-    let (ip, ua) = extract_client_info(&headers);
+    let (ip, ua) = extract_client_info(&headers, peer, &state);
     let result = state
         .feishu_auth_service()?
         .poll(&body.poll_token, ip.as_deref(), ua.as_deref())
@@ -152,18 +156,42 @@ pub async fn feishu_poll(
             vpn_api_types::auth::FeishuAuthPollStatus::Complete
         )
     });
-    if completed && state.audit_service.is_some() {
-        state
-            .audit_service()?
-            .log_external_login_attempt(
-                "feishu",
-                true,
-                None,
-                ip.as_deref(),
-                ua.as_deref(),
-                state.clock.now_unix_ms(),
-            )
-            .await;
+    if completed || result.is_err() {
+        if let Some(audit) = &state.audit_service {
+            let username = result.as_ref().ok().and_then(|r| r.username.clone());
+            let user_id = if let Some(name) = &username {
+                state
+                    .auth_service()?
+                    .user_repo
+                    .find_by_username(name)
+                    .await?
+                    .map(|u| u.id)
+            } else {
+                None
+            };
+            audit
+                .log_auth(
+                    crate::repositories::AuditLogEntry {
+                        user_id,
+                        username,
+                        action: if completed {
+                            "external_login_success"
+                        } else {
+                            "external_login_failed"
+                        }
+                        .into(),
+                        resource: "/api/v1/auth/feishu/poll".into(),
+                        ip_addr: ip,
+                        user_agent: ua,
+                        ..Default::default()
+                    },
+                    completed,
+                    result.as_ref().err(),
+                    headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+                    state.clock.now_unix_ms(),
+                )
+                .await;
+        }
     }
     let response = result?;
     Ok(success(&state, response))
@@ -205,36 +233,39 @@ pub async fn first_time_setup(
 #[tracing::instrument(skip(state, headers, body))]
 pub async fn login(
     State(state): State<AppState>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<ApiResponse<LoginResponse>>, ApiError> {
     let svc = state.auth_service()?;
-    let (ip, ua) = extract_client_info(&headers);
+    let (ip, ua) = extract_client_info(&headers, peer, &state);
     let result = svc
         .login(&body.username, &body.password, ip.as_deref(), ua.as_deref())
         .await;
 
-    // Story 5.2：登录成功/失败均写审计（尽力而为，不阻塞）。
-    if let Ok(audit) = state.audit_service() {
-        let now = state.clock.now_unix_ms();
-        match &result {
-            Ok(_) => {
-                audit
-                    .log_login_attempt(&body.username, true, None, ip.as_deref(), now)
-                    .await
-            }
-            Err(e) => {
-                audit
-                    .log_login_attempt(
-                        &body.username,
-                        false,
-                        Some(&e.to_string()),
-                        ip.as_deref(),
-                        now,
-                    )
-                    .await
-            }
-        }
+    if let Some(audit) = &state.audit_service {
+        audit
+            .log_auth(
+                crate::repositories::AuditLogEntry {
+                    user_id: result.as_ref().ok().map(|r| r.user.id.clone()),
+                    username: Some(body.username.chars().take(256).collect()),
+                    action: if result.is_ok() {
+                        "login_success"
+                    } else {
+                        "login_failed"
+                    }
+                    .into(),
+                    resource: "/api/v1/auth/login".into(),
+                    ip_addr: ip,
+                    user_agent: ua,
+                    ..Default::default()
+                },
+                result.is_ok(),
+                result.as_ref().err(),
+                headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+                state.clock.now_unix_ms(),
+            )
+            .await;
     }
 
     let outcome = result?;

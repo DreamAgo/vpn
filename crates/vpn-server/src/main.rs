@@ -373,6 +373,13 @@ async fn run(
     if cfg!(unix) {
         state.restart_tx = Some(restart_tx);
     }
+    state.trusted_proxies = std::env::var("VPN_TRUSTED_PROXIES")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse())
+        .collect::<Result<Vec<std::net::IpAddr>, _>>()
+        .context("VPN_TRUSTED_PROXIES 必须是逗号分隔的代理 IP")?;
     let app = build_router(state);
 
     // 监听端口
@@ -385,7 +392,7 @@ async fn run(
     // 启动服务（含优雅关闭）
     if let Some(proxy) = obfs_proxy {
         tokio::select! {
-            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_or_restart(restart_rx.clone())) => {
+            result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(shutdown_or_restart(restart_rx.clone())) => {
                 result.context("HTTP 服务运行失败")?;
             }
             result = proxy.run() => {
@@ -397,7 +404,7 @@ async fn run(
         }
     } else {
         tokio::select! {
-            result = axum::serve(listener, app).with_graceful_shutdown(shutdown_or_restart(restart_rx.clone())) => {
+            result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(shutdown_or_restart(restart_rx.clone())) => {
                 result.context("HTTP 服务运行失败")?;
             }
             result = dns_server.run() => {

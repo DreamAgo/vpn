@@ -1,5 +1,6 @@
 //! SQLite 实现的网段目录仓储。
 
+use crate::middleware::audit_context;
 use chrono::Utc;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use vpn_core::{AppError, Result};
@@ -113,6 +114,7 @@ impl SqliteSubnetRepository {
 
     /// 插入。名称冲突 → DuplicateResource。
     pub async fn insert(&self, id: &str, name: &str, cidr: &str) -> Result<SubnetRow> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "subnets", id).await?;
         let now = Utc::now().timestamp_millis();
         let res = sqlx::query(
             r#"INSERT INTO subnets (id, name, cidr, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)"#,
@@ -121,16 +123,19 @@ impl SqliteSubnetRepository {
         .bind(name)
         .bind(cidr)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
         match res {
-            Ok(_) => Ok(SubnetRow {
-                id: id.to_string(),
-                name: name.to_string(),
-                cidr: cidr.to_string(),
-                created_at: now,
-                updated_at: now,
-            }),
+            Ok(_) => {
+                audit_context::finish(tx, "subnets", id, audit_before).await?;
+                Ok(SubnetRow {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    cidr: cidr.to_string(),
+                    created_at: now,
+                    updated_at: now,
+                })
+            }
             Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
                 Err(AppError::DuplicateResource("网段组名称".to_string()))
             }
@@ -140,6 +145,7 @@ impl SqliteSubnetRepository {
 
     /// 更新 name / cidr(None 表示不改)。冲突 → DuplicateResource。返回受影响行数。
     pub async fn update(&self, id: &str, name: Option<&str>, cidr: Option<&str>) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "subnets", id).await?;
         if name.is_none() && cidr.is_none() {
             return Ok(0);
         }
@@ -156,8 +162,11 @@ impl SqliteSubnetRepository {
         }
         qb.push(" WHERE id = ");
         qb.push_bind(id);
-        match qb.build().execute(&self.pool).await {
-            Ok(r) => Ok(r.rows_affected()),
+        match qb.build().execute(&mut *tx).await {
+            Ok(r) => {
+                audit_context::finish(tx, "subnets", id, audit_before).await?;
+                Ok(r.rows_affected())
+            }
             Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
                 Err(AppError::DuplicateResource("网段组名称".to_string()))
             }
@@ -166,11 +175,13 @@ impl SqliteSubnetRepository {
     }
 
     pub async fn delete(&self, id: &str) -> Result<u64> {
+        let (mut tx, audit_before) = audit_context::begin(&self.pool, "subnets", id).await?;
         let res = sqlx::query("DELETE FROM subnets WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(Box::new(e)))?;
+        audit_context::finish(tx, "subnets", id, audit_before).await?;
         Ok(res.rows_affected())
     }
 }

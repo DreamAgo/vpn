@@ -14,6 +14,14 @@ impl ConfigService {
         Self { repo }
     }
 
+    pub async fn set_many(&self, values: &[(String, String)]) -> Result<()> {
+        let entries: Vec<_> = values
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        self.repo.set_many(&entries).await
+    }
+
     pub async fn get_raw(&self, key: &str) -> Result<Option<String>> {
         self.repo.get(key).await
     }
