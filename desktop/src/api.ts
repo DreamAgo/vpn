@@ -1,6 +1,7 @@
 // Thin wrapper around the Tauri commands exposed by the Rust backend.
 // Mirrors `vpn_cli::ipc::StatusResponse` / `ConnState`.
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   disable as disableAutostart,
   enable as enableAutostart,
@@ -85,6 +86,11 @@ function previewStatus(): StatusResponse {
     bytes_tx: 12_884_021,
     last_error: null,
   };
+}
+
+export async function onStatusChanged(callback: () => void): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) return () => {};
+  return listen("vpn-status-changed", callback);
 }
 
 export function getStatus(): Promise<StatusResponse> {

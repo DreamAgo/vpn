@@ -108,7 +108,7 @@ pub(crate) fn repo() -> Result<CredentialRepo, String> {
     CredentialRepo::file().map_err(|e| e.to_string())
 }
 
-/// 当前连接状态(前端每 2.5s 轮询)。读本进程内状态,不会失败。
+/// 当前连接快照：状态事件触发刷新，前端定期轮询兜底。
 #[tauri::command]
 pub async fn get_status(mgr: tauri::State<'_, Arc<VpnManager>>) -> Result<StatusResponse, ()> {
     #[cfg(target_os = "macos")]

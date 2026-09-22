@@ -87,6 +87,10 @@ pub enum HelperRequest {
         refresh_token: String,
     },
     GetStatus,
+    /// 等待连接元数据变化；流量计数不触发唤醒。
+    WaitStatus {
+        previous: StatusResponse,
+    },
     GetVersion,
     GetLogs,
 }
@@ -150,6 +154,14 @@ pub struct StatusResponse {
 }
 
 impl StatusResponse {
+    /// Compare connection metadata without high-frequency traffic counters.
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.state == other.state
+            && self.vpn_ip == other.vpn_ip
+            && self.since == other.since
+            && self.last_error == other.last_error
+    }
+
     /// 构造一个 Disconnected 初始快照。
     pub fn disconnected() -> Self {
         Self {
@@ -317,6 +329,22 @@ pub use transport::{send_request, serve};
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn helper_wait_status_round_trip_and_connection_comparison() {
+        let previous = super::StatusResponse::disconnected();
+        let request = super::HelperRequest::WaitStatus {
+            previous: previous.clone(),
+        };
+        let encoded = super::encode_helper_line(&request).unwrap();
+        assert_eq!(super::decode_helper_request(&encoded).unwrap(), request);
+        let mut updated = previous.clone();
+        updated.bytes_rx = 100;
+        updated.bytes_tx = 200;
+        assert!(updated.same_connection(&previous));
+        updated.last_error = Some("failed".into());
+        assert!(!updated.same_connection(&previous));
+    }
+
     use super::*;
 
     #[test]

@@ -4975,18 +4975,22 @@ version = "0.1.39"
 dependencies = [
  "async-trait",
  "base64",
+ "core-foundation 0.10.1",
  "dirs",
  "hickory-proto",
  "keyring",
  "libc",
  "rand 0.8.6",
  "sha2",
+ "system-configuration-sys",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tun-rs",
  "vpn-api-types",
+ "windows-sys 0.59.0",
+ "winreg",
  "xsalsa20poly1305",
 ]
 

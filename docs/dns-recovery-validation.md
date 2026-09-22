@@ -53,3 +53,24 @@ Resolve-DnsName example.com
 - `cargo check --offline --manifest-path desktop/src-tauri/Cargo.toml`：macOS 桌面编译通过。
 - 根工作区及桌面工作区格式检查、`git diff --check`：通过。
 - Windows 真机矩阵未执行；未合入 main、未创建版本标签、未发布或部署。
+
+## Windows 连接耗时优化（2026-09-22，待真机验证）
+
+- 清理 NRPT 前直接读取本地注册表：键不存在或没有子键时不启动 PowerShell；有规则时仍运行原清理脚本，保留产品归属及活动租约检查。
+- 重置 VPN 网卡 DNS 前通过 `GetAdaptersAddresses` 读取指定 IPv4 接口索引的 DNS 列表：确认列表为空时不启动 PowerShell。接口未找到、原生查询失败或状态持续变化时回退完整清理。
+- 每次重新读取状态，不缓存“已经清理”的结果。没有遗留配置的正常连接路径中，握手前三次 PowerShell 调用均可跳过；恢复遗留配置仍在控制面请求之前执行。
+- 日志新增 `dns_command`（操作、跳过/成功/失败、耗时）、`dns_before_connect`、`dns_before_handshake`，并补充 `route_apply` 耗时。结合既有 `tun_open`、`register` 等阶段定位连接慢的原因。
+- Windows 每条 PowerShell 命令上限为 30 秒，其他平台命令为 10 秒；这些是超时上限，并非固定等待。
+
+真机对比应在同一机器上分别记录冷启动连接和断开后重连，核对无遗留配置时 `dns_command` 为 `skipped`。另测遗留产品规则、其他产品规则、网卡已有 DNS 和原生检查失败的场景，确保恢复和隔离行为不变。当前不承诺具体秒数，需以慢机器日志实测为准。
+
+原生枚举遵循 [Microsoft GetAdaptersAddresses 文档](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getadaptersaddresses)，保留 IPv4/IPv6 DNS 地址，采用对齐的缓冲区并处理大小变化。
+
+本次本地验证：平台与 CLI 库测试 183 项通过、2 项既有真机测试忽略；Windows 目标（含新增原生检查测试）通过 Clippy，警告视为错误；macOS 桌面端编译、两工作区格式及差异检查通过。新增 Windows 测试仅完成交叉编译，尚未在 Windows 执行，也未完成连接耗时实测。本次优化未发布。
+
+## macOS 连接耗时优化（2026-09-22，未发布）
+
+- 通过 SystemConfiguration 原生接口读取产品专属动态配置键，缺失时跳过 `scutil`。无遗留配置时，连接前和网卡创建后的两次 `scutil` 清理调用均可跳过；有遗留配置时仍先恢复解析，再请求控制面。
+- 使用 `SCDynamicStoreCopyMultiple` 按完整键名查询，空字典表示键不存在，NULL 表示查询失败。查询失败回退原清理流程；每次重新检查，不缓存状态，不修改其他网络服务配置。
+- 本机执行平台库测试：36 项通过、2 项既有真机测试忽略，包括原生查询存在/不存在键的只读测试。macOS 平台/CLI Clippy 和桌面编译通过；完整 VPN 连接耗时仍需实测。
+- 依据：[Apple SCDynamicStoreCopyMultiple](https://developer.apple.com/documentation/systemconfiguration/scdynamicstorecopymultiple(_:_:_:))。

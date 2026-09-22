@@ -490,13 +490,24 @@ async fn handle_request(request: HelperRequest, manager: Arc<VpnManager>) -> Hel
                 },
             }
         }
-        HelperRequest::GetStatus => {
-            let mut status = manager.status().await;
-            status.last_error = status
-                .last_error
-                .map(|message| bounded_message(&vpn_cli::error::redact_sensitive(&message)));
+        HelperRequest::WaitStatus { previous } => {
+            // Subscribe first, then read: no transition can fall between these steps.
+            let mut changes = manager.subscribe_status();
+            let wait = async {
+                loop {
+                    let status = safe_status(manager.status().await);
+                    if !status.same_connection(&previous) || changes.changed().await.is_err() {
+                        return status;
+                    }
+                }
+            };
+            let status = match tokio::time::timeout(Duration::from_secs(5), wait).await {
+                Ok(status) => status,
+                Err(_) => safe_status(manager.status().await),
+            };
             HelperResponse::Status(status)
         }
+        HelperRequest::GetStatus => HelperResponse::Status(safe_status(manager.status().await)),
         HelperRequest::GetVersion => HelperResponse::Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
             build_hash: current_build_hash().unwrap_or_else(|_| "unavailable".to_string()),
@@ -884,6 +895,22 @@ fn record_blocked_login_hash(hash: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn safe_status(mut status: StatusResponse) -> StatusResponse {
+    status.last_error = status
+        .last_error
+        .map(|message| bounded_message(&vpn_cli::error::redact_sensitive(&message)));
+    status
+}
+
+/// Read-only long poll. Missing/old helpers fall back to the GUI's regular polling;
+/// this never installs or starts a privileged helper just to observe status.
+pub async fn wait_status(previous: StatusResponse) -> Result<StatusResponse, String> {
+    match request(&HelperRequest::WaitStatus { previous }).await? {
+        HelperResponse::Status(status) => Ok(status),
+        _ => Err("helper 不支持状态变化通知".into()),
+    }
+}
+
 pub async fn status() -> StatusResponse {
     match request(&HelperRequest::GetStatus).await {
         Ok(HelperResponse::Status(status)) => status,
@@ -1170,6 +1197,36 @@ fn looks_like_log_record(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_wait_returns_changed_snapshot_without_waiting() {
+        let manager = Arc::new(VpnManager::new());
+        let mut previous = StatusResponse::disconnected();
+        previous.state = vpn_cli::ipc::ConnState::Connected;
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle_request(HelperRequest::WaitStatus { previous }, manager),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response,
+            HelperResponse::Status(StatusResponse::disconnected())
+        );
+    }
+
+    #[tokio::test]
+    async fn status_wait_ignores_traffic_difference_instead_of_spinning() {
+        let manager = Arc::new(VpnManager::new());
+        let mut previous = StatusResponse::disconnected();
+        previous.bytes_rx = 100;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            handle_request(HelperRequest::WaitStatus { previous }, manager),
+        )
+        .await
+        .is_err());
+    }
 
     #[test]
     fn peer_requires_active_console_user() {

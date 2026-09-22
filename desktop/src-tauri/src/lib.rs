@@ -10,6 +10,7 @@ mod commands;
 mod macos_helper;
 mod manager;
 mod observability;
+mod status_events;
 mod updates;
 
 use std::sync::{
@@ -249,6 +250,7 @@ pub fn run() {
             sync_tray_state,
         ])
         .setup(|app| {
+            status_events::start(app.handle().clone());
             // Windows GUI 以管理员身份运行；在页面登录请求之前恢复上次遗留 DNS。
             #[cfg(target_os = "windows")]
             tauri::async_runtime::block_on(vpn_cli::daemon::cleanup_dns_before_connect())?;

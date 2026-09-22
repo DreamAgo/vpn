@@ -73,6 +73,10 @@ impl VpnManager {
         }
     }
 
+    pub fn subscribe_status(&self) -> watch::Receiver<()> {
+        self.shared.subscribe()
+    }
+
     /// 当前状态快照。
     pub async fn status(&self) -> StatusResponse {
         self.shared.snapshot().await
@@ -159,9 +163,20 @@ impl VpnManager {
             .as_ref()
             .is_none_or(|task| task.is_finished())
         {
-            daemon::cleanup_dns_before_connect()
-                .await
-                .map_err(|error| format!("连接前清理 DNS 失败：{error}"))?;
+            let dns_started = Instant::now();
+            let cleanup = daemon::cleanup_dns_before_connect().await;
+            tracing::info!(
+                stage = "dns_before_connect",
+                result = if cleanup.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                elapsed_ms = dns_started.elapsed().as_millis(),
+                "连接前 DNS 清理结束"
+            );
+            cleanup.map_err(|error| format!("连接前清理 DNS 失败：{error}"))?;
+            self.ensure_connect_epoch(expected_epoch)?;
         }
         let api = Arc::new(ApiClient::new(&server).map_err(|error| {
             tracing::warn!(stage = "credentials", result = "failed", error = %error.safe_diagnostic(), "初始化控制面客户端失败");

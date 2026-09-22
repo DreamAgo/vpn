@@ -2,7 +2,7 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use hickory_proto::{
@@ -19,6 +19,11 @@ use tokio::{
 use vpn_api_types::{peer::ClientDnsSettings, system::ClientDnsMode};
 
 use crate::{PlatformError, Result};
+
+#[cfg(target_os = "macos")]
+mod macos_preflight;
+#[cfg(target_os = "windows")]
+mod windows_preflight;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 // Each Windows operation gets its own budget, including PowerShell/CIM cold start.
@@ -42,6 +47,14 @@ struct CommandSpec {
     program: &'static str,
     args: Vec<String>,
     stdin: Option<String>,
+    preflight: Option<CleanupCheck>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupCheck {
+    MacosDynamicStore,
+    Policy,
+    Interface(u32),
 }
 
 /// 一次 DNS 应用会话；只恢复本产品在当前 TUN 接口上创建的状态。
@@ -191,6 +204,7 @@ pub async fn cleanup_dns_before_connect() -> Result<()> {
 fn windows_policy_cleanup_command() -> CommandSpec {
     let mut command = powershell(windows_policy_cleanup());
     command.stage = "清理 NRPT 策略/刷新缓存";
+    command.preflight = Some(CleanupCheck::Policy);
     command
 }
 
@@ -200,6 +214,7 @@ fn windows_interface_cleanup(ifindex: u32) -> CommandSpec {
             .replace("__IFINDEX__", &ifindex.to_string()),
     );
     command.stage = "重置 VPN 网卡 DNS";
+    command.preflight = Some(CleanupCheck::Interface(ifindex));
     command
 }
 
@@ -364,67 +379,136 @@ fn stale_cleanup_commands(
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn cleanup_needed(check: CleanupCheck) -> std::io::Result<bool> {
+    match check {
+        #[cfg(target_os = "macos")]
+        CleanupCheck::MacosDynamicStore => macos_preflight::needed(),
+        #[cfg(target_os = "windows")]
+        CleanupCheck::Policy | CleanupCheck::Interface(_) => windows_preflight::needed(check),
+        // Platform-mismatched specs must not be silently skipped.
+        _ => Ok(true),
+    }
+}
+
 async fn run_commands(commands: Vec<CommandSpec>) -> Result<()> {
     for spec in commands {
-        let mut command = Command::new(spec.program);
-        command.args(&spec.args);
-        command.kill_on_drop(true);
-        // DNS maintenance runs in the background, including cleanup on every connection.
-        // Redirecting stdio alone does not prevent PowerShell from opening a console.
-        #[cfg(target_os = "windows")]
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        if spec.stdin.is_some() {
-            command.stdin(std::process::Stdio::piped());
+        let started = Instant::now();
+        let operation = spec.stage;
+        tracing::info!(
+            stage = "dns_command",
+            operation,
+            result = "started",
+            "开始处理 DNS 配置"
+        );
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(check) = spec.preflight {
+            // Native enumeration can block; keep it off the async runtime worker.
+            match tokio::task::spawn_blocking(move || cleanup_needed(check)).await {
+                Ok(Ok(false)) => {
+                    tracing::info!(
+                        stage = "dns_command",
+                        operation,
+                        result = "skipped",
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "无遗留配置，跳过 DNS 清理命令"
+                    );
+                    continue;
+                }
+                Ok(Ok(true)) => {}
+                outcome => {
+                    tracing::warn!(
+                        stage = "dns_preflight",
+                        operation,
+                        ?outcome,
+                        "原生检查失败，回退到完整 DNS 清理"
+                    );
+                }
+            }
         }
-        command.stdout(std::process::Stdio::null());
-        command.stderr(std::process::Stdio::piped());
-        let mut child = command.spawn()?;
-        let duration = if spec.program == "powershell.exe" {
-            WINDOWS_COMMAND_TIMEOUT
-        } else {
-            COMMAND_TIMEOUT
-        };
-        let stderr = child.stderr.take();
-        let output = timeout(duration, async {
-            if let Some(input) = spec.stdin {
-                child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| PlatformError::command(spec.program, "无法打开 stdin"))?
-                    .write_all(input.as_bytes())
-                    .await?;
-            }
-            let (status, stderr) = tokio::join!(child.wait(), drain_stderr(stderr));
-            Ok::<_, PlatformError>(std::process::Output {
-                status: status?,
-                stdout: Vec::new(),
-                stderr: stderr?,
-            })
+        let result = run_command(spec).await;
+        tracing::info!(
+            stage = "dns_command",
+            operation,
+            result = if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            elapsed_ms = started.elapsed().as_millis(),
+            "DNS 配置处理结束"
+        );
+        result?;
+    }
+    Ok(())
+}
+
+async fn run_command(spec: CommandSpec) -> Result<()> {
+    let mut command = Command::new(spec.program);
+    command.args(&spec.args);
+    command.kill_on_drop(true);
+    // DNS maintenance runs in the background, including cleanup on every connection.
+    // Redirecting stdio alone does not prevent PowerShell from opening a console.
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    if spec.stdin.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let duration = if spec.program == "powershell.exe" {
+        WINDOWS_COMMAND_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    };
+    let stderr = child.stderr.take();
+    let output = timeout(duration, async {
+        if let Some(input) = spec.stdin {
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| PlatformError::command(spec.program, "无法打开 stdin"))?
+                .write_all(input.as_bytes())
+                .await?;
+        }
+        let (status, stderr) = tokio::join!(child.wait(), drain_stderr(stderr));
+        Ok::<_, PlatformError>(std::process::Output {
+            status: status?,
+            stdout: Vec::new(),
+            stderr: stderr?,
         })
-        .await;
-        let output = match output {
-            Ok(result) => result?,
-            Err(_) => {
-                // Explicitly kill AND reap before another attempt can reuse the interface.
-                child.kill().await.map_err(|error| {
-                    PlatformError::command(
-                        spec.program,
-                        format!("{}超时，终止子进程失败：{error}", spec.stage),
-                    )
-                })?;
-                return Err(PlatformError::command(spec.program,format!("{}超时（{} 秒），已终止并回收子进程；请检查 Windows DNS Client/WMI 服务后重试",spec.stage,duration.as_secs())));
-            }
-        };
-        if !output.status.success() {
+    })
+    .await;
+    let output = match output {
+        Ok(result) => result?,
+        Err(_) => {
+            // Explicitly kill AND reap before another attempt can reuse the interface.
+            child.kill().await.map_err(|error| {
+                PlatformError::command(
+                    spec.program,
+                    format!("{}超时，终止子进程失败：{error}", spec.stage),
+                )
+            })?;
             return Err(PlatformError::command(
                 spec.program,
                 format!(
-                    "{}失败：{}",
+                    "{}超时（{} 秒），已终止并回收子进程；请检查 Windows DNS Client/WMI 服务后重试",
                     spec.stage,
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    duration.as_secs()
                 ),
             ));
         }
+    };
+    if !output.status.success() {
+        return Err(PlatformError::command(
+            spec.program,
+            format!(
+                "{}失败：{}",
+                spec.stage,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
     }
     Ok(())
 }
@@ -452,6 +536,7 @@ fn cleanup_commands(platform: DnsPlatform, ifindex: u32, interface: &str) -> Vec
             stage: "macOS DNS 配置",
             program: "/usr/sbin/scutil",
             args: vec![],
+            preflight: Some(CleanupCheck::MacosDynamicStore),
             stdin: Some(format!("remove State:/Network/Service/{OWNER}/DNS\nquit\n")),
         }],
         DnsPlatform::Windows => vec![
@@ -477,7 +562,8 @@ fn apply_commands(
                 stage: "macOS DNS 配置",
             program: "/usr/sbin/scutil",
                 args: vec![],
-                stdin: Some(format!(
+                preflight: None,
+            stdin: Some(format!(
                     "d.init\nd.add ServerAddresses * {server}\nd.add InterfaceName {interface}\nd.add SearchOrder # 1\nd.add SupplementalMatchDomains * \"\"\nd.add SupplementalMatchDomainsNoSearch # 1\nset State:/Network/Service/{OWNER}/DNS\nquit\n"
                 )),
             }],
@@ -490,6 +576,7 @@ fn spec<const N: usize>(program: &'static str, args: [&str; N]) -> CommandSpec {
         stage: "DNS 配置",
         program,
         args: args.into_iter().map(str::to_string).collect(),
+        preflight: None,
         stdin: None,
     }
 }
@@ -504,6 +591,7 @@ fn powershell(script: String) -> CommandSpec {
             "-Command".to_string(),
             script,
         ],
+        preflight: None,
         stdin: None,
     }
 }

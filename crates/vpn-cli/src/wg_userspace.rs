@@ -569,6 +569,7 @@ impl UserspaceTunnel {
         let vpn_subnet = ipnet::Ipv4Net::new(vpn_ip, subnet_prefix)
             .map_err(|error| CliError::Invalid(format!("无效 VPN 子网: {error}")))?
             .trunc();
+        let route_started = std::time::Instant::now();
         let handle =
             Handle::new().map_err(|error| CliError::Other(format!("路由句柄失败: {error}")))?;
         let route_policy = RoutePolicy {
@@ -586,13 +587,26 @@ impl UserspaceTunnel {
         tracing::info!(
             stage = "route_apply",
             result = route_result,
+            elapsed_ms = route_started.elapsed().as_millis(),
             requested = desired.len(),
             applied = added.len(),
             "VPN 路由应用完成"
         );
 
         // 此处只清理旧配置；新 DNS 由转发循环中的健康检测任务延迟应用。
-        if let Err(error) = vpn_platform::cleanup_stale_dns(ifindex).await {
+        let dns_started = std::time::Instant::now();
+        let cleanup = vpn_platform::cleanup_stale_dns(ifindex).await;
+        tracing::info!(
+            stage = "dns_before_handshake",
+            result = if cleanup.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            elapsed_ms = dns_started.elapsed().as_millis(),
+            "握手前 DNS 清理结束"
+        );
+        if let Err(error) = cleanup {
             if crate::route_reconcile::cleanup(&handle, &mut added).await > 0 {
                 return Err(CliError::Cleanup("DNS 清理失败且路由回滚未完成".into()));
             }

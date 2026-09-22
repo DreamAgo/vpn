@@ -14,6 +14,7 @@ import {
   getLaunchOnStartup,
   getDiagnosticsInfo,
   getStatus,
+  onStatusChanged,
   hideWindow,
   installPendingUpdate,
   isLoggedIn,
@@ -205,10 +206,24 @@ export default function App() {
   }, [addActivity]);
 
   useEffect(() => {
-    refresh();
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void onStatusChanged(() => {
+      if (!disposed) void refresh();
+    }).then((stop) => {
+      if (disposed) { stop(); return; }
+      unlisten = stop;
+      // Close the gap between the first snapshot and listener registration.
+      void refresh();
+    }).catch(() => { /* Regular polling still recovers missed notifications. */ });
+    void refresh();
     pollRef.current = window.setInterval(refresh, POLL_MS);
     const timer = window.setInterval(() => setTick((x) => x + 1), 1000);
     return () => {
+      disposed = true;
+      unlisten?.();
+      // Prevent a pending refresh from applying after unmount / StrictMode cleanup.
+      ++refreshIdRef.current;
       if (pollRef.current) window.clearInterval(pollRef.current);
       window.clearInterval(timer);
     };

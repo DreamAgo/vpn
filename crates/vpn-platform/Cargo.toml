@@ -34,6 +34,8 @@ rand = { workspace = true }
 # === macOS：keyring 走 Keychain (apple-native，内部即 security-framework) ===
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+core-foundation = "0.10"
+system-configuration-sys = "0.6"
 
 # === Linux：keyring 走 libsecret (Secret Service)，crypto-rust 提供纯 Rust 加密 ===
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -45,6 +47,8 @@ libc = "0.2"
 # === Windows：keyring 走 Windows Credential Manager ===
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+winreg = "0.56"
+windows-sys = { version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 tempfile = "3"

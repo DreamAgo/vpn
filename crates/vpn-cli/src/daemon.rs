@@ -46,6 +46,7 @@ pub const PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 pub struct SharedState {
     inner: Arc<Mutex<StatusResponse>>,
     health: Arc<Mutex<(bool, bool)>>,
+    changes: tokio::sync::watch::Sender<()>,
 }
 
 impl Default for SharedState {
@@ -60,6 +61,18 @@ impl SharedState {
         Self {
             inner: Arc::new(Mutex::new(StatusResponse::disconnected())),
             health: Arc::new(Mutex::new((false, false))),
+            changes: tokio::sync::watch::channel(()).0,
+        }
+    }
+
+    /// Subscribe before reading a snapshot to avoid missing a concurrent transition.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    fn notify_change(&self, before: &StatusResponse, after: &StatusResponse) {
+        if !before.same_connection(after) {
+            self.changes.send_replace(());
         }
     }
 
@@ -75,7 +88,9 @@ impl SharedState {
             *health = (false, false);
         }
         let mut s = self.inner.lock().await;
+        let before = s.clone();
         apply_state_transition(&mut s, state, now_unix);
+        self.notify_change(&before, &s);
     }
 
     /// 管理心跳与经过认证的 WireGuard 握手必须同时正常，才显示已连接。
@@ -93,25 +108,35 @@ impl SharedState {
         ) {
             let next = if health.0 && health.1 {
                 ConnState::Connected
+            } else if status.state == ConnState::Connecting {
+                // Initial readiness is not a lost connection.
+                ConnState::Connecting
             } else {
                 ConnState::Reconnecting
             };
             if status.state != next {
+                let before = status.clone();
                 apply_state_transition(&mut status, next, now_unix());
+                self.notify_change(&before, &status);
             }
         }
     }
 
     /// 设置已分配的 VPN IP。
     pub async fn set_vpn_ip(&self, ip: Option<String>) {
-        self.inner.lock().await.vpn_ip = ip;
+        let mut status = self.inner.lock().await;
+        let before = status.clone();
+        status.vpn_ip = ip;
+        self.notify_change(&before, &status);
     }
 
     /// 记录错误信息并进入 Error 态。
     pub async fn set_error(&self, message: impl Into<String>, now_unix: i64) {
         let mut s = self.inner.lock().await;
+        let before = s.clone();
         s.last_error = Some(message.into());
         apply_state_transition(&mut s, ConnState::Error, now_unix);
+        self.notify_change(&before, &s);
     }
 
     /// 累加流量计数（数据面转发循环调用）。
@@ -986,6 +1011,54 @@ pub(crate) fn now_unix() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn connection_changes_notify_but_traffic_and_repeated_states_do_not() {
+        let state = super::SharedState::new();
+        let mut changes = state.subscribe();
+        state.add_traffic(42, 7).await;
+        state
+            .set_state(crate::ipc::ConnState::Disconnected, 10)
+            .await;
+        assert!(!changes.has_changed().unwrap());
+        state.set_state(crate::ipc::ConnState::Connecting, 11).await;
+        assert!(changes.has_changed().unwrap());
+        changes.changed().await.unwrap();
+        state.set_vpn_ip(Some("10.8.0.2".into())).await;
+        changes.changed().await.unwrap();
+        state.set_vpn_ip(Some("10.8.0.2".into())).await;
+        assert!(!changes.has_changed().unwrap());
+        state.set_channel_health(true, true).await;
+        assert!(!changes.has_changed().unwrap());
+        state.set_channel_health(false, true).await;
+        changes.changed().await.unwrap();
+        assert_eq!(
+            state.snapshot().await.state,
+            crate::ipc::ConnState::Connected
+        );
+        state.set_channel_health(false, true).await;
+        state.add_traffic(100, 100).await;
+        assert!(!changes.has_changed().unwrap());
+        state.set_error("first error", 12).await;
+        changes.changed().await.unwrap();
+        state.set_error("different error", 13).await;
+        changes.changed().await.unwrap();
+        state
+            .set_state(crate::ipc::ConnState::Disconnected, 14)
+            .await;
+        changes.changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscriber_sees_transition_between_subscription_and_snapshot() {
+        let state = super::SharedState::new();
+        let mut changes = state.subscribe();
+        state.set_error("failed", 1).await;
+        assert_eq!(state.snapshot().await.state, crate::ipc::ConnState::Error);
+        assert!(changes.has_changed().unwrap());
+        changes.changed().await.unwrap();
+        assert!(!changes.has_changed().unwrap());
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -1021,7 +1094,7 @@ mod tests {
         let state = SharedState::new();
         state.set_state(ConnState::Connecting, 1).await;
         state.set_channel_health(false, true).await;
-        assert_eq!(state.snapshot().await.state, ConnState::Reconnecting);
+        assert_eq!(state.snapshot().await.state, ConnState::Connecting);
         state.set_channel_health(true, true).await;
         assert_eq!(state.snapshot().await.state, ConnState::Connected);
         state.set_channel_health(true, false).await;
@@ -1037,7 +1110,7 @@ mod tests {
         assert_eq!(state.snapshot().await.state, ConnState::Disconnected);
         state.set_state(ConnState::Connecting, 3).await;
         state.set_channel_health(false, true).await;
-        assert_eq!(state.snapshot().await.state, ConnState::Reconnecting);
+        assert_eq!(state.snapshot().await.state, ConnState::Connecting);
         state.set_error("fatal", 4).await;
         state.set_channel_health(true, true).await;
         assert_eq!(state.snapshot().await.state, ConnState::Error);
