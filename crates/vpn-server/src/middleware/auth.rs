@@ -73,7 +73,6 @@ pub async fn require_auth(
                         serde_json::json!({"outcome":"failed","reason_code":error.inner.code(),"request_id":request_id,"authenticated":false,"identity_source":identity_source})
                             .to_string(),
                     ),
-                    ..Default::default()
                 },
                 state.clock.now_unix_ms(),
             )
