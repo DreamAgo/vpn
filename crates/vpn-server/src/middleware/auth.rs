@@ -41,18 +41,36 @@ pub async fn require_auth(
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.chars().take(512).collect::<String>());
+    let audit_token = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.starts_with("ylk_"))
+        .map(str::to_owned);
     let result = authenticate(axum::extract::State(state.clone()), request, next).await;
     if let (Err(error), Some(audit)) = (&result, &state.audit_service) {
+        let user_id = match (state.auth_service(), audit_token.as_deref()) {
+            (Ok(svc), Some(token)) => svc.issuer.access_subject_for_audit(token).await,
+            _ => None,
+        };
+        let username = match user_id.as_deref() {
+            Some(id) => audit.actor_name(id).await,
+            None => None,
+        };
+        let identity_source = user_id.as_ref().map(|_| "signature_verified_access_token");
         audit
             .log(
                 crate::repositories::AuditLogEntry {
                     action: "auth.rejected".into(),
+                    user_id,
+                    username,
                     resource: path,
                     user_agent,
                     ip_addr: ip,
                     status_code: Some(crate::error::status_code(&error.inner).as_u16() as i32),
                     metadata: Some(
-                        serde_json::json!({"outcome":"failed","reason_code":error.inner.code(),"request_id":request_id})
+                        serde_json::json!({"outcome":"failed","reason_code":error.inner.code(),"request_id":request_id,"authenticated":false,"identity_source":identity_source})
                             .to_string(),
                     ),
                     ..Default::default()

@@ -25,6 +25,12 @@ pub trait TokenIssuer: Send + Sync + Debug {
     /// 解析并验证 Access Token，返回 (user_id, role)。
     async fn verify_access(&self, token: &str) -> Result<(String, String)>;
 
+    /// Audit attribution only. Never use this identity to authorize a request.
+    /// Implementations may ignore expiration, but must still verify authenticity.
+    async fn access_subject_for_audit(&self, _token: &str) -> Option<String> {
+        None
+    }
+
     /// 解析并验证 Refresh Token，返回 user_id。
     async fn verify_refresh(&self, token: &str) -> Result<String>;
 }

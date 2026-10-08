@@ -169,6 +169,19 @@ impl TokenIssuer for JwtTokenIssuer {
         Ok((data.claims.sub, data.claims.role))
     }
 
+    async fn access_subject_for_audit(&self, token: &str) -> Option<String> {
+        let mut validation = Self::validation();
+        validation.validate_exp = false;
+        validation.validate_nbf = true;
+        let claims = jsonwebtoken::decode::<AccessClaims>(token, &self.decoding_key, &validation)
+            .ok()?
+            .claims;
+        if claims.sub.is_empty() || claims.iat > Utc::now().timestamp() + 5 {
+            return None;
+        }
+        Some(claims.sub)
+    }
+
     async fn verify_refresh(&self, _token: &str) -> Result<String> {
         // 设计：Refresh Token 是不透明字符串，需要通过 sessions 表查询
         // 此 trait 方法不再适用（service 层直接走 session_repo），返回未实现错误。
@@ -205,6 +218,38 @@ mod tests {
         let (sub, role) = issuer.verify_access(&token).await.unwrap();
         assert_eq!(sub, "user-1");
         assert_eq!(role, "admin");
+    }
+
+    #[tokio::test]
+    async fn audit_identity_never_authorizes_expired_or_forged_tokens() {
+        let issuer = make_issuer();
+        let now = Utc::now().timestamp();
+        let claims = AccessClaims {
+            sub: "user-1".into(),
+            role: "admin".into(),
+            exp: now - 60,
+            iat: now - 960,
+        };
+        let token =
+            jsonwebtoken::encode(&JwtTokenIssuer::header(), &claims, &issuer.encoding_key).unwrap();
+        assert!(issuer.verify_access(&token).await.is_err());
+        assert_eq!(
+            issuer.access_subject_for_audit(&token).await.as_deref(),
+            Some("user-1")
+        );
+        let other = make_issuer();
+        assert!(other.access_subject_for_audit(&token).await.is_none());
+        assert!(issuer
+            .access_subject_for_audit("invalid.jwt.token")
+            .await
+            .is_none());
+        let future = AccessClaims {
+            iat: now + 3600,
+            ..claims
+        };
+        let token =
+            jsonwebtoken::encode(&JwtTokenIssuer::header(), &future, &issuer.encoding_key).unwrap();
+        assert!(issuer.access_subject_for_audit(&token).await.is_none());
     }
 
     #[tokio::test]
