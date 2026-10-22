@@ -28,6 +28,8 @@ class ManifestTests(unittest.TestCase):
         manifest = self.generate()
         self.assertEqual(manifest["version"], "0.1.16")
         expected = {
+            "cli-linux-x86_64": ".bin",
+            "cli-linux-aarch64": ".bin",
             "windows-x86_64": ".exe",
             "darwin-x86_64": ".app.tar.gz",
             "darwin-aarch64": ".app.tar.gz",
@@ -35,7 +37,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(set(manifest["platforms"]), set(expected))
         for target, extension in expected.items():
             item = manifest["platforms"][target]
-            self.assertTrue(item["url"].startswith("https://updates.example/updates/vpn-gui-"))
+            self.assertTrue(item["url"].startswith("https://updates.example/updates/vpn-"))
             self.assertTrue(item["url"].endswith(extension))
             self.assertEqual(item["signature"], f"signature-{target}")
 

@@ -52,6 +52,27 @@ pub enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Linux 系统服务自动升级（独立于 VPN 连接）。
+    Update {
+        #[command(subcommand)]
+        action: UpdateAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UpdateAction {
+    /// 为 root 系统服务启用自动升级；服务端须通过公网 HTTPS 可达。
+    Install {
+        #[arg(long)]
+        server: String,
+        /// systemd OnCalendar 表达式，例如 *-*-* 03:00:00。
+        #[arg(long, default_value = "hourly")]
+        schedule: String,
+    },
+    /// 执行一次检查和升级（通常由独立 systemd timer 调用）。
+    Run,
+    /// 关闭定时升级，保留配置、备份和日志。
+    Disable,
 }
 
 /// daemon 子命令。
@@ -59,6 +80,11 @@ pub enum Command {
 pub enum DaemonAction {
     /// 安装为系统服务（systemd user / launchd / Windows Service）。
     Install,
+    /// Linux：安装 root 系统服务，使用 root 文件凭证并自动连接。
+    InstallSystem,
+    /// Linux 系统服务内部使用：断开并等待路由清理。
+    #[command(hide = true)]
+    Drain,
     /// 卸载系统服务。
     Uninstall,
     /// 启动服务。
@@ -159,6 +185,14 @@ pub async fn run_ipc_command(cmd: &Command, socket: &std::path::Path) -> CliResu
 
 /// daemon 服务管理：转发给 vpn-platform DaemonRuntime。
 pub fn run_daemon_admin(action: &DaemonAction) -> CliResult<String> {
+    if *action == DaemonAction::InstallSystem {
+        #[cfg(target_os = "linux")]
+        return crate::update::install_daemon()
+            .map(|()| "系统服务已安装；执行 sudo systemctl start vpn-cli 启动。".into())
+            .map_err(|e| CliError::Other(format!("{e:#}")));
+        #[cfg(not(target_os = "linux"))]
+        return Err(CliError::Invalid("系统服务安装仅支持 Linux".into()));
+    }
     let runtime = vpn_platform::default_runtime()?;
     match action {
         DaemonAction::Install => {
@@ -182,9 +216,10 @@ pub fn run_daemon_admin(action: &DaemonAction) -> CliResult<String> {
             let status = runtime.status()?;
             Ok(format!("daemon 状态: {status:?}"))
         }
-        DaemonAction::Run => Err(CliError::Invalid(
-            "`daemon run` 应由 main 直接驱动".to_string(),
+        DaemonAction::Run | DaemonAction::Drain => Err(CliError::Invalid(
+            "此 daemon 命令应由 main 直接驱动".to_string(),
         )),
+        DaemonAction::InstallSystem => unreachable!(),
     }
 }
 
@@ -283,6 +318,7 @@ mod tests {
     fn daemon_subcommands_parse() {
         for (arg, expected) in [
             ("install", DaemonAction::Install),
+            ("install-system", DaemonAction::InstallSystem),
             ("uninstall", DaemonAction::Uninstall),
             ("start", DaemonAction::Start),
             ("stop", DaemonAction::Stop),

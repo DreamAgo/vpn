@@ -51,6 +51,12 @@ async fn run() -> CliResult<()> {
             println!("{msg}");
         }
         Command::Daemon { action } => match action {
+            #[cfg(target_os = "linux")]
+            DaemonAction::Drain => {
+                vpn_cli::update::drain()
+                    .await
+                    .map_err(|e| vpn_cli::error::CliError::Other(format!("{e:#}")))?;
+            }
             DaemonAction::Run => {
                 let config = cli::build_daemon_config(&repo)?;
                 tracing::info!(server = %config.server_url, "daemon 启动");
@@ -61,6 +67,19 @@ async fn run() -> CliResult<()> {
                 println!("{msg}");
             }
         },
+        Command::Update { action } => {
+            #[cfg(target_os = "linux")]
+            vpn_cli::update::dispatch(action)
+                .await
+                .map_err(|e| vpn_cli::error::CliError::Other(format!("{e:#}")))?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = action;
+                return Err(vpn_cli::error::CliError::Invalid(
+                    "自动升级仅支持 Linux systemd 系统服务".into(),
+                ));
+            }
+        }
     }
     Ok(())
 }

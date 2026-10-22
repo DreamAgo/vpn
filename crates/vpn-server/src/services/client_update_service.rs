@@ -445,6 +445,8 @@ fn package_assets(release: &Release) -> Result<Vec<&Asset>> {
         .filter(|a| {
             (a.name.starts_with("vpn-gui-") && !a.name.starts_with("vpn-gui-linux-"))
                 || (a.name.starts_with("vpn-android-") && a.name.ends_with(".apk"))
+                || (a.name.starts_with("vpn-cli-linux-")
+                    && (a.name.ends_with(".bin") || a.name.ends_with(".bin.sig")))
         })
         .collect();
     let android_name = format!(
@@ -687,11 +689,19 @@ fn validate(manifest: &Manifest, release: &Release) -> Result<()> {
     if let Some(date) = &manifest.pub_date {
         chrono::DateTime::parse_from_rfc3339(date).map_err(|_| "清单发布时间格式错误")?;
     }
-    let required = [
-        ("windows-x86_64", "windows-amd64-setup", "exe"),
-        ("darwin-x86_64", "macos-amd64", "app.tar.gz"),
-        ("darwin-aarch64", "macos-arm64", "app.tar.gz"),
+    let mut required = vec![
+        ("windows-x86_64", "vpn-gui-windows-amd64-setup", "exe"),
+        ("darwin-x86_64", "vpn-gui-macos-amd64", "app.tar.gz"),
+        ("darwin-aarch64", "vpn-gui-macos-arm64", "app.tar.gz"),
     ];
+    // Old releases remain mirrorable. New CLI manifests must contain both
+    // architectures, with signed packages from the very same release tag.
+    if manifest.platforms.keys().any(|key| key.starts_with("cli-")) {
+        required.extend([
+            ("cli-linux-x86_64", "vpn-cli-linux-amd64", "bin"),
+            ("cli-linux-aarch64", "vpn-cli-linux-arm64", "bin"),
+        ]);
+    }
     if manifest.platforms.len() != required.len() {
         return Err("更新清单平台不完整或包含未知平台".into());
     }
@@ -700,7 +710,7 @@ fn validate(manifest: &Manifest, release: &Release) -> Result<()> {
             .platforms
             .get(target)
             .ok_or_else(|| format!("缺少平台 {target}"))?;
-        let filename = format!("vpn-gui-{name}-{}.{extension}", release.tag_name);
+        let filename = format!("{name}-{}.{extension}", release.tag_name);
         let expected = format!(
             "https://github.com/{REPO}/releases/download/{}/{filename}",
             release.tag_name
@@ -1004,6 +1014,68 @@ mod tests {
             }
         }
         (manifest, release, files)
+    }
+    #[tokio::test]
+    async fn linux_cli_packages_require_both_architectures_and_are_mirrored() {
+        let (mut manifest, mut release, mut files) = fixture();
+        for (target, arch) in [
+            ("cli-linux-x86_64", "amd64"),
+            ("cli-linux-aarch64", "arm64"),
+        ] {
+            let name = format!("vpn-cli-linux-{arch}-v0.1.21.bin");
+            let signature = STANDARD.encode([42; 100]);
+            manifest.platforms.insert(
+                target.into(),
+                PlatformUpdate {
+                    url: format!("https://github.com/{REPO}/releases/download/v0.1.21/{name}"),
+                    signature: signature.clone(),
+                },
+            );
+            for (name, bytes) in [
+                (name.clone(), b"cli binary".to_vec()),
+                (format!("{name}.sig"), signature.into_bytes()),
+            ] {
+                release.assets.push(Asset {
+                    browser_download_url: format!(
+                        "https://github.com/{REPO}/releases/download/v0.1.21/{name}"
+                    ),
+                    size: bytes.len() as u64,
+                    digest: Some(format!("sha256:{:x}", Sha256::digest(&bytes))),
+                    name: name.clone(),
+                });
+                files.push((name, bytes));
+            }
+        }
+        validate(&manifest, &release).unwrap();
+        let mut incomplete = manifest.clone();
+        incomplete.platforms.remove("cli-linux-aarch64");
+        assert!(validate(&incomplete, &release).is_err());
+        let signature_asset = release.assets.pop().unwrap();
+        assert!(validate(&manifest, &release).is_err());
+        release.assets.push(signature_asset);
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        tokio::fs::create_dir_all(&stage).await.unwrap();
+        for (name, bytes) in files {
+            tokio::fs::write(stage.join(name), bytes).await.unwrap();
+        }
+        let service = ClientUpdateService::new(dir.path().to_owned());
+        service
+            .publish_downloaded(&stage, manifest, &release, "https://vpn.example")
+            .await
+            .unwrap();
+        let published = service.current().await.unwrap().unwrap();
+        for target in ["cli-linux-x86_64", "cli-linux-aarch64"] {
+            let entry = &published.platforms[target];
+            assert!(entry
+                .url
+                .starts_with("https://vpn.example/updates/releases/"));
+            assert!(published
+                .downloads
+                .iter()
+                .any(|asset| asset.url == entry.url));
+        }
+        assert_eq!(package_assets(&release).unwrap().len(), 10);
     }
     #[test]
     fn android_apk_is_optional_canonical_verified_and_aab_is_ignored() {

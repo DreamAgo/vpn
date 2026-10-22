@@ -9,6 +9,8 @@ from urllib.parse import quote
 
 
 ASSETS = {
+    "cli-linux-x86_64": "vpn-cli-linux-amd64-{tag}.bin",
+    "cli-linux-aarch64": "vpn-cli-linux-arm64-{tag}.bin",
     "windows-x86_64": "vpn-gui-windows-amd64-setup-{tag}.exe",
     "darwin-x86_64": "vpn-gui-macos-amd64-{tag}.app.tar.gz",
     "darwin-aarch64": "vpn-gui-macos-arm64-{tag}.app.tar.gz",

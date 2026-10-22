@@ -27,4 +27,6 @@ pub mod netmon;
 pub mod reconnect;
 mod route_bypass;
 mod route_reconcile;
+#[cfg(unix)]
+pub mod update;
 pub mod wg_userspace;
