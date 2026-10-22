@@ -80,6 +80,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p vpn-cli
+          # Hosted runners make /usr/local writable by runner users. A root
+          # updater deliberately rejects that; prepare production-like paths.
+          sudo chown root:root /usr/local /usr/local/bin
+          sudo chmod go-w /usr/local /usr/local/bin
+          sudo install -d -o root -g root -m 0755 /usr/local/libexec
           sudo install -o root -g root -m 0755 target/debug/vpn-cli /usr/local/bin/vpn-cli
           sudo /usr/local/bin/vpn-cli daemon install-system
           sudo /usr/local/bin/vpn-cli update install --server https://127.0.0.1:9
