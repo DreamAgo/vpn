@@ -811,6 +811,12 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
     }
 
     let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<ControlMsg>(8);
+    // Opt-in for unattended Linux system services; desktop/user services retain
+    // their existing explicit Connect behavior.
+    let auto_connect = std::env::var("VPN_CLI_AUTO_CONNECT").as_deref() == Ok("1");
+    if auto_connect {
+        let _ = ctrl_tx.send(ControlMsg::Connect).await;
+    }
 
     // IPC server：把请求分发到主循环。
     let ipc_state = state.clone();
@@ -836,7 +842,23 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
     // 一旦无法证明旧数据面已删除路由，本 daemon 进程内永久
     // fail-closed。重启 daemon 是当前唯一安全的人工恢复边界。
     let mut cleanup_failure: Option<String> = None;
-    'control: while let Some(msg) = ctrl_rx.recv().await {
+    let mut reconnect_tick = tokio::time::interval(Duration::from_secs(60));
+    'control: loop {
+        let msg = tokio::select! {
+            message = ctrl_rx.recv() => {
+                let Some(message) = message else { break };
+                message
+            }
+            _ = reconnect_tick.tick(), if auto_connect => {
+                // A headless node may boot before its server is reachable.
+                // Retry initial failures, but never override manual disconnect
+                // or the fail-closed route-cleanup boundary.
+                if cleanup_failure.is_some() || state.snapshot().await.state != ConnState::Error {
+                    continue 'control;
+                }
+                ControlMsg::Connect
+            }
+        };
         match msg {
             ControlMsg::Connect => {
                 if let Some(error) = cleanup_failure.as_ref() {

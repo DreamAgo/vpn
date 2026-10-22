@@ -75,6 +75,32 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features
 
+      - name: Linux systemd updater installation smoke test
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo build -p vpn-cli
+          # Hosted runners make /usr/local writable by runner users. A root
+          # updater deliberately rejects that; prepare production-like paths.
+          sudo chown root:root /usr/local /usr/local/bin
+          sudo chmod go-w /usr/local /usr/local/bin
+          sudo install -d -o root -g root -m 0755 /usr/local/libexec
+          sudo install -o root -g root -m 0755 target/debug/vpn-cli /usr/local/bin/vpn-cli
+          sudo /usr/local/bin/vpn-cli daemon install-system
+          sudo /usr/local/bin/vpn-cli update install --server https://127.0.0.1:9
+          sudo systemd-analyze verify /etc/systemd/system/vpn-cli.service /etc/systemd/system/vpn-cli-update.service /etc/systemd/system/vpn-cli-update.timer
+          sudo systemctl is-enabled vpn-cli-update.timer
+          sudo systemctl is-active vpn-cli-update.timer
+          before=$(sha256sum /usr/local/bin/vpn-cli)
+          if sudo /usr/local/libexec/vpn-cli-updater update run; then
+            echo 'An unavailable update source must fail without replacing the client' >&2
+            exit 1
+          fi
+          test "$before" = "$(sha256sum /usr/local/bin/vpn-cli)"
+          sudo /usr/local/libexec/vpn-cli-updater update disable
+          if sudo systemctl is-enabled --quiet vpn-cli-update.timer; then exit 1; fi
+          sudo systemctl disable --now vpn-cli.service
+
   # ============================================================
   # Frontend: ESLint + tsc + build
   # ============================================================

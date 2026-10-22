@@ -37,6 +37,8 @@ net-route = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+minisign-verify = "0.2.5"
+semver = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
