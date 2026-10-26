@@ -1053,7 +1053,7 @@ fn install_shell_command(exe: &Path, expected_hash: &str) -> String {
     // plist 内容是编译进程序的固定数据，不接受路径、label 或参数输入。
     let plist_b64 = base64::engine::general_purpose::STANDARD.encode(render_plist());
     format!(
-        "set -e; H={}; P={}; L=/var/run/{HELPER_LABEL}.install.lock; /usr/bin/touch $L; \
+        "set -e; H={}; P={}; {} L=/var/run/{HELPER_LABEL}.install.lock; /usr/bin/touch $L; \
          /usr/sbin/chown root:wheel $L; /bin/chmod 600 $L; exec 9>$L; /usr/bin/lockf -t 30 9; \
          N=$H.new.$$; Q=$P.new.$$; HB=$H.bak; PB=$P.bak; ARMED=0; \
          if [ -e $HB ] || [ -e $PB ]; then CUR_OK=0; \
@@ -1072,9 +1072,18 @@ fn install_shell_command(exe: &Path, expected_hash: &str) -> String {
          /bin/launchctl bootout system/{HELPER_LABEL} >/dev/null 2>&1 || true; \
          /bin/mv -f $N $H; /bin/mv -f $Q $P; /bin/sync; /bin/launchctl bootstrap system $P; \
          ARMED=0; /bin/rm -f $HB $PB; /bin/sync; trap - EXIT HUP INT TERM",
-        shell_quote(HELPER_PATH), shell_quote(PLIST_PATH), shell_quote(&exe.to_string_lossy()),
+        shell_quote(HELPER_PATH), shell_quote(PLIST_PATH), prepare_helper_directories_command(), shell_quote(&exe.to_string_lossy()),
         shell_quote(expected_hash), shell_quote(&plist_b64)
     )
+}
+
+fn prepare_helper_directories_command() -> &'static str {
+    // A fresh Mac may not have PrivilegedHelperTools yet. Run inside the
+    // administrator-authorized shell, before recovery or staging any files.
+    "for D in /Library/PrivilegedHelperTools /Library/LaunchDaemons; do \
+     if [ -L \"$D\" ] || { [ -e \"$D\" ] && [ ! -d \"$D\" ]; }; then \
+     /bin/echo \"helper 安装目录不是普通目录: $D\" >&2; exit 1; fi; \
+     /usr/bin/install -d -o root -g wheel -m 755 \"$D\"; done;"
 }
 
 fn render_plist() -> String {
@@ -1245,6 +1254,10 @@ mod tests {
     #[test]
     fn privileged_install_is_hash_pinned_and_transactional() {
         let command = install_shell_command(Path::new("/tmp/App bin"), &"a".repeat(64));
+        assert!(
+            command.find(prepare_helper_directories_command()).unwrap()
+                < command.find("if [ -e $HB ]").unwrap()
+        );
         assert!(command.contains("shasum -a 256"));
         assert!(command.contains("trap rollback EXIT HUP INT TERM"));
         assert!(command.contains("base64 -D"));
@@ -1260,6 +1273,83 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn helper_install_prepares_missing_directories_and_rejects_unsafe_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "helper-directories-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let helper = root.join("Privileged Helper Tools");
+        let daemons = root.join("LaunchDaemons");
+        // Exercise the actual macOS install command without administrator
+        // privileges or writes to /Library; only paths and ownership differ.
+        let command = format!("set -e; {}", prepare_helper_directories_command())
+            .replace(
+                "/Library/PrivilegedHelperTools",
+                &shell_quote(&helper.to_string_lossy()),
+            )
+            .replace(
+                "/Library/LaunchDaemons",
+                &shell_quote(&daemons.to_string_lossy()),
+            )
+            .replace(
+                "-o root -g wheel",
+                &format!("-o {} -g {}", unsafe { libc::geteuid() }, unsafe {
+                    libc::getegid()
+                }),
+            );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap()
+        };
+
+        let result = run();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for dir in [&helper, &daemons] {
+            let metadata = std::fs::metadata(dir).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.gid(), unsafe { libc::getegid() });
+        }
+        let existing = helper.join("existing-helper");
+        std::fs::write(&existing, b"keep").unwrap();
+        assert!(run().status.success());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+        std::fs::remove_file(existing).unwrap();
+
+        for dir in [&helper, &daemons] {
+            std::fs::remove_dir(dir).unwrap();
+            std::fs::write(dir, b"occupied").unwrap();
+            assert!(!run().status.success());
+            assert_eq!(std::fs::read(dir).unwrap(), b"occupied");
+            std::fs::remove_file(dir).unwrap();
+            // Both a directory symlink and a dangling symlink must be rejected.
+            for target in [&root, &root.join("missing")] {
+                std::os::unix::fs::symlink(target, dir).unwrap();
+                assert!(!run().status.success());
+                assert!(std::fs::symlink_metadata(dir)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                std::fs::remove_file(dir).unwrap();
+            }
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
