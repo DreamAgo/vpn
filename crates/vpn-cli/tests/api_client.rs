@@ -392,3 +392,102 @@ async fn heartbeat_unauthorized_refreshes_and_retries() {
     assert_eq!(response.allowed_routes, vec!["10.8.0.0/24"]);
     assert_eq!(client.access_token().as_deref(), Some("fresh"));
 }
+
+#[tokio::test]
+async fn near_expiry_requests_share_one_proactive_refresh() {
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/auth/login"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(LoginResponse {
+                access_token: "near-expiry".into(),
+                refresh_token: "rtk".into(),
+                access_expires_in: 30,
+                must_change_password: false,
+            })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/auth/refresh"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(40))
+                .set_body_json(ok_envelope(RefreshResponse {
+                    access_token: "fresh".into(),
+                    access_expires_in: 900,
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/peers/heartbeat"))
+        .and(header("authorization", "Bearer near-expiry"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/peers/heartbeat"))
+        .and(header("authorization", "Bearer fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(())))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/peers/me/config"))
+        .and(header("authorization", "Bearer fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("config"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = ApiClient::new(server.uri()).unwrap();
+    client.login("alice", "pw").await.unwrap();
+    let req = vpn_api_types::peer::PeerHeartbeatRequest {
+        endpoint: None,
+        wg_public_key: None,
+        rtt_ms: None,
+        loss_pct: None,
+    };
+    let (a, b, c) = tokio::join!(
+        client.heartbeat(&req),
+        client.heartbeat(&req),
+        client.download_config()
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(c.unwrap(), "config");
+}
+
+#[tokio::test]
+async fn proactive_refresh_failure_does_not_send_stale_heartbeat() {
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/auth/login"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(LoginResponse {
+                access_token: "near-expiry".into(),
+                refresh_token: "revoked".into(),
+                access_expires_in: 30,
+                must_change_password: false,
+            })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/auth/refresh"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(err_envelope(1002, "Token 过期或无效")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/peers/heartbeat"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let client = ApiClient::new(server.uri()).unwrap();
+    client.login("alice", "pw").await.unwrap();
+    let req = vpn_api_types::peer::PeerHeartbeatRequest {
+        endpoint: None,
+        wg_public_key: None,
+        rtt_ms: None,
+        loss_pct: None,
+    };
+    assert!(client.heartbeat(&req).await.unwrap_err().is_token_expired());
+}

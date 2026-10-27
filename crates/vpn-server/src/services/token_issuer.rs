@@ -160,12 +160,25 @@ impl TokenIssuer for JwtTokenIssuer {
     }
 
     async fn verify_access(&self, token: &str) -> Result<(String, String)> {
-        let data =
-            jsonwebtoken::decode::<AccessClaims>(token, &self.decoding_key, &Self::validation())
-                .map_err(|e| match e.kind() {
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => AppError::TokenExpired,
-                    _ => AppError::TokenExpired, // 任何 JWT 错误都视为 token 无效，避免泄露详细原因
-                })?;
+        let data = match jsonwebtoken::decode::<AccessClaims>(
+            token,
+            &self.decoding_key,
+            &Self::validation(),
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                // Revalidate authenticity and all other claims before classifying
+                // expiration as routine. Never suppress an invalid signature.
+                if matches!(
+                    error.kind(),
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature
+                ) && self.access_subject_for_audit(token).await.is_some()
+                {
+                    return Err(AppError::AccessTokenExpired);
+                }
+                return Err(AppError::TokenExpired);
+            }
+        };
         Ok((data.claims.sub, data.claims.role))
     }
 
@@ -232,13 +245,20 @@ mod tests {
         };
         let token =
             jsonwebtoken::encode(&JwtTokenIssuer::header(), &claims, &issuer.encoding_key).unwrap();
-        assert!(issuer.verify_access(&token).await.is_err());
+        assert!(matches!(
+            issuer.verify_access(&token).await,
+            Err(AppError::AccessTokenExpired)
+        ));
         assert_eq!(
             issuer.access_subject_for_audit(&token).await.as_deref(),
             Some("user-1")
         );
         let other = make_issuer();
         assert!(other.access_subject_for_audit(&token).await.is_none());
+        assert!(matches!(
+            other.verify_access(&token).await,
+            Err(AppError::TokenExpired)
+        ));
         assert!(issuer
             .access_subject_for_audit("invalid.jwt.token")
             .await
@@ -250,6 +270,10 @@ mod tests {
         let token =
             jsonwebtoken::encode(&JwtTokenIssuer::header(), &future, &issuer.encoding_key).unwrap();
         assert!(issuer.access_subject_for_audit(&token).await.is_none());
+        assert!(matches!(
+            issuer.verify_access(&token).await,
+            Err(AppError::TokenExpired)
+        ));
     }
 
     #[tokio::test]

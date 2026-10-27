@@ -28,6 +28,9 @@ function Details({ record }: { record: AuditLogDto }) {
       {key:'actor',label:'操作者 ID',children:record.userId ?? '未提供'},
       {key:'ip',label:'来源 IP',children:record.ipAddr ?? '未提供'},
       {key:'request',label:'请求 ID',children:String(data.request_id ?? '历史记录未提供')},
+      {key:'count',label:'发生次数',children:String(data.occurrences ?? 1)},
+      {key:'first',label:'首次发生',children:dayjs(Number(data.first_seen_at ?? record.createdAt)).format('YYYY-MM-DD HH:mm:ss')},
+      {key:'last',label:'最近发生',children:dayjs(Number(data.last_seen_at ?? record.createdAt)).format('YYYY-MM-DD HH:mm:ss')},
       {key:'status',label:'HTTP 状态',children:record.statusCode ?? '未提供'},
       {key:'agent',label:'客户端',children:record.userAgent ?? '未提供'},
       {key:'reason',label:'结果说明',children:String(data.reason ?? data.reason_code ?? (data.outcome === 'committed' ? '数据库变更已提交；运行时应用失败会另记失败记录' : '—'))},
@@ -71,6 +74,7 @@ export function AuditLogsPage() {
     {title:'操作',dataIndex:'action',render:(_,r)=><span title={r.action}>{labels[r.action] ?? r.action}</span>},
     {title:'目标',dataIndex:'resource',ellipsis:true},
     {title:'来源 IP',dataIndex:'ipAddr'},
+    {title:'次数',width:70,render:(_,r)=>String(metadata(r).occurrences ?? 1)},
     {title:'结果',render:(_,r)=><Tag color={outcome(r)==='失败'?'error':outcome(r)==='历史记录未提供'?'default':'success'}>{outcome(r)}</Tag>},
   ];
   const exportLogs = async () => {
@@ -84,8 +88,10 @@ export function AuditLogsPage() {
         rows.push(...data.items);
         if(rows.length>=data.total || !data.items.length) break;
       }
-      const lines=[['时间','操作者','操作者ID','操作','目标','来源IP','结果','HTTP状态','请求ID'],...rows.map(r=>[
-        dayjs(r.createdAt).format('YYYY-MM-DD HH:mm:ss'),r.username,r.userId,labels[r.action] ?? r.action,r.resource,r.ipAddr,outcome(r),r.statusCode,metadata(r).request_id,
+      const lines=[['时间','操作者','操作者ID','操作','目标','来源IP','结果','次数','首次发生','最近发生','HTTP状态','请求ID'],...rows.map(r=>[
+        dayjs(r.createdAt).format('YYYY-MM-DD HH:mm:ss'),r.username,r.userId,labels[r.action] ?? r.action,r.resource,r.ipAddr,outcome(r),metadata(r).occurrences ?? 1,
+        dayjs(Number(metadata(r).first_seen_at ?? r.createdAt)).format('YYYY-MM-DD HH:mm:ss'),
+        dayjs(Number(metadata(r).last_seen_at ?? r.createdAt)).format('YYYY-MM-DD HH:mm:ss'),r.statusCode,metadata(r).request_id,
       ])];
       const url=URL.createObjectURL(new Blob(['\uFEFF'+lines.map(row=>row.map(csvCell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}));
       const link=document.createElement('a');link.href=url;link.download='audit-logs.csv';link.click();

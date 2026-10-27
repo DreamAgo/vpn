@@ -13,6 +13,7 @@
 //! 网络层用 `wiremock` 做端到端验证（见 tests/）。
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -72,6 +73,8 @@ pub struct Tokens {
     pub access_token: Option<String>,
     /// refresh token（用于刷新 access token）。
     pub refresh_token: Option<String>,
+    /// Conservative refresh deadline derived from the server-provided TTL.
+    pub access_refresh_at: Option<Instant>,
 }
 
 /// HTTP API 客户端。
@@ -79,6 +82,7 @@ pub struct ApiClient {
     base_url: String,
     http: reqwest::Client,
     tokens: Mutex<Tokens>,
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 /// Install the TLS crypto provider required by this client before any HTTP
@@ -143,12 +147,16 @@ impl ApiClient {
             base_url: normalize_base_url(base_url.into()),
             http,
             tokens: Mutex::new(Tokens::default()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     /// 设置已持有的 refresh token（例如从凭证存储恢复后）。
     pub fn set_refresh_token(&self, token: impl Into<String>) {
-        self.tokens.lock().unwrap().refresh_token = Some(token.into());
+        let mut tokens = self.tokens.lock().unwrap();
+        tokens.refresh_token = Some(token.into());
+        tokens.access_token = None;
+        tokens.access_refresh_at = None;
     }
 
     /// 当前 refresh token（用于持久化）。
@@ -173,11 +181,13 @@ impl ApiClient {
             username: username.to_string(),
             password: password.to_string(),
         };
+        let started = Instant::now();
         let resp: LoginResponse = self.post_json_unauthed("/api/v1/auth/login", &req).await?;
         {
             let mut t = self.tokens.lock().unwrap();
             t.access_token = Some(resp.access_token.clone());
             t.refresh_token = Some(resp.refresh_token.clone());
+            t.access_refresh_at = Some(refresh_deadline(started, resp.access_expires_in));
         }
         Ok(resp)
     }
@@ -197,6 +207,7 @@ impl ApiClient {
     }
 
     pub async fn feishu_poll(&self, poll_token: &str) -> CliResult<FeishuAuthPollResponse> {
+        let started = Instant::now();
         let response: FeishuAuthPollResponse = self
             .post_json_unauthed(
                 "/api/v1/auth/feishu/poll",
@@ -210,6 +221,7 @@ impl ApiClient {
                 let mut tokens = self.tokens.lock().unwrap();
                 tokens.access_token = Some(login.access_token.clone());
                 tokens.refresh_token = Some(login.refresh_token.clone());
+                tokens.access_refresh_at = Some(refresh_deadline(started, login.access_expires_in));
             }
         }
         Ok(response)
@@ -229,6 +241,11 @@ impl ApiClient {
 
     /// 用 refresh token 换取新的 access token，并更新内部状态。
     pub async fn refresh(&self) -> CliResult<RefreshResponse> {
+        let _guard = self.refresh_lock.lock().await;
+        self.refresh_unlocked().await
+    }
+
+    async fn refresh_unlocked(&self) -> CliResult<RefreshResponse> {
         let refresh_token = self
             .tokens
             .lock()
@@ -236,11 +253,17 @@ impl ApiClient {
             .refresh_token
             .clone()
             .ok_or(CliError::NotLoggedIn)?;
+        let started = Instant::now();
         let req = RefreshRequest { refresh_token };
         let resp: RefreshResponse = self
             .post_json_unauthed("/api/v1/auth/refresh", &req)
             .await?;
-        self.tokens.lock().unwrap().access_token = Some(resp.access_token.clone());
+        let mut tokens = self.tokens.lock().unwrap();
+        if tokens.refresh_token.as_deref() != Some(req.refresh_token.as_str()) {
+            return Err(CliError::NotLoggedIn);
+        }
+        tokens.access_token = Some(resp.access_token.clone());
+        tokens.access_refresh_at = Some(refresh_deadline(started, resp.access_expires_in));
         Ok(resp)
     }
 
@@ -259,6 +282,7 @@ impl ApiClient {
         let mut t = self.tokens.lock().unwrap();
         t.access_token = None;
         t.refresh_token = None;
+        t.access_refresh_at = None;
         Ok(())
     }
 
@@ -286,16 +310,16 @@ impl ApiClient {
 
     /// 下载客户端 .conf 配置（非信封，纯文本附件）。
     pub async fn download_config(&self) -> CliResult<String> {
-        let access = self.require_access()?;
+        let access = self.fresh_access().await?;
         let do_req = |token: String| {
             self.http
                 .get(self.url("/api/v1/peers/me/config"))
                 .bearer_auth(token)
         };
-        let resp = do_req(access).send().await?;
+        let resp = do_req(access.clone()).send().await?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            // 刷新后重试一次。
-            self.refresh().await?;
+            // 刷新后重试一次，并复用并发请求已经刷新出的 token。
+            self.refresh_after_rejection(&access).await?;
             let access = self.require_access()?;
             let resp = do_req(access).send().await?;
             return Ok(resp.error_for_status()?.text().await?);
@@ -304,6 +328,31 @@ impl ApiClient {
     }
 
     // === 内部 HTTP 辅助 ===
+
+    async fn fresh_access(&self) -> CliResult<String> {
+        let needs_refresh = || {
+            self.tokens
+                .lock()
+                .unwrap()
+                .access_refresh_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        };
+        if needs_refresh() {
+            let _guard = self.refresh_lock.lock().await;
+            if needs_refresh() {
+                self.refresh_unlocked().await?;
+            }
+        }
+        self.require_access()
+    }
+
+    async fn refresh_after_rejection(&self, rejected: &str) -> CliResult<()> {
+        let _guard = self.refresh_lock.lock().await;
+        if self.require_access()? == rejected {
+            self.refresh_unlocked().await?;
+        }
+        Ok(())
+    }
 
     fn require_access(&self) -> CliResult<String> {
         self.tokens
@@ -331,11 +380,13 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> CliResult<T> {
-        match self.post_json_authed_once(path, body).await {
+        let access = self.fresh_access().await?;
+        match self.post_json_authed_once(path, body, &access).await {
             Err(e) if e.is_token_expired() => {
                 // 刷新 access token 后重试一次。
-                self.refresh().await?;
-                self.post_json_authed_once(path, body).await
+                self.refresh_after_rejection(&access).await?;
+                self.post_json_authed_once(path, body, &self.require_access()?)
+                    .await
             }
             other => other,
         }
@@ -345,8 +396,8 @@ impl ApiClient {
         &self,
         path: &str,
         body: &B,
+        access: &str,
     ) -> CliResult<T> {
-        let access = self.require_access()?;
         let resp = self
             .http
             .post(self.url(path))
@@ -357,6 +408,14 @@ impl ApiClient {
         let text = resp.text().await?;
         parse_and_unwrap(&text)
     }
+}
+
+// Start from request dispatch so network latency cannot extend token validity.
+fn refresh_deadline(started: Instant, ttl_secs: i64) -> Instant {
+    let seconds = (ttl_secs.max(0) as u64).saturating_sub(60);
+    started
+        .checked_add(Duration::from_secs(seconds))
+        .unwrap_or(started)
 }
 
 /// 规整 base_url：去掉末尾的 `/`，避免拼接出 `//`。
