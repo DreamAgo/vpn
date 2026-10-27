@@ -280,13 +280,35 @@ pub async fn login(
     ))
 }
 
-#[tracing::instrument(skip(state, body))]
+#[tracing::instrument(skip(state, headers, body))]
 pub async fn refresh(
     State(state): State<AppState>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     Json(body): Json<RefreshRequest>,
 ) -> Result<Json<ApiResponse<RefreshResponse>>, ApiError> {
     let svc = state.auth_service()?;
-    let access_token = svc.refresh(&body.refresh_token).await?;
+    let result = svc.refresh(&body.refresh_token).await;
+    if let (Err(error), Some(audit)) = (&result, &state.audit_service) {
+        let (ip, ua) = extract_client_info(&headers, peer, &state);
+        let hash = crate::services::token_issuer::hash_refresh_token(&body.refresh_token);
+        let user_id = svc.session_repo.user_for_audit(&hash).await.ok().flatten();
+        let username = match user_id.as_deref() {
+            Some(id) => audit.actor_name(id).await,
+            None => None,
+        };
+        audit.log_rejection(crate::repositories::AuditLogEntry {
+            user_id, username, action: "auth.rejected".into(),
+            resource: "/api/v1/auth/refresh".into(), ip_addr: ip,
+            user_agent: ua.map(|value| value.chars().take(512).collect()),
+            status_code: Some(crate::error::status_code(error).as_u16() as i32),
+            metadata: Some(serde_json::json!({"outcome":"failed", "reason_code":error.code(),
+                "reason":match error.code() {1002=>"刷新凭据过期或无效",1004=>"账号已禁用",3001=>"用户不存在",_=>"认证检查失败"},
+                "authenticated":false,
+                "request_id":headers.get("x-request-id").and_then(|value|value.to_str().ok()).map(|value|value.chars().take(128).collect::<String>())}).to_string()),
+        }, state.clock.now_unix_ms()).await;
+    }
+    let access_token = result?;
     Ok(success(
         &state,
         RefreshResponse {

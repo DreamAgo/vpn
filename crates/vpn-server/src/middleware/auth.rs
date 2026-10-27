@@ -49,6 +49,13 @@ pub async fn require_auth(
         .filter(|v| !v.starts_with("ylk_"))
         .map(str::to_owned);
     let result = authenticate(axum::extract::State(state.clone()), request, next).await;
+    if matches!(&result, Err(error) if matches!(error.inner, AppError::AccessTokenExpired)) {
+        tracing::debug!(resource = %path, "Access Token 正常到期，等待客户端续期");
+        if let Some(audit) = &state.audit_service {
+            audit.record_access_expiration();
+        }
+        return result;
+    }
     if let (Err(error), Some(audit)) = (&result, &state.audit_service) {
         let user_id = match (state.auth_service(), audit_token.as_deref()) {
             (Ok(svc), Some(token)) => svc.issuer.access_subject_for_audit(token).await,
@@ -60,7 +67,7 @@ pub async fn require_auth(
         };
         let identity_source = user_id.as_ref().map(|_| "signature_verified_access_token");
         audit
-            .log(
+            .log_rejection(
                 crate::repositories::AuditLogEntry {
                     action: "auth.rejected".into(),
                     user_id,
@@ -70,7 +77,7 @@ pub async fn require_auth(
                     ip_addr: ip,
                     status_code: Some(crate::error::status_code(&error.inner).as_u16() as i32),
                     metadata: Some(
-                        serde_json::json!({"outcome":"failed","reason_code":error.inner.code(),"request_id":request_id,"authenticated":false,"identity_source":identity_source})
+                        serde_json::json!({"outcome":"failed","reason_code":error.inner.code(),"reason":match error.inner.code() {1002=>"认证凭据无效",1004=>"账号已禁用",1007=>"缺失认证信息",3001=>"用户不存在",_=>"认证检查失败"},"request_id":request_id,"authenticated":false,"identity_source":identity_source})
                             .to_string(),
                     ),
                 },
@@ -105,7 +112,20 @@ async fn authenticate(
         }
 
         let svc = state.auth_service()?;
-        let (user_id, role) = svc.issuer.verify_access(token).await?;
+        let (user_id, role) = match svc.issuer.verify_access(token).await {
+            Err(AppError::AccessTokenExpired) => {
+                let user_id = svc
+                    .issuer
+                    .access_subject_for_audit(token)
+                    .await
+                    .ok_or(AppError::TokenExpired)?;
+                // A disabled/deleted account must remain auditable even when its
+                // otherwise authentic access token has also expired.
+                svc.user_repo.ensure_available(&user_id).await?;
+                return Err(AppError::AccessTokenExpired.into());
+            }
+            other => other?,
+        };
         svc.user_repo.ensure_available(&user_id).await?;
         request
             .extensions_mut()

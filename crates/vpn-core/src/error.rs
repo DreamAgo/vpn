@@ -19,6 +19,10 @@ pub enum AppError {
     #[error("Token 过期或无效")]
     TokenExpired,
 
+    /// Internally distinguished from invalid credentials; same public response.
+    #[error("Token 过期或无效")]
+    AccessTokenExpired,
+
     #[error("账号已锁定，请稍后再试")]
     AccountLocked,
 
@@ -96,7 +100,7 @@ impl AppError {
     pub fn code(&self) -> i32 {
         match self {
             AppError::InvalidCredentials => error_codes::INVALID_CREDENTIALS,
-            AppError::TokenExpired => error_codes::TOKEN_EXPIRED,
+            AppError::TokenExpired | AppError::AccessTokenExpired => error_codes::TOKEN_EXPIRED,
             AppError::AccountLocked => error_codes::ACCOUNT_LOCKED,
             AppError::AccountDisabled => error_codes::ACCOUNT_DISABLED,
             AppError::PasswordTooWeak(_) => error_codes::PASSWORD_TOO_WEAK,
@@ -145,6 +149,11 @@ mod tests {
     fn error_codes_match_expected_business_codes() {
         assert_eq!(AppError::InvalidCredentials.code(), 1001);
         assert_eq!(AppError::TokenExpired.code(), 1002);
+        assert_eq!(AppError::AccessTokenExpired.code(), 1002);
+        assert_eq!(
+            AppError::AccessTokenExpired.to_string(),
+            AppError::TokenExpired.to_string()
+        );
         assert_eq!(AppError::RequireAdmin.code(), 2001);
         assert_eq!(AppError::UserNotFound.code(), 3001);
         assert_eq!(AppError::RateLimited.code(), 4001);

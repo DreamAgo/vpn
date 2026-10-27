@@ -80,6 +80,15 @@ impl SqliteSessionRepository {
         Ok(())
     }
 
+    /// Audit attribution only: includes revoked and expired sessions, never authorizes.
+    pub async fn user_for_audit(&self, hash: &str) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT user_id FROM sessions WHERE refresh_token_hash=?")
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| AppError::Database(Box::new(error)))
+    }
+
     /// 查找未撤销且未过期的 session。
     pub async fn find_active_by_token_hash(
         &self,

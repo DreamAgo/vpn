@@ -131,6 +131,39 @@ impl SqliteAuditLogRepository {
         Ok(())
     }
 
+    /// Atomically retain and count repeated authentication rejections.
+    pub async fn insert_rejection(
+        &self,
+        id: &str,
+        entry: &AuditLogEntry,
+        now_ms: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO audit_logs
+            (id,user_id,username,action,resource,ip_addr,user_agent,metadata,status_code,created_at)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            ON CONFLICT(id) DO UPDATE SET metadata=json_set(audit_logs.metadata,
+                '$.occurrences',json_extract(audit_logs.metadata,'$.occurrences')+1,
+                '$.first_seen_at',min(json_extract(audit_logs.metadata,'$.first_seen_at'),?10),
+                '$.last_seen_at',max(json_extract(audit_logs.metadata,'$.last_seen_at'),?10),
+                '$.last_request_id',json_extract(excluded.metadata,'$.request_id'))"#,
+        )
+        .bind(id)
+        .bind(&entry.user_id)
+        .bind(&entry.username)
+        .bind(&entry.action)
+        .bind(&entry.resource)
+        .bind(&entry.ip_addr)
+        .bind(&entry.user_agent)
+        .bind(&entry.metadata)
+        .bind(entry.status_code)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| AppError::Database(Box::new(error)))?;
+        Ok(())
+    }
+
     /// 统计符合过滤条件的总数（分页 total）。
     pub async fn count(&self, filter: &AuditLogFilter) -> Result<i64> {
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT COUNT(*) FROM audit_logs");

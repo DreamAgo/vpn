@@ -286,3 +286,237 @@ async fn audit_logs_require_admin() {
     let (status, _) = req(&app, "GET", "/api/v1/admin/audit-logs", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+fn signed_expired_token(tmp: &tempfile::TempDir, user_id: &str) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let key = std::fs::read(tmp.path().join("jwt_private.pem")).unwrap();
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &json!({"sub":user_id,"role":"user","exp":now-60,"iat":now-960}),
+        &jsonwebtoken::EncodingKey::from_rsa_pem(&key).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn routine_expiration_is_not_audited_but_invalid_credentials_are() {
+    let (app, tmp, access, admin_id) = setup_admin().await;
+    let expired = signed_expired_token(&tmp, &admin_id);
+    let (status, body) = req(
+        &app,
+        "POST",
+        "/api/v1/peers/heartbeat",
+        Some(json!({})),
+        Some(&expired),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], 1002);
+    assert_eq!(body["message"], "Token 过期或无效");
+    let query = "/api/v1/admin/audit-logs?action=auth.rejected";
+    let (_, logs) = req(&app, "GET", query, None, Some(&access)).await;
+    assert_eq!(logs["data"]["total"], 0);
+    let (_, health) = req(
+        &app,
+        "GET",
+        "/api/v1/admin/audit-health",
+        None,
+        Some(&access),
+    )
+    .await;
+    assert_eq!(health["data"]["access_expirations"], 1);
+    for _ in 0..3 {
+        let (status, body) = req(
+            &app,
+            "POST",
+            "/api/v1/peers/heartbeat",
+            Some(json!({})),
+            Some("forged.jwt.token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], 1002);
+    }
+    let (_, logs) = req(&app, "GET", query, None, Some(&access)).await;
+    let rows = logs["data"]["items"].as_array().unwrap();
+    // A wall-clock bucket boundary can legitimately produce two groups.
+    let count: u64 = rows
+        .iter()
+        .map(|row| {
+            assert!(row["user_id"].is_null());
+            let metadata: Value = serde_json::from_str(row["metadata"].as_str().unwrap()).unwrap();
+            assert_eq!(metadata["reason_code"], 1002);
+            metadata["occurrences"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(count, 3);
+    assert!(!logs.to_string().contains("forged.jwt.token"));
+}
+
+#[tokio::test]
+async fn disabled_accounts_and_failed_refresh_remain_auditable() {
+    let (app, tmp, access, _) = setup_admin().await;
+    let (status, user) = req(
+        &app,
+        "POST",
+        "/api/v1/admin/users",
+        Some(json!({"username":"disabled-user","email":"disabled@example.com"})),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{user}");
+    let id = user["data"]["user"]["id"]
+        .as_str()
+        .or_else(|| user["data"]["id"].as_str())
+        .unwrap();
+    let (status, body) = req(
+        &app,
+        "PATCH",
+        &format!("/api/v1/admin/users/{id}"),
+        Some(json!({"status":"disabled"})),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expired = signed_expired_token(&tmp, id);
+    let (_, body) = req(
+        &app,
+        "POST",
+        "/api/v1/peers/heartbeat",
+        Some(json!({})),
+        Some(&expired),
+    )
+    .await;
+    assert_eq!(body["code"], 1004);
+    let (_, body) = req(
+        &app,
+        "POST",
+        "/api/v1/auth/refresh",
+        Some(json!({"refresh_token":"invalid-secret"})),
+        None,
+    )
+    .await;
+    assert_eq!(body["code"], 1002);
+    let (_, logs) = req(
+        &app,
+        "GET",
+        "/api/v1/admin/audit-logs?action=auth.rejected",
+        None,
+        Some(&access),
+    )
+    .await;
+    let rows = logs["data"]["items"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{logs}");
+    assert!(rows
+        .iter()
+        .any(|row| row["user_id"] == id && row["resource"] == "/api/v1/peers/heartbeat"));
+    assert!(rows
+        .iter()
+        .any(|row| row["resource"] == "/api/v1/auth/refresh"));
+    assert!(!logs.to_string().contains("invalid-secret"));
+}
+
+#[tokio::test]
+async fn rejection_aggregation_preserves_counts_and_separates_keys_and_windows() {
+    use vpn_server::repositories::AuditLogEntry;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let audit = AuditService::new(SqliteAuditLogRepository::new(pool.clone()));
+    let entry = AuditLogEntry {
+        action: "auth.rejected".into(),
+        resource: "/api/v1/peers/heartbeat".into(),
+        ip_addr: Some("192.0.2.1".into()),
+        status_code: Some(401),
+        metadata: Some(
+            json!({"outcome":"failed","reason_code":1002,"request_id":"first"}).to_string(),
+        ),
+        ..Default::default()
+    };
+    let mut jobs = Vec::new();
+    for n in 0..8 {
+        let audit = audit.clone();
+        let entry = entry.clone();
+        jobs.push(tokio::spawn(async move {
+            audit.log_rejection(entry, 300_000 + n).await
+        }));
+    }
+    for job in jobs {
+        job.await.unwrap();
+    }
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT metadata FROM audit_logs")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let data: Value = serde_json::from_str(&rows[0].0).unwrap();
+    assert_eq!(data["occurrences"], 8);
+    assert_eq!(data["first_seen_at"], 300_000);
+    assert_eq!(data["last_seen_at"], 300_007);
+    // Recreating the service must not reset the persisted group count.
+    let audit = AuditService::new(SqliteAuditLogRepository::new(pool.clone()));
+    audit.log_rejection(entry.clone(), 300_020).await;
+    audit.log_rejection(entry.clone(), 600_000).await;
+    let mut other = entry.clone();
+    other.ip_addr = Some("192.0.2.2".into());
+    audit.log_rejection(other, 300_030).await;
+    let mut other = entry;
+    other.metadata = Some(json!({"outcome":"failed","reason_code":1007}).to_string());
+    audit.log_rejection(other, 300_040).await;
+    let (groups, count): (i64, i64) = sqlx::query_as(
+        "SELECT count(*),sum(json_extract(metadata,'$.occurrences')) FROM audit_logs",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((groups, count), (4, 12));
+}
+
+#[tokio::test]
+async fn revoked_refresh_is_attributed_without_recording_credentials() {
+    let (app, _tmp, access, admin_id) = setup_admin().await;
+    let (_, login) = req(
+        &app,
+        "POST",
+        "/api/v1/auth/login",
+        Some(json!({"username":"admin","password":"secret123"})),
+        None,
+    )
+    .await;
+    let refresh = login["data"]["refresh_token"].as_str().unwrap();
+    let (status, _) = req(
+        &app,
+        "POST",
+        "/api/v1/auth/logout",
+        Some(json!({"refresh_token":refresh})),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = req(
+        &app,
+        "POST",
+        "/api/v1/auth/refresh",
+        Some(json!({"refresh_token":refresh})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], 1002);
+    let (_, logs) = req(
+        &app,
+        "GET",
+        "/api/v1/admin/audit-logs?action=auth.rejected",
+        None,
+        Some(&access),
+    )
+    .await;
+    assert_eq!(logs["data"]["total"], 1);
+    let row = &logs["data"]["items"][0];
+    assert_eq!(row["user_id"], admin_id);
+    assert_eq!(row["username"], "admin");
+    assert!(!logs.to_string().contains(refresh));
+}

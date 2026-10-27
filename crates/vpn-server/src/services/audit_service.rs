@@ -2,6 +2,7 @@
 //!
 //! 写入是「尽力而为」：失败仅降级为 tracing::warn，不阻塞主请求路径。
 
+use sha2::{Digest, Sha256};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -27,6 +28,7 @@ pub struct AuditService {
     repo: SqliteAuditLogRepository,
     failed_writes: Arc<AtomicU64>,
     dropped_events: Arc<AtomicU64>,
+    access_expirations: Arc<AtomicU64>,
     writers: Arc<tokio::sync::Semaphore>,
 }
 
@@ -36,6 +38,7 @@ impl AuditService {
             repo,
             failed_writes: Arc::new(AtomicU64::new(0)),
             dropped_events: Arc::new(AtomicU64::new(0)),
+            access_expirations: Arc::new(AtomicU64::new(0)),
             writers: Arc::new(tokio::sync::Semaphore::new(16)),
         }
     }
@@ -44,7 +47,49 @@ impl AuditService {
         self.repo.actor_name(id).await.ok().flatten()
     }
     pub fn health(&self) -> serde_json::Value {
-        serde_json::json!({"failed_writes":self.failed_writes.load(Ordering::Relaxed),"failed_transaction_writes":crate::middleware::audit_context::FAILED_TRANSACTION_WRITES.load(Ordering::Relaxed),"dropped_events":self.dropped_events.load(Ordering::Relaxed)})
+        serde_json::json!({"failed_writes":self.failed_writes.load(Ordering::Relaxed),"failed_transaction_writes":crate::middleware::audit_context::FAILED_TRANSACTION_WRITES.load(Ordering::Relaxed),"dropped_events":self.dropped_events.load(Ordering::Relaxed),"access_expirations":self.access_expirations.load(Ordering::Relaxed)})
+    }
+    pub fn record_access_expiration(&self) {
+        self.access_expirations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Persist the first rejection immediately; atomically count repetitions in
+    /// fixed five-minute windows. No raw credentials are part of the grouping key.
+    pub async fn log_rejection(&self, mut entry: AuditLogEntry, now_ms: i64) {
+        let Ok(_permit) = self.writers.try_acquire() else {
+            let count = self.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                tracing::warn!(dropped_events = count, "审计事件并发写入已达上限");
+            }
+            return;
+        };
+        let mut metadata: serde_json::Value = entry
+            .metadata
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .filter(|value: &serde_json::Value| value.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let key = serde_json::json!([
+            now_ms.div_euclid(300_000),
+            entry.action,
+            entry.user_id,
+            entry.ip_addr,
+            entry.resource,
+            entry.user_agent,
+            entry.status_code,
+            metadata["reason_code"],
+            metadata["reason"]
+        ]);
+        let id = format!("auth-{:x}", Sha256::digest(key.to_string().as_bytes()));
+        metadata["occurrences"] = 1.into();
+        metadata["first_seen_at"] = now_ms.into();
+        metadata["last_seen_at"] = now_ms.into();
+        metadata["aggregation_window_seconds"] = 300.into();
+        entry.metadata = Some(metadata.to_string());
+        if let Err(error) = self.repo.insert_rejection(&id, &entry, now_ms).await {
+            self.failed_writes.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(?error, "认证审计写入失败");
+        }
     }
     /// Only fallback/auth events are best effort; critical changes use the business transaction.
     pub async fn log(&self, entry: AuditLogEntry, now_ms: i64) {

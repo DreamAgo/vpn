@@ -23,6 +23,7 @@ pub trait TokenIssuer: Send + Sync + Debug {
     async fn issue_refresh(&self, user_id: &str) -> Result<String>;
 
     /// 解析并验证 Access Token，返回 (user_id, role)。
+    /// Only return AccessTokenExpired when authenticity and all other claims are valid.
     async fn verify_access(&self, token: &str) -> Result<(String, String)>;
 
     /// Audit attribution only. Never use this identity to authorize a request.
