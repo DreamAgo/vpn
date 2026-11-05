@@ -6,7 +6,7 @@
 //! - `net-route`：跨平台路由表(为 allowed_ips 加 `dev <tun>` 路由)；
 //! - tokio UDP：与服务端 endpoint 收发密文。
 //!
-//! 转发循环（单任务 `tokio::select!`）：
+//! 独立 UDP 收包与路由维护任务；WireGuard 状态由单个转发任务管理：
 //! - 系统路由将需走 VPN 的 IP 包交给 TUN；
 //! - TUN 读到 IP 包 → `Tunn::encapsulate` → UDP 送服务端；
 //! - UDP 收到密文 → `Tunn::decapsulate` → 写回 TUN（或回送握手包）；
@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -81,8 +82,100 @@ async fn renewed_udp(old: &UdpSocket) -> std::io::Result<UdpSocket> {
         "0.0.0.0:0"
     })
     .await?;
+    configure_udp_buffers(&socket);
     socket.connect(peer).await?;
     Ok(socket)
+}
+
+// Explicit on every socket, including recovery; OS limits may clamp the request.
+fn configure_udp_buffers(socket: &UdpSocket) {
+    let socket = socket2::SockRef::from(socket);
+    if let Err(error) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
+        tracing::warn!(%error, "无法扩大 VPN UDP 接收缓冲区");
+    }
+    tracing::info!(receive_buffer_bytes = ?socket.recv_buffer_size(), "VPN UDP 接收缓冲区");
+}
+
+/// At most 128 queued full-size datagrams (~8 MiB), plus one in flight.
+/// Keep draining the kernel socket even when the consumer is busy with TUN I/O.
+struct UdpDatagram {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+struct UdpIngress {
+    packets: tokio::sync::mpsc::Receiver<UdpDatagram>,
+    recycle: tokio::sync::mpsc::Sender<Vec<u8>>,
+    task: tokio::task::JoinHandle<()>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+impl UdpIngress {
+    fn start(socket: Arc<UdpSocket>) -> Self {
+        let (tx, packets) = tokio::sync::mpsc::channel(128);
+        let (recycle, mut pool) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dropped_counter = dropped.clone();
+        let task = tokio::spawn(async move {
+            let mut buffer = vec![0; 65535];
+            let mut drops = 0u64;
+            let mut errors = 0u64;
+            let mut last_log = std::time::Instant::now();
+            loop {
+                match socket.recv(&mut buffer).await {
+                    Ok(n) => {
+                        match tx.try_send(UdpDatagram {
+                            bytes: buffer,
+                            len: n,
+                        }) {
+                            Ok(()) => buffer = pool.try_recv().unwrap_or_else(|_| vec![0; 65535]),
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
+                                drops += 1;
+                                dropped_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                buffer = packet.bytes;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    Err(_) => {
+                        errors += 1;
+                        // Backoff only this receiver, never pause encryption/TUN/timers.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+                if last_log.elapsed() >= Duration::from_secs(10) {
+                    if drops != 0 || errors != 0 {
+                        tracing::warn!(
+                            queue_drops = drops,
+                            receive_errors = errors,
+                            queued_packets = tx.max_capacity() - tx.capacity(),
+                            "VPN UDP 接收队列统计"
+                        );
+                        drops = 0;
+                        errors = 0;
+                    }
+                    last_log = std::time::Instant::now();
+                }
+            }
+        });
+        Self {
+            packets,
+            recycle,
+            task,
+            dropped,
+        }
+    }
+    fn recycle(&self, packet: Vec<u8>) {
+        let _ = self.recycle.try_send(packet);
+    }
+}
+impl Drop for UdpIngress {
+    fn drop(&mut self) {
+        self.task.abort();
+        let dropped = self.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        if dropped != 0 {
+            tracing::warn!(queue_drops = dropped, "VPN UDP 接收任务结束");
+        }
+    }
 }
 
 const IP_UDP_OVERHEAD: u16 = 28;
@@ -564,6 +657,8 @@ impl UserspaceTunnel {
             "VPN UDP endpoint 已就绪"
         );
 
+        configure_udp_buffers(&udp);
+
         // 5) Configured destinations stay on the TUN. A TCP connection can use
         // a physical socket without changing the routes of other connections.
         let vpn_subnet = ipnet::Ipv4Net::new(vpn_ip, subnet_prefix)
@@ -653,7 +748,7 @@ impl UserspaceTunnel {
 #[allow(clippy::too_many_arguments)]
 async fn forward_loop(
     device: tun::AsyncDevice,
-    mut udp: UdpSocket,
+    udp: UdpSocket,
     mut tunn: Tunn,
     handle: Handle,
     mut added_routes: Vec<(String, Route)>,
@@ -672,6 +767,7 @@ async fn forward_loop(
     // 独立运行探测，避免等待 DNS 时阻塞 TUN 转发。sender 随本任务销毁，
     // 即使 forward_loop panic，monitor 也能收到关闭并恢复 DNS。
     let (dns_stop, dns_rx) = watch::channel(false);
+    let (route_stop_tx, mut route_stop) = watch::channel(false);
     let dns_task = dns_settings
         .filter(|settings| settings.mode != vpn_api_types::system::ClientDnsMode::Disabled)
         .map(|settings| {
@@ -693,11 +789,39 @@ async fn forward_loop(
     // 三个方向各用独立缓冲，避免 select! 多分支对同一缓冲的可变借用冲突。
     let mut tun_read_buf = vec![0u8; packet_buffer_size];
     let mut enc_buf = vec![0u8; packet_buffer_size];
-    let mut udp_read_buf = vec![0u8; 65535];
+    let mut udp = Arc::new(udp);
+    let mut ingress = UdpIngress::start(udp.clone());
+    let mut incoming_buffer = vec![0u8; packet_buffer_size];
     let mut ticker = tokio::time::interval(TIMER_TICK);
-    let mut active_exclusions = Vec::new();
-    let mut route_retry = tokio::time::interval(Duration::from_secs(5));
-    route_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut timer_buffer = vec![0u8; packet_buffer_size];
+    // The worker owns the route ledger through cleanup. Stop it before teardown.
+    let route_task = tokio::spawn(async move {
+        let mut active_exclusions = Vec::new();
+        let mut retry = tokio::time::interval(Duration::from_secs(5));
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = route_stop.changed() => break,
+                _ = retry.tick() => {},
+                changed = wait_routes_change(&mut routes_rx) => {
+                    if changed {
+                        if let Some(rx) = routes_rx.as_ref() { route_policy = rx.borrow().clone(); }
+                    }
+                }
+            }
+            let policy = route_policy.clone();
+            // Interface enumeration uses synchronous OS APIs; keep it off runtime workers.
+            let plan = tokio::task::spawn_blocking(move || {
+                current_tunnel_routes(&policy, vpn_subnet, ifindex)
+            })
+            .await;
+            if let Ok((desired, exclusions)) = plan {
+                crate::route_reconcile::reconcile(&handle, &mut added_routes, &desired).await;
+                record_route_exclusions(&mut active_exclusions, exclusions);
+            }
+        }
+        crate::route_reconcile::cleanup(&handle, &mut added_routes).await
+    });
 
     // 本地累加收发字节，按 TIMER_TICK 节奏批量刷回 SharedState——避免每包都锁 mutex
     // （高吞吐时每秒数千包，逐包加锁会成为热点）。统计的是隧道明文负载（用户可见的
@@ -705,7 +829,6 @@ async fn forward_loop(
     let mut tx_acc: u64 = 0; // 出站：写入隧道的明文（Sent）
     let mut rx_acc: u64 = 0; // 入站：从隧道收到的明文（Received）
     let mut udp_send_failures: u64 = 0;
-    let mut udp_recv_failures: u64 = 0;
     let mut timer_failures: u64 = 0;
     let mut last_udp_error_log = std::time::Instant::now();
     let mut obfs_drops: u64 = 0;
@@ -768,20 +891,23 @@ async fn forward_loop(
                 }
             }
             // 入站：UDP → 解密 → TUN（或回送握手）
-            r = udp.recv(&mut udp_read_buf) => {
-                match r {
-                    Ok(n) => {
+            packet = ingress.packets.recv() => {
+                match packet {
+                    Some(datagram) => {
+                        let udp_read_buf = datagram.bytes;
+                        let incoming_bytes = &udp_read_buf[..datagram.len];
                         let decoded;
                         let incoming = if let Some(runtime) = obfs.as_mut() {
-                            match runtime.decoder.decode(&udp_read_buf[..n], &mut runtime.replay) {
+                            match runtime.decoder.decode(incoming_bytes, &mut runtime.replay) {
                                 Ok(packet) => { decoded = packet; decoded.as_slice() }
                                 Err(_) => {
                                     obfs_drops = obfs_drops.saturating_add(1);
+                                    ingress.recycle(udp_read_buf);
                                     continue;
                                 }
                             }
                         } else {
-                            &udp_read_buf[..n]
+                            incoming_bytes
                         };
                         match handle_incoming(
                             &mut tunn,
@@ -789,7 +915,7 @@ async fn forward_loop(
                             &device,
                             incoming,
                             obfs.as_ref(),
-                            packet_buffer_size,
+                            &mut incoming_buffer,
                             &mut send_state,
                         ).await {
                             Ok(IncomingStats { rx_bytes, tx_bytes, send_failures, authenticated }) => {
@@ -809,39 +935,16 @@ async fn forward_loop(
                                 break Err(e);
                             }
                         }
+                        ingress.recycle(udp_read_buf);
                     }
-                    // UDP 瞬时错误**不拆隧道**：connected UDP socket 在对端暂不可达时会收到
-                    // ICMP port-unreachable → recv 返回 ConnectionRefused;网络切换/抖动同理。
-                    // 忽略续跑，boringtun 的定时器(下方 ticker)会自动重握手恢复。短暂 sleep
-                    // 避免错误持续返回时空转占 CPU。
-                    Err(_) => {
-                        udp_recv_failures = udp_recv_failures.saturating_add(1);
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                    None => break Err(CliError::Other("UDP 接收任务停止".into())),
                 }
-            }
-            // 实时路由更新：心跳检测到允许网段或排除规则变化 → 增量增删本地路由。
-            changed = wait_routes_change(&mut routes_rx) => {
-                if changed {
-                    if let Some(rx) = routes_rx.as_ref() {
-                        route_policy = rx.borrow().clone();
-                        let (desired, exclusions) = current_tunnel_routes(&route_policy, vpn_subnet, ifindex);
-                        crate::route_reconcile::reconcile(&handle, &mut added_routes, &desired).await;
-                        record_route_exclusions(&mut active_exclusions, exclusions);
-                    }
-                }
-            }
-            _ = route_retry.tick() => {
-                // Retry failed OS operations even if configuration is unchanged.
-                let (desired, exclusions) = current_tunnel_routes(&route_policy, vpn_subnet, ifindex);
-                crate::route_reconcile::reconcile(&handle, &mut added_routes, &desired).await;
-                record_route_exclusions(&mut active_exclusions, exclusions);
             }
             // 定时器：握手重传 / keepalive，并顺带把累计流量刷回状态。
             _ = ticker.tick() => {
-                let mut tbuf = vec![0u8; packet_buffer_size];
+                let tbuf = &mut timer_buffer;
                 let mut expired = false;
-                match tunn.update_timers(&mut tbuf) {
+                match tunn.update_timers(tbuf) {
                     TunnResult::WriteToNetwork(p) => {
                         if let Err(error) = send_network(&udp, obfs.as_ref(), p).await {
                             send_state.failure_logger.record("timer", p, &error);
@@ -867,10 +970,14 @@ async fn forward_loop(
                 if retry && !*shutdown.borrow() {
                     // 新 socket 更新源端口/NAT 映射；保留 TUN、路由与密钥，不与退出清理竞态。
                     match renewed_udp(&udp).await {
-                        Ok(socket) => udp = socket,
+                        Ok(socket) => {
+                            let socket = Arc::new(socket);
+                            ingress = UdpIngress::start(socket.clone());
+                            udp = socket;
+                        },
                         Err(error) => tracing::warn!(error=%error, "恢复 UDP socket 失败，保留旧 socket 稍后重试"),
                     }
-                    match tunn.format_handshake_initiation(&mut tbuf, true) {
+                    match tunn.format_handshake_initiation(tbuf, true) {
                         TunnResult::WriteToNetwork(packet) => {
                             if let Err(error) = send_network(&udp, obfs.as_ref(), packet).await {
                                 send_state.failure_logger.record("recovery_handshake", packet, &error);
@@ -882,14 +989,12 @@ async fn forward_loop(
                     tracing::warn!(attempt=recovery.attempts, "数据隧道未就绪，已更新 UDP socket 并重新发起握手");
                 }
                 if (udp_send_failures > 0
-                    || udp_recv_failures > 0
                     || timer_failures > 0
                     || obfs_drops > 0)
                     && last_udp_error_log.elapsed() >= Duration::from_secs(10)
                 {
-                    tracing::debug!(send_failures = udp_send_failures, recv_failures = udp_recv_failures, timer_failures, obfs_drops, "隧道 UDP 暂时不可用或收到非法混淆包，保持连接等待恢复");
+                    tracing::debug!(send_failures = udp_send_failures, timer_failures, obfs_drops, "隧道 UDP 暂时不可用或收到非法混淆包，保持连接等待恢复");
                     udp_send_failures = 0;
-                    udp_recv_failures = 0;
                     timer_failures = 0;
                     obfs_drops = 0;
                     last_udp_error_log = std::time::Instant::now();
@@ -924,7 +1029,15 @@ async fn forward_loop(
             }
         }
     }
-    cleanup_failures += crate::route_reconcile::cleanup(&handle, &mut added_routes).await;
+    drop(ingress);
+    let _ = route_stop_tx.send(true);
+    match route_task.await {
+        Ok(failures) => cleanup_failures += failures,
+        Err(error) => {
+            cleanup_failures += 1;
+            tracing::warn!(%error, "路由维护任务退出失败");
+        }
+    }
     if cleanup_failures == 0 {
         tracing::info!(
             stage = "forward_loop",
@@ -1081,11 +1194,10 @@ async fn handle_incoming(
     device: &tun::AsyncDevice,
     packet: &[u8],
     obfs: Option<&ObfsRuntime>,
-    packet_buffer_size: usize,
+    out: &mut [u8],
     send_state: &mut SendState,
 ) -> CliResult<IncomingStats> {
-    let mut out = vec![0u8; packet_buffer_size];
-    let result = tunn.decapsulate(None, packet, &mut out);
+    let result = tunn.decapsulate(None, packet, out);
     let authenticated = authenticated_receive(packet, &result);
     match result {
         TunnResult::WriteToNetwork(p) => {
@@ -1099,8 +1211,7 @@ async fn handle_incoming(
             }
             // boringtun 约定：收到握手类响应后，用空包重复调用以排空待发队列。
             loop {
-                let mut drain = vec![0u8; packet_buffer_size];
-                match tunn.decapsulate(None, &[], &mut drain) {
+                match tunn.decapsulate(None, &[], out) {
                     TunnResult::WriteToNetwork(p) => {
                         let queued_user_bytes =
                             if wireguard_packet_type(p) == Some(4) && p.len() > 32 {
@@ -1188,6 +1299,89 @@ async fn send_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ingress_drains_socket_without_consumer_and_bounds_queue() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(socket.local_addr().unwrap()).await.unwrap();
+        socket.connect(sender.local_addr().unwrap()).await.unwrap();
+        let socket = Arc::new(socket);
+        let weak = Arc::downgrade(&socket);
+        let mut ingress = UdpIngress::start(socket);
+        // No consumer runs while these packets arrive. Let the independent
+        // receiver drain each datagram to avoid depending on kernel queue sizes.
+        for index in 0..128u16 {
+            sender.send(&index.to_le_bytes()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while ingress.packets.len() != usize::from(index) + 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        sender.send(b"overflow").await.unwrap();
+        // The queue cannot grow even when the main forward task is stalled.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ingress.dropped.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ingress.packets.len(), 128);
+        for index in 0..128u16 {
+            let packet = ingress.packets.recv().await.unwrap();
+            assert_eq!(&packet.bytes[..packet.len], &index.to_le_bytes());
+            ingress.recycle(packet.bytes);
+        }
+        sender.send(b"still alive").await.unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(2), ingress.packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&packet.bytes[..packet.len], b"still alive");
+        drop(ingress);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingress_preserves_large_datagrams_on_renewed_socket() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(sender.local_addr().unwrap()).await.unwrap();
+        configure_udp_buffers(&socket);
+        let old_address = socket.local_addr().unwrap();
+        let renewed = Arc::new(renewed_udp(&socket).await.unwrap());
+        assert_ne!(old_address, renewed.local_addr().unwrap());
+        let mut ingress = UdpIngress::start(renewed.clone());
+        socket2::SockRef::from(&sender)
+            .set_send_buffer_size(128 * 1024)
+            .unwrap();
+        let bytes = vec![0x5a; 60000];
+        sender
+            .send_to(&bytes, renewed.local_addr().unwrap())
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(2), ingress.packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&packet.bytes[..packet.len], bytes.as_slice());
+        assert!(
+            socket2::SockRef::from(renewed.as_ref())
+                .recv_buffer_size()
+                .unwrap()
+                > 0
+        );
+    }
 
     fn bypass_policy() -> RoutePolicy {
         RoutePolicy {
