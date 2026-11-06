@@ -455,6 +455,7 @@ button:disabled {
   font-family: var(--mono);
   font-size: 13px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1155,3 +1156,15 @@ button:disabled {
 .update-dialog p { font-size: 13px; line-height: 1.6; }
 .update-dialog-notes { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .update-dialog-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 16px; }
+
+.metric-detail {
+  display: block;
+  margin-top: 5px;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

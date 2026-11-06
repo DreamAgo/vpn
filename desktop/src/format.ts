@@ -25,3 +25,8 @@ export function formatDuration(sinceUnixSecs: number | null): string {
   if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
   return `${pad(m)}:${pad(s)}`;
 }
+
+export function formatRate(bytesPerSecond: number | null | undefined): string {
+  if (bytesPerSecond == null || !Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return "--";
+  return `${formatBytes(bytesPerSecond)}/s`;
+}

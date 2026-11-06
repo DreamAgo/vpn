@@ -77,13 +77,17 @@ function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+const PREVIEW_CONNECTED_SINCE = Math.floor(Date.now() / 1000) - 42 * 60;
+const PREVIEW_TRAFFIC_STARTED = performance.now();
+
 function previewStatus(): StatusResponse {
+  const elapsed = (performance.now() - PREVIEW_TRAFFIC_STARTED) / 1000;
   return {
     state: "connected",
     vpn_ip: "10.8.0.12",
-    since: Math.floor(Date.now() / 1000) - 42 * 60,
-    bytes_rx: 84_213_840,
-    bytes_tx: 12_884_021,
+    since: PREVIEW_CONNECTED_SINCE,
+    bytes_rx: 84_213_840 + Math.floor(elapsed * 1_572_864),
+    bytes_tx: 12_884_021 + Math.floor(elapsed * 262_144),
     last_error: null,
   };
 }

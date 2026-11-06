@@ -186,6 +186,10 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      - name: Test desktop traffic rates
+        working-directory: desktop
+        run: npm test
+
       - name: Build desktop frontend
         working-directory: desktop
         run: npm run build

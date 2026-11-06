@@ -30,7 +30,8 @@ import {
   setLaunchOnStartup,
   syncTrayState,
 } from "./api";
-import { formatBytes, formatDuration } from "./format";
+import { formatBytes, formatDuration, formatRate } from "./format";
+import { useTrafficRates } from "./useTrafficRates";
 
 const POLL_MS = 2500;
 const BACKEND_FAILURE_THRESHOLD = 2;
@@ -116,6 +117,11 @@ export default function App() {
   const backendFailuresRef = useRef(0);
   const refreshIdRef = useRef(0);
   const sessionEndingRef = useRef(false);
+  const trafficActive = loggedIn === true && status?.state === "connected" && !backendUnavailable;
+  const rates = useTrafficRates(trafficActive, JSON.stringify([server, status?.vpn_ip, status?.since]));
+  const displayRate = (value: number | undefined) => formatRate(
+    status?.state === "disconnected" && !backendUnavailable ? 0 : value,
+  );
 
   const addActivity = useCallback((title: string, detail?: string) => {
     setActivity((items) => [
@@ -496,8 +502,8 @@ export default function App() {
         <section className="metric-grid">
           <Metric label="专属地址" value={status?.vpn_ip ?? "--"} onCopy={() => onCopy(status?.vpn_ip, "专属地址")} />
           <Metric label="连接时长" value={status?.since ? formatDuration(status.since) : "--"} />
-          <Metric label="接收" value={formatBytes(status?.bytes_rx ?? 0)} />
-          <Metric label="发送" value={formatBytes(status?.bytes_tx ?? 0)} />
+          <Metric label="下载速率" value={displayRate(rates?.rx)} detail={`累计接收 ${formatBytes(status?.bytes_rx ?? 0)}`} />
+          <Metric label="上传速率" value={displayRate(rates?.tx)} detail={`累计发送 ${formatBytes(status?.bytes_tx ?? 0)}`} />
         </section>
 
         <section className="endpoint-card">
@@ -668,7 +674,7 @@ function StatusGlyph({ state }: { state: ConnState }) {
   );
 }
 
-function Metric({ label, value, onCopy }: { label: string; value: string; onCopy?: () => void }) {
+function Metric({ label, value, detail, onCopy }: { label: string; value: string; detail?: string; onCopy?: () => void }) {
   return (
     <div className="metric">
       <span className="small-label">{label}</span>
@@ -679,6 +685,7 @@ function Metric({ label, value, onCopy }: { label: string; value: string; onCopy
       ) : (
         <span className="metric-value">{value}</span>
       )}
+      {detail && <span className="metric-detail">{detail}</span>}
     </div>
   );
 }
