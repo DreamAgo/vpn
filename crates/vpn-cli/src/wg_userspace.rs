@@ -96,8 +96,9 @@ fn configure_udp_buffers(socket: &UdpSocket) {
     tracing::info!(receive_buffer_bytes = ?socket.recv_buffer_size(), "VPN UDP 接收缓冲区");
 }
 
-/// At most 128 queued full-size datagrams (~8 MiB), plus one in flight.
-/// Keep draining the kernel socket even when the consumer is busy with TUN I/O.
+// Yield before one receiver turn can fill the 128-slot queue.
+const UDP_RECEIVE_BATCH: usize = 32;
+
 struct UdpDatagram {
     bytes: Vec<u8>,
     len: usize,
@@ -120,6 +121,7 @@ impl UdpIngress {
             let mut drops = 0u64;
             let mut errors = 0u64;
             let mut last_log = std::time::Instant::now();
+            let mut batch = 0usize;
             loop {
                 match socket.recv(&mut buffer).await {
                     Ok(n) => {
@@ -141,6 +143,15 @@ impl UdpIngress {
                         // Backoff only this receiver, never pause encryption/TUN/timers.
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
+                }
+                batch += 1;
+                if batch == UDP_RECEIVE_BATCH {
+                    // try_send/try_recv do not spend Tokio's cooperative budget.
+                    // A forwarding task doing several async operations per packet
+                    // exhausts its budget sooner than this socket-draining task.
+                    // Yield before the 128-slot queue can fill in a single turn.
+                    batch = 0;
+                    tokio::task::yield_now().await;
                 }
                 if last_log.elapsed() >= Duration::from_secs(10) {
                     if drops != 0 || errors != 0 {
@@ -1350,6 +1361,39 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_burst_yields_to_ready_consumer_without_queue_loss() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        configure_udp_buffers(&socket);
+        sender.connect(socket.local_addr().unwrap()).await.unwrap();
+        socket.connect(sender.local_addr().unwrap()).await.unwrap();
+        // Preload a burst larger than the application queue. No consumer is
+        // stalled: both tasks can run as soon as ingress starts.
+        for index in 0..256u16 {
+            sender.send(&index.to_le_bytes()).await.unwrap();
+        }
+        let mut ingress = UdpIngress::start(Arc::new(socket));
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            for index in 0..256u16 {
+                let packet = ingress.packets.recv().await.unwrap();
+                assert_eq!(&packet.bytes[..packet.len], &index.to_le_bytes());
+                ingress.recycle(packet.bytes);
+                // Model additional ready async work (TUN/network I/O) in the
+                // forwarding task without adding an artificial sleep.
+                tokio::task::consume_budget().await;
+                tokio::task::consume_budget().await;
+            }
+        })
+        .await;
+        assert_eq!(
+            ingress.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a runnable consumer must get CPU before ingress drops a burst"
+        );
+        received.unwrap();
     }
 
     #[tokio::test]
