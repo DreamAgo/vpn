@@ -96,75 +96,108 @@ fn configure_udp_buffers(socket: &UdpSocket) {
     tracing::info!(receive_buffer_bytes = ?socket.recv_buffer_size(), "VPN UDP 接收缓冲区");
 }
 
-// Yield before one receiver turn can fill the 128-slot queue.
+// Bound both memory and local application queue age. This does not bound time
+// spent in the OS socket buffer or on the network.
 const UDP_RECEIVE_BATCH: usize = 32;
+const UDP_QUEUE_CAPACITY: usize = 128;
+const UDP_MAX_QUEUE_AGE: Duration = Duration::from_millis(100);
 
 struct UdpDatagram {
     bytes: Vec<u8>,
     len: usize,
+    received_at: std::time::Instant,
+}
+
+// Producer and consumer update different counters on different runtime workers.
+// Avoid bouncing one shared cache line for every packet.
+#[repr(align(64))]
+#[derive(Default)]
+struct IngressCounter(std::sync::atomic::AtomicU64);
+impl std::ops::Deref for IngressCounter {
+    type Target = std::sync::atomic::AtomicU64;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Default)]
+struct IngressStats {
+    received: IngressCounter,
+    expired: IngressCounter,
+    receive_errors: IngressCounter,
+    backpressure_events: IngressCounter,
+    queue_peak: IngressCounter,
+    wait_max_us: IngressCounter,
+    residence_max_us: IngressCounter,
+    processing_max_us: IngressCounter,
+}
+impl IngressStats {
+    fn observe(counter: &std::sync::atomic::AtomicU64, elapsed: Duration) {
+        counter.fetch_max(
+            elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 struct UdpIngress {
     packets: tokio::sync::mpsc::Receiver<UdpDatagram>,
     recycle: tokio::sync::mpsc::Sender<Vec<u8>>,
     task: tokio::task::JoinHandle<()>,
-    dropped: Arc<std::sync::atomic::AtomicU64>,
+    stats: Arc<IngressStats>,
+    last_log: std::time::Instant,
 }
 impl UdpIngress {
     fn start(socket: Arc<UdpSocket>) -> Self {
-        let (tx, packets) = tokio::sync::mpsc::channel(128);
-        let (recycle, mut pool) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
-        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let dropped_counter = dropped.clone();
+        let (tx, packets) = tokio::sync::mpsc::channel(UDP_QUEUE_CAPACITY);
+        let (recycle, mut pool) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_QUEUE_CAPACITY);
+        let stats = Arc::new(IngressStats::default());
+        let counters = stats.clone();
         let task = tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
             let mut buffer = vec![0; 65535];
-            let mut drops = 0u64;
-            let mut errors = 0u64;
-            let mut last_log = std::time::Instant::now();
             let mut batch = 0usize;
             loop {
-                match socket.recv(&mut buffer).await {
-                    Ok(n) => {
-                        match tx.try_send(UdpDatagram {
-                            bytes: buffer,
-                            len: n,
-                        }) {
-                            Ok(()) => buffer = pool.try_recv().unwrap_or_else(|_| vec![0; 65535]),
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
-                                drops += 1;
-                                dropped_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                buffer = packet.bytes;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                // Reserve capacity BEFORE reading. A full application queue pauses
+                // reads and lets the bounded kernel buffer absorb a short burst.
+                // No freshly received packet is thrown away just because it is full.
+                let permit = match tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        counters.backpressure_events.fetch_add(1, Relaxed);
+                        let started = std::time::Instant::now();
+                        let result = tx.reserve().await;
+                        IngressStats::observe(&counters.wait_max_us, started.elapsed());
+                        match result {
+                            Ok(permit) => permit,
+                            Err(_) => break,
                         }
                     }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                };
+                match socket.recv(&mut buffer).await {
+                    Ok(n) => {
+                        counters.received.fetch_add(1, Relaxed);
+                        counters
+                            .queue_peak
+                            .fetch_max((tx.max_capacity() - tx.capacity()) as u64, Relaxed);
+                        permit.send(UdpDatagram {
+                            bytes: buffer,
+                            len: n,
+                            received_at: std::time::Instant::now(),
+                        });
+                        buffer = pool.try_recv().unwrap_or_else(|_| vec![0; 65535]);
+                    }
                     Err(_) => {
-                        errors += 1;
-                        // Backoff only this receiver, never pause encryption/TUN/timers.
+                        drop(permit);
+                        counters.receive_errors.fetch_add(1, Relaxed);
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
                 batch += 1;
                 if batch == UDP_RECEIVE_BATCH {
-                    // try_send/try_recv do not spend Tokio's cooperative budget.
-                    // A forwarding task doing several async operations per packet
-                    // exhausts its budget sooner than this socket-draining task.
-                    // Yield before the 128-slot queue can fill in a single turn.
                     batch = 0;
                     tokio::task::yield_now().await;
-                }
-                if last_log.elapsed() >= Duration::from_secs(10) {
-                    if drops != 0 || errors != 0 {
-                        tracing::warn!(
-                            queue_drops = drops,
-                            receive_errors = errors,
-                            queued_packets = tx.max_capacity() - tx.capacity(),
-                            "VPN UDP 接收队列统计"
-                        );
-                        drops = 0;
-                        errors = 0;
-                    }
-                    last_log = std::time::Instant::now();
                 }
             }
         });
@@ -172,20 +205,65 @@ impl UdpIngress {
             packets,
             recycle,
             task,
-            dropped,
+            stats,
+            last_log: std::time::Instant::now(),
         }
     }
+
+    async fn recv(&mut self) -> Option<UdpDatagram> {
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            let packet = self.packets.recv().await?;
+            let age = packet.received_at.elapsed();
+            IngressStats::observe(&self.stats.residence_max_us, age);
+            if age <= UDP_MAX_QUEUE_AGE {
+                return Some(packet);
+            }
+            // Deliberately discard stale packets rather than forwarding an old
+            // backlog indefinitely. UDP/WireGuard already tolerate packet loss.
+            self.stats.expired.fetch_add(1, Relaxed);
+            self.recycle(packet.bytes);
+        }
+    }
+
     fn recycle(&self, packet: Vec<u8>) {
         let _ = self.recycle.try_send(packet);
+    }
+
+    fn log_stats(&mut self, force: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !force && self.last_log.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        let received = self.stats.received.swap(0, Relaxed);
+        let expired = self.stats.expired.swap(0, Relaxed);
+        let receive_errors = self.stats.receive_errors.swap(0, Relaxed);
+        let backpressure_events = self.stats.backpressure_events.swap(0, Relaxed);
+        let queue_peak = self.stats.queue_peak.swap(0, Relaxed);
+        let backpressure_max_us = self.stats.wait_max_us.swap(0, Relaxed);
+        let queue_age_max_us = self.stats.residence_max_us.swap(0, Relaxed);
+        let processing_max_us = self.stats.processing_max_us.swap(0, Relaxed);
+        if received != 0 || expired != 0 || receive_errors != 0 || backpressure_events != 0 {
+            tracing::info!(
+                received,
+                expired,
+                receive_errors,
+                backpressure_events,
+                queue_peak,
+                backpressure_max_us,
+                queue_age_max_us,
+                processing_max_us,
+                queued_packets = self.packets.len(),
+                "VPN UDP 接收流水线统计"
+            );
+        }
+        self.last_log = std::time::Instant::now();
     }
 }
 impl Drop for UdpIngress {
     fn drop(&mut self) {
         self.task.abort();
-        let dropped = self.dropped.load(std::sync::atomic::Ordering::Relaxed);
-        if dropped != 0 {
-            tracing::warn!(queue_drops = dropped, "VPN UDP 接收任务结束");
-        }
+        self.log_stats(true);
     }
 }
 
@@ -902,9 +980,10 @@ async fn forward_loop(
                 }
             }
             // 入站：UDP → 解密 → TUN（或回送握手）
-            packet = ingress.packets.recv() => {
+            packet = ingress.recv() => {
                 match packet {
                     Some(datagram) => {
+                        let processing_started = std::time::Instant::now();
                         let udp_read_buf = datagram.bytes;
                         let incoming_bytes = &udp_read_buf[..datagram.len];
                         let decoded;
@@ -913,6 +992,7 @@ async fn forward_loop(
                                 Ok(packet) => { decoded = packet; decoded.as_slice() }
                                 Err(_) => {
                                     obfs_drops = obfs_drops.saturating_add(1);
+                                    IngressStats::observe(&ingress.stats.processing_max_us, processing_started.elapsed());
                                     ingress.recycle(udp_read_buf);
                                     continue;
                                 }
@@ -946,6 +1026,7 @@ async fn forward_loop(
                                 break Err(e);
                             }
                         }
+                        IngressStats::observe(&ingress.stats.processing_max_us, processing_started.elapsed());
                         ingress.recycle(udp_read_buf);
                     }
                     None => break Err(CliError::Other("UDP 接收任务停止".into())),
@@ -953,6 +1034,7 @@ async fn forward_loop(
             }
             // 定时器：握手重传 / keepalive，并顺带把累计流量刷回状态。
             _ = ticker.tick() => {
+                ingress.log_stats(false);
                 let tbuf = &mut timer_buffer;
                 let mut expired = false;
                 match tunn.update_timers(tbuf) {
@@ -1312,7 +1394,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn ingress_drains_socket_without_consumer_and_bounds_queue() {
+    async fn ingress_applies_bounded_backpressure_without_discarding_fresh_packets() {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender.connect(socket.local_addr().unwrap()).await.unwrap();
@@ -1335,7 +1417,12 @@ mod tests {
         sender.send(b"overflow").await.unwrap();
         // The queue cannot grow even when the main forward task is stalled.
         tokio::time::timeout(Duration::from_secs(2), async {
-            while ingress.dropped.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            while ingress
+                .stats
+                .backpressure_events
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1347,8 +1434,14 @@ mod tests {
             assert_eq!(&packet.bytes[..packet.len], &index.to_le_bytes());
             ingress.recycle(packet.bytes);
         }
+        let overflow = tokio::time::timeout(Duration::from_secs(2), ingress.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&overflow.bytes[..overflow.len], b"overflow");
+        ingress.recycle(overflow.bytes);
         sender.send(b"still alive").await.unwrap();
-        let packet = tokio::time::timeout(Duration::from_secs(2), ingress.packets.recv())
+        let packet = tokio::time::timeout(Duration::from_secs(2), ingress.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1361,6 +1454,92 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingress_shutdown_releases_socket_while_waiting_for_queue_capacity() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(socket.local_addr().unwrap()).await.unwrap();
+        socket.connect(sender.local_addr().unwrap()).await.unwrap();
+        let socket = Arc::new(socket);
+        let weak = Arc::downgrade(&socket);
+        let ingress = UdpIngress::start(socket);
+        for index in 0..UDP_QUEUE_CAPACITY {
+            sender.send(b"queued").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while ingress.packets.len() != index + 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ingress
+                .stats
+                .backpressure_events
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            ingress
+                .stats
+                .queue_peak
+                .load(std::sync::atomic::Ordering::Relaxed),
+            UDP_QUEUE_CAPACITY as u64
+        );
+        drop(ingress);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingress_discards_expired_backlog_and_delivers_fresh_packet() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(socket.local_addr().unwrap()).await.unwrap();
+        socket.connect(sender.local_addr().unwrap()).await.unwrap();
+        let mut ingress = UdpIngress::start(Arc::new(socket));
+        sender.send(b"stale").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ingress.packets.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(UDP_MAX_QUEUE_AGE + Duration::from_millis(20)).await;
+        sender.send(b"fresh").await.unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(2), ingress.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&packet.bytes[..packet.len], b"fresh");
+        assert_eq!(
+            ingress
+                .stats
+                .expired
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(
+            ingress
+                .stats
+                .residence_max_us
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 100_000
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1389,7 +1568,10 @@ mod tests {
         })
         .await;
         assert_eq!(
-            ingress.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            ingress
+                .stats
+                .expired
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "a runnable consumer must get CPU before ingress drops a burst"
         );
@@ -1414,7 +1596,7 @@ mod tests {
             .send_to(&bytes, renewed.local_addr().unwrap())
             .await
             .unwrap();
-        let packet = tokio::time::timeout(Duration::from_secs(2), ingress.packets.recv())
+        let packet = tokio::time::timeout(Duration::from_secs(2), ingress.recv())
             .await
             .unwrap()
             .unwrap();
