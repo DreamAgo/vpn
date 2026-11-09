@@ -4890,7 +4890,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpn-api-types"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "ipnet",
  "serde",
@@ -4900,7 +4900,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-cli"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4938,7 +4938,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-core"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4950,7 +4950,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-mobile"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "base64",
  "boringtun",
@@ -4967,7 +4967,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-obfs"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "aes",
  "chacha20poly1305",
@@ -4980,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-platform"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "async-trait",
  "base64",
@@ -5005,7 +5005,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-server"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "aes",
  "anyhow",
@@ -5055,7 +5055,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-wireguard"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "async-trait",
  "base64",
