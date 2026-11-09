@@ -466,6 +466,7 @@ function eventLabel(value: string): string {
   if (value === 'gateway_offline') return '网关离线';
   if (value === 'gateway_recovered') return '网关恢复';
   if (value === 'approval_approved') return '审批通过';
+  if (value === 'access_expiring') return '授权到期提醒';
   if (value === 'test_email') return '测试邮件';
   return value;
 }

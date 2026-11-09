@@ -15,11 +15,12 @@ use vpn_core::AppError;
 use crate::{
     auth::RequireAdmin,
     error::ApiError,
+    repositories::access_grant_repo_sqlite::{AccessExpiryReminderRow, ApprovalMailRow},
     services::feishu_directory_service::{ContactEvent, DirectoryStateRow},
     state::AppState,
 };
 
-const BACKUP_FORMAT_VERSION: u32 = 4;
+const BACKUP_FORMAT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupArchive {
@@ -32,7 +33,9 @@ pub struct BackupArchive {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackupTables {
     #[serde(default)]
-    approval_mail_outbox: Vec<crate::repositories::access_grant_repo_sqlite::ApprovalMailRow>,
+    approval_mail_outbox: Vec<ApprovalMailRow>,
+    #[serde(default)]
+    access_expiry_reminders: Vec<AccessExpiryReminderRow>,
     users: Vec<UserRow>,
     user_groups: Vec<UserGroupRow>,
     user_group_members: Vec<UserGroupMemberRow>,
@@ -234,9 +237,12 @@ pub async fn restore_backup(
     RequireAdmin(_): RequireAdmin,
     Json(archive): Json<BackupArchive>,
 ) -> Result<Json<ApiResponse<RestoreResponse>>, ApiError> {
-    // v1 备份没有审批字段，serde default 会按 legacy/空授权安全恢复；新版导出使用 v2，
-    // 让旧版服务端明确拒绝而不是忽略授权字段后把账号静默降级。
-    if !matches!(archive.format_version, 1 | 2 | 3 | BACKUP_FORMAT_VERSION) {
+    // 旧备份缺少的授权和提醒字段由 serde 提供默认值。v5 保存到期提醒状态，
+    // 让旧版服务端明确拒绝此格式，避免丢失已发送状态。
+    if !matches!(
+        archive.format_version,
+        1 | 2 | 3 | 4 | BACKUP_FORMAT_VERSION
+    ) {
         return Err(
             AppError::Validation(format!("不支持的备份版本: {}", archive.format_version)).into(),
         );
@@ -253,6 +259,10 @@ pub async fn restore_backup(
     };
     let _directory_pause = match &state.feishu_directory_service {
         Some(service) => Some(service.pause_worker().await),
+        None => None,
+    };
+    let _expiry_reminder_pause = match &state.notification_service {
+        Some(service) => Some(service.pause_expiry_reminders().await),
         None => None,
     };
     restore_archive(&pool, &archive).await?;
@@ -352,6 +362,12 @@ async fn create_backup(pool: &SqlitePool) -> Result<BackupArchive, AppError> {
         .map_err(|e| AppError::Database(Box::new(e)))?,
         approval_mail_outbox: sqlx::query_as("SELECT * FROM approval_mail_outbox ORDER BY instance_code")
             .fetch_all(&mut *tx).await.map_err(|e| AppError::Database(Box::new(e)))?,
+        access_expiry_reminders: sqlx::query_as(
+            "SELECT user_id,expires_at,sent,attempts,next_attempt_at FROM access_expiry_reminders ORDER BY user_id,expires_at",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?,
         feishu_approval_inbox: sqlx::query_as::<_, ApprovalInboxRow>(
             "SELECT event_id, instance_code, payload_hash, payload, status, attempts, next_attempt_at, last_error, created_at, updated_at FROM feishu_approval_inbox ORDER BY created_at",
         )
@@ -391,6 +407,7 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
 
     for table in [
         "approval_mail_outbox",
+        "access_expiry_reminders",
         "feishu_approval_inbox",
         "feishu_contact_inbox",
         "feishu_user_states",
@@ -419,6 +436,19 @@ async fn restore_archive(pool: &SqlitePool, archive: &BackupArchive) -> Result<(
             .execute(&mut *tx).await.map_err(|e| AppError::Database(Box::new(e)))?;
     }
     insert_users(&mut tx, &archive.tables.users).await?;
+    for row in &archive.tables.access_expiry_reminders {
+        sqlx::query(
+            "INSERT INTO access_expiry_reminders(user_id,expires_at,sent,attempts,next_attempt_at) VALUES(?1,?2,?3,?4,?5)",
+        )
+        .bind(&row.user_id)
+        .bind(row.expires_at)
+        .bind(row.sent)
+        .bind(row.attempts)
+        .bind(row.next_attempt_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(Box::new(e)))?;
+    }
     insert_user_groups(&mut tx, &archive.tables.user_groups).await?;
     insert_external_identities(&mut tx, &archive.tables.external_identities).await?;
     insert_user_group_members(&mut tx, &archive.tables.user_group_members).await?;
@@ -701,8 +731,9 @@ mod directory_backup_tests {
         sqlx::query("INSERT INTO feishu_user_states(subject,app_id,status,blocked,last_event_at) VALUES('union1','app','frozen',1,100)").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO feishu_contact_inbox(event_id,app_id,user_id,id_type,event_type,event_at,payload_hash) VALUES('e1','app','union1','union_id','contact.user.updated_v3',100,'hash')").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO approval_mail_outbox(instance_code,recipient,body,expires_at,done,attempts,next_attempt_at) VALUES('mail1','a@example.com','approved',999999,1,2,100)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO access_expiry_reminders(user_id,expires_at,sent,attempts,next_attempt_at) VALUES('u1',999999,1,3,100)").execute(&pool).await.unwrap();
         let archive = create_backup(&pool).await.unwrap();
-        assert_eq!(archive.format_version, 4);
+        assert_eq!(archive.format_version, 5);
         let encoded = serde_json::to_vec(&archive).unwrap();
         let archive: BackupArchive = serde_json::from_slice(&encoded).unwrap();
         sqlx::query("INSERT INTO audit_logs(id,action,resource,created_at) VALUES('live-history','user_update','users/u1',1)").execute(&pool).await.unwrap();
@@ -748,5 +779,27 @@ mod directory_backup_tests {
         .await
         .unwrap();
         assert_eq!(mail, (true, 2));
+        let reminder: (bool, i64) = sqlx::query_as(
+            "SELECT sent,attempts FROM access_expiry_reminders WHERE user_id='u1' AND expires_at=999999",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reminder, (true, 3));
+
+        let mut old = serde_json::to_value(archive).unwrap();
+        old["format_version"] = 4.into();
+        old["tables"]
+            .as_object_mut()
+            .unwrap()
+            .remove("access_expiry_reminders");
+        let old: BackupArchive = serde_json::from_value(old).unwrap();
+        assert!(old.tables.access_expiry_reminders.is_empty());
+        restore_archive(&pool, &old).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_expiry_reminders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

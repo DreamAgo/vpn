@@ -1,6 +1,10 @@
 //! Event notification service.
 
+use std::{sync::Arc, time::Duration};
+
+use chrono::{DateTime, FixedOffset, Utc};
 use reqwest::Url;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 use vpn_api_types::system::{
     ApprovalEmailTemplate, EmailNotificationSettings, HttpNotificationChannelSettings,
@@ -11,7 +15,10 @@ use vpn_core::{AppError, Result};
 
 use crate::{
     config::NotificationConfig,
-    repositories::SqliteNotificationEventRepository,
+    repositories::{
+        access_grant_repo_sqlite::AccessExpiryReminderRow, SqliteAccessGrantRepository,
+        SqliteNotificationEventRepository,
+    },
     services::{
         config_service::ConfigService,
         notification_channels::{
@@ -41,6 +48,7 @@ const KEY_NOTIFY_DINGTALK_URL: &str = "notify_dingtalk_url";
 
 const EVENT_GATEWAY_OFFLINE: &str = "gateway_offline";
 const EVENT_GATEWAY_RECOVERED: &str = "gateway_recovered";
+const EVENT_ACCESS_EXPIRING: &str = "access_expiring";
 const EVENT_TEST_EMAIL: &str = "test_email";
 const CHANNEL_EMAIL: &str = "email";
 const CHANNEL_WEBHOOK: &str = "webhook";
@@ -66,6 +74,7 @@ pub struct NotificationService {
     defaults: NotificationConfig,
     config_service: Option<ConfigService>,
     event_repo: Option<SqliteNotificationEventRepository>,
+    expiry_reminder_maintenance: Arc<RwLock<()>>,
 }
 
 impl NotificationService {
@@ -77,6 +86,7 @@ impl NotificationService {
             defaults: config,
             config_service: None,
             event_repo: None,
+            expiry_reminder_maintenance: Arc::new(RwLock::new(())),
         }
     }
 
@@ -265,9 +275,119 @@ impl NotificationService {
             html_body.as_deref(),
             &key,
             Some(&metadata),
-            true,
         )
         .await
+    }
+
+    pub fn spawn_expiry_reminders(self: &Arc<Self>, repo: SqliteAccessGrantRepository) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let delay = match service.deliver_expiry_reminder(&repo).await {
+                    Ok(true) => 2,
+                    Ok(false) => 60,
+                    Err(error) => {
+                        tracing::error!(?error, "授权到期提醒任务处理失败");
+                        60
+                    }
+                };
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+        });
+    }
+
+    pub(crate) async fn pause_expiry_reminders(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.expiry_reminder_maintenance.write().await
+    }
+
+    async fn deliver_expiry_reminder(&self, repo: &SqliteAccessGrantRepository) -> Result<bool> {
+        let _maintenance = self.expiry_reminder_maintenance.read().await;
+        if !self.email_enabled().await? {
+            return Ok(false);
+        }
+        let Some(reminder) = repo
+            .claim_expiry_reminder(Utc::now().timestamp_millis())
+            .await?
+        else {
+            return Ok(false);
+        };
+        let sent = match self.send_expiry_reminder(repo, &reminder).await {
+            Ok(sent) => sent,
+            Err(error) => {
+                tracing::warn!(%error, "授权到期提醒发送失败，将稍后重试");
+                false
+            }
+        };
+        repo.finish_expiry_reminder(&reminder, sent, Utc::now().timestamp_millis())
+            .await?;
+        Ok(true)
+    }
+
+    async fn send_expiry_reminder(
+        &self,
+        repo: &SqliteAccessGrantRepository,
+        claim: &AccessExpiryReminderRow,
+    ) -> Result<bool> {
+        let key = format!(
+            "{EVENT_ACCESS_EXPIRING}:{}:{}",
+            claim.user_id, claim.expires_at
+        );
+        // A recorded delivery can survive a restart before the lease is marked sent.
+        if self
+            .event_repo()?
+            .latest_after(&key, i64::MIN)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+
+        let config = self.effective_config().await?;
+        if !config.email_enabled {
+            return Ok(false);
+        }
+        let Some(reminder) = repo
+            .load_expiry_reminder(claim, Utc::now().timestamp_millis())
+            .await?
+        else {
+            return Ok(false);
+        };
+        let expires_at = DateTime::from_timestamp_millis(claim.expires_at)
+            .ok_or_else(|| AppError::Validation("授权到期时间非法".into()))?
+            .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+            .format("%Y-%m-%d %H:%M:%S");
+        let body = format!(
+            "{}，您好！\n\n您的易链 VPN 网络授权即将到期。\n授权用户组：{}\n授权截止时间（北京时间）：{}\n\n如需继续访问，请在到期前通过飞书提交网络授权申请。",
+            reminder.username,
+            reminder.groups.join("、"),
+            expires_at,
+        );
+        let metadata = serde_json::json!({
+            "user_id": claim.user_id,
+            "expires_at": claim.expires_at,
+            "user_groups": reminder.groups,
+        })
+        .to_string();
+        let remaining_ms =
+            claim.expires_at.min(claim.next_attempt_at) - Utc::now().timestamp_millis();
+        if remaining_ms <= 0 {
+            return Ok(false);
+        }
+        self.send_configured_email_and_record(
+            &config,
+            NotificationMessage {
+                event_type: EVENT_ACCESS_EXPIRING.to_string(),
+                target: reminder.recipient,
+                subject: "易链通知：VPN 网络授权即将到期".to_string(),
+                body,
+                html_body: None,
+                metadata: Some(metadata),
+            },
+            &key,
+            Duration::from_millis(remaining_ms.min(45_000) as u64),
+        )
+        .await?;
+        Ok(true)
     }
 
     pub async fn notify_gateway_offline(&self, gateways: &[GatewayOfflineNotice]) -> Result<()> {
@@ -308,7 +428,6 @@ impl NotificationService {
                 None,
                 "test_email",
                 Some(&metadata),
-                false,
             )
             .await?;
             sent_any = true;
@@ -414,7 +533,6 @@ impl NotificationService {
                         None,
                         &dedupe_key,
                         Some(&metadata),
-                        true,
                     )
                     .await?;
                 }
@@ -436,13 +554,21 @@ impl NotificationService {
         Ok(())
     }
 
+    async fn email_enabled(&self) -> Result<bool> {
+        match &self.config_service {
+            Some(store) => {
+                store
+                    .get_bool(KEY_NOTIFY_EMAIL_ENABLED, self.defaults.email_enabled)
+                    .await
+            }
+            None => Ok(self.defaults.email_enabled),
+        }
+    }
+
     async fn effective_config(&self) -> Result<NotificationConfig> {
         let Some(config_store) = &self.config_service else {
             return Ok(self.defaults.clone());
         };
-        let enabled = config_store
-            .get_bool(KEY_NOTIFY_EMAIL_ENABLED, self.defaults.email_enabled)
-            .await?;
         let smtp_host = config_store
             .get_string(KEY_NOTIFY_SMTP_HOST)
             .await?
@@ -466,7 +592,7 @@ impl NotificationService {
             .get_csv(KEY_NOTIFY_EMAIL_TO, &self.defaults.email_to)
             .await?;
         Ok(NotificationConfig {
-            email_enabled: enabled,
+            email_enabled: self.email_enabled().await?,
             smtp_host,
             smtp_port,
             smtp_username,
@@ -569,76 +695,54 @@ impl NotificationService {
         html_body: Option<&str>,
         dedupe_key: &str,
         metadata: Option<&str>,
-        require_enabled: bool,
     ) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
         let config = self.effective_config().await?;
-        let can_send = (!require_enabled || config.email_enabled)
-            && EmailNotifier::from_config(&config).is_some();
-        if !can_send {
-            self.record_event(
-                event_type,
-                CHANNEL_EMAIL,
-                target,
-                "failed",
-                subject,
-                Some("邮件通知未启用或 SMTP 配置不完整"),
-                metadata,
-                dedupe_key,
-                None,
-            )
-            .await?;
-            return Err(AppError::Validation(
-                "邮件通知未启用或 SMTP 配置不完整".to_string(),
-            ));
-        }
-        let notifier = EmailNotifier::from_config(&config)
-            .ok_or_else(|| AppError::Validation("SMTP 配置不完整".to_string()))?;
-        let message = NotificationMessage {
-            event_type: event_type.to_string(),
-            target: target.to_string(),
-            subject: subject.to_string(),
-            body: body.to_string(),
-            html_body: html_body.map(str::to_string),
-            metadata: metadata.map(str::to_string),
-        };
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(45), notifier.send(&message))
-                .await
-                .unwrap_or_else(|_| Err(AppError::Config("SMTP 发送超时".into())));
+        self.send_configured_email_and_record(
+            &config,
+            NotificationMessage {
+                event_type: event_type.to_string(),
+                target: target.to_string(),
+                subject: subject.to_string(),
+                body: body.to_string(),
+                html_body: html_body.map(str::to_string),
+                metadata: metadata.map(str::to_string),
+            },
+            dedupe_key,
+            Duration::from_secs(45),
+        )
+        .await
+    }
 
-        match result {
-            Ok(()) => {
-                self.record_event(
-                    event_type,
-                    CHANNEL_EMAIL,
-                    target,
-                    "sent",
-                    subject,
-                    None,
-                    metadata,
-                    dedupe_key,
-                    Some(now),
-                )
-                .await?;
-                Ok(())
-            }
-            Err(e) => {
-                self.record_event(
-                    event_type,
-                    CHANNEL_EMAIL,
-                    target,
-                    "failed",
-                    subject,
-                    Some(&e.to_string()),
-                    metadata,
-                    dedupe_key,
-                    None,
-                )
-                .await?;
-                Err(e)
-            }
-        }
+    async fn send_configured_email_and_record(
+        &self,
+        config: &NotificationConfig,
+        message: NotificationMessage,
+        dedupe_key: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let result = match EmailNotifier::from_config(config) {
+            Some(notifier) => tokio::time::timeout(timeout, notifier.send(&message))
+                .await
+                .unwrap_or_else(|_| Err(AppError::Config("SMTP 发送超时".into()))),
+            None => Err(AppError::Validation(
+                "邮件通知未启用或 SMTP 配置不完整".into(),
+            )),
+        };
+        let error = result.as_ref().err().map(ToString::to_string);
+        self.record_event(
+            &message.event_type,
+            CHANNEL_EMAIL,
+            &message.target,
+            if result.is_ok() { "sent" } else { "failed" },
+            &message.subject,
+            error.as_deref(),
+            message.metadata.as_deref(),
+            dedupe_key,
+            result.is_ok().then_some(now),
+        )
+        .await?;
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -980,6 +1084,103 @@ mod approval_mail_tests {
             body: " ".into()
         })
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn expiry_reminder_uses_the_runtime_email_switch_and_records_delivery_failure() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO users(id,username,email,password_hash,role,created_at,updated_at)
+               VALUES('u1','alice','alice@example.com','hash','user',0,0)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_groups(id,name,created_at,updated_at) VALUES('g1','ops',0,0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO access_grants(id,approval_instance_code,user_id,group_id,expires_at,created_at,updated_at)
+               VALUES('a1','instance','u1','g1',?1,0,0)"#,
+        )
+        .bind(Utc::now().timestamp_millis() + 86_400_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let config = ConfigService::new(crate::repositories::SqliteSystemConfigRepository::new(
+            pool.clone(),
+        ));
+        let events = SqliteNotificationEventRepository::new(pool.clone());
+        let service = NotificationService::new_with_config_service(
+            NotificationConfig {
+                email_enabled: false,
+                smtp_host: None,
+                smtp_port: 587,
+                smtp_username: None,
+                smtp_password: None,
+                email_from: None,
+                email_to: vec!["admin@example.com".into()],
+            },
+            config.clone(),
+            events.clone(),
+        );
+        let repo = SqliteAccessGrantRepository::new(pool.clone());
+        assert!(!service.deliver_expiry_reminder(&repo).await.unwrap());
+        config
+            .set_bool(KEY_NOTIFY_EMAIL_ENABLED, true)
+            .await
+            .unwrap();
+        assert!(service.deliver_expiry_reminder(&repo).await.unwrap());
+        assert!(!service.deliver_expiry_reminder(&repo).await.unwrap());
+        let history = events
+            .list(Some(EVENT_ACCESS_EXPIRING), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].target, "alice@example.com");
+        assert_eq!(history[0].status, "failed");
+
+        // Recover a successful send whose notification history committed before the lease update.
+        service
+            .record_event(
+                EVENT_ACCESS_EXPIRING,
+                CHANNEL_EMAIL,
+                &history[0].target,
+                "sent",
+                &history[0].subject,
+                None,
+                None,
+                &history[0].dedupe_key,
+                Some(Utc::now().timestamp_millis()),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE access_expiry_reminders SET next_attempt_at = 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(service.deliver_expiry_reminder(&repo).await.unwrap());
+        let sent: bool = sqlx::query_scalar("SELECT sent FROM access_expiry_reminders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(sent);
+        assert_eq!(
+            events
+                .list(Some(EVENT_ACCESS_EXPIRING), None, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

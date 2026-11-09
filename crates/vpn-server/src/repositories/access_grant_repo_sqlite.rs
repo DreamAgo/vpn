@@ -51,6 +51,25 @@ pub struct ApprovalMailRow {
     pub last_error: Option<String>,
 }
 
+const REMINDER_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const REMINDER_LEASE_MS: i64 = 5 * 60 * 1_000;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct AccessExpiryReminderRow {
+    pub user_id: String,
+    pub expires_at: i64,
+    pub sent: bool,
+    pub attempts: i64,
+    pub next_attempt_at: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct AccessExpiryReminder {
+    pub username: String,
+    pub recipient: String,
+    pub groups: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteAccessGrantRepository {
     pool: SqlitePool,
@@ -73,6 +92,85 @@ impl SqliteAccessGrantRepository {
             .bind(error.is_none()).bind(error)
             .bind(Utc::now().timestamp_millis() + delay.min(3_600_000))
             .bind(&row.instance_code).bind(row.attempts).execute(&self.pool).await.map_err(db)?;
+        Ok(())
+    }
+
+    pub(crate) async fn claim_expiry_reminder(
+        &self,
+        now: i64,
+    ) -> Result<Option<AccessExpiryReminderRow>> {
+        // One write statement atomically selects and leases one deadline.
+        sqlx::query_as(
+            r#"INSERT INTO access_expiry_reminders(user_id, expires_at, attempts, next_attempt_at)
+               SELECT g.user_id, g.expires_at, 1, ?3
+               FROM access_expiry_reminder_groups g
+               LEFT JOIN access_expiry_reminders r
+                 ON r.user_id = g.user_id AND r.expires_at = g.expires_at
+               WHERE g.expires_at > ?1 AND g.expires_at <= ?2
+                 AND (r.user_id IS NULL OR (r.sent = 0 AND r.next_attempt_at <= ?1))
+               ORDER BY g.expires_at, g.user_id LIMIT 1
+               ON CONFLICT(user_id, expires_at) DO UPDATE SET
+                 attempts = attempts + 1, next_attempt_at = excluded.next_attempt_at
+               RETURNING user_id, expires_at, sent, attempts, next_attempt_at"#,
+        )
+        .bind(now)
+        .bind(now + REMINDER_WINDOW_MS)
+        .bind(now + REMINDER_LEASE_MS)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    pub(crate) async fn load_expiry_reminder(
+        &self,
+        claim: &AccessExpiryReminderRow,
+        now: i64,
+    ) -> Result<Option<AccessExpiryReminder>> {
+        let groups: Vec<(String, String, String)> = sqlx::query_as(
+            r#"SELECT DISTINCT g.username, g.email, g.group_name
+               FROM access_expiry_reminder_groups g
+               JOIN access_expiry_reminders r
+                 ON r.user_id = g.user_id AND r.expires_at = g.expires_at
+               WHERE r.user_id = ?1 AND r.expires_at = ?2 AND r.attempts = ?3
+                 AND r.sent = 0 AND r.expires_at > ?4 AND r.next_attempt_at > ?4
+               ORDER BY g.group_name"#,
+        )
+        .bind(&claim.user_id)
+        .bind(claim.expires_at)
+        .bind(claim.attempts)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(groups
+            .first()
+            .cloned()
+            .map(|(username, recipient, _)| AccessExpiryReminder {
+                username,
+                recipient,
+                groups: groups.into_iter().map(|(_, _, name)| name).collect(),
+            }))
+    }
+
+    pub(crate) async fn finish_expiry_reminder(
+        &self,
+        reminder: &AccessExpiryReminderRow,
+        sent: bool,
+        now: i64,
+    ) -> Result<()> {
+        let retry_ms = (30_000_i64 << reminder.attempts.min(7)).min(3_600_000);
+        sqlx::query(
+            r#"UPDATE access_expiry_reminders SET sent = ?1, next_attempt_at = ?2
+               WHERE user_id = ?3 AND expires_at = ?4 AND attempts = ?5 AND sent = 0"#,
+        )
+        .bind(sent)
+        .bind(now + retry_ms)
+        .bind(&reminder.user_id)
+        .bind(reminder.expires_at)
+        .bind(reminder.attempts)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
         Ok(())
     }
 
@@ -531,6 +629,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn expiry_reminders_include_only_effective_groups_within_the_window() {
+        let pool = setup().await;
+        let repo = SqliteAccessGrantRepository::new(pool.clone());
+        sqlx::query(
+            r#"INSERT INTO user_groups(id,name,created_at,updated_at)
+               VALUES('g1','Ops',0,0),('g2','Dev',0,0),('g3','Renewed',0,0),('g4','Manual',0,0)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = 1_800_000_000_000;
+        let expiry = now + REMINDER_WINDOW_MS;
+        repo.apply_approved(grant("expired", now)).await.unwrap();
+        let mut approval = grant("due", expiry);
+        approval.group_ids = ["g1", "g2", "g3", "g4"].map(String::from).to_vec();
+        repo.apply_approved(approval).await.unwrap();
+        repo.apply_approved(grant("overlapping", expiry))
+            .await
+            .unwrap();
+        let mut renewal = grant("renewal", expiry + 1);
+        renewal.group_ids = vec!["g3".into()];
+        repo.apply_approved(renewal).await.unwrap();
+        sqlx::query("INSERT INTO user_group_members VALUES('u-new','g4')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claim = repo.claim_expiry_reminder(now).await.unwrap().unwrap();
+        assert_eq!(claim.expires_at, expiry);
+        sqlx::query("UPDATE users SET email='current@example.com' WHERE id='u-new'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reminder = repo
+            .load_expiry_reminder(&claim, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reminder.groups, ["Dev", "Ops"]);
+        assert_eq!(reminder.recipient, "current@example.com");
+        sqlx::query("UPDATE users SET status = 'disabled' WHERE id = 'u-new'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo
+            .load_expiry_reminder(&claim, now)
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("UPDATE users SET status = 'active' WHERE id = 'u-new'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(repo
+            .load_expiry_reminder(&claim, expiry)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.claim_expiry_reminder(now).await.unwrap().is_none());
+        let next = repo.claim_expiry_reminder(now + 1).await.unwrap().unwrap();
+        assert_eq!(next.expires_at, expiry + 1);
+        assert_eq!(
+            repo.load_expiry_reminder(&next, now + 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .groups,
+            ["Renewed"],
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_reminders_are_leased_retried_and_deduplicated() {
+        let pool = setup().await;
+        let repo = SqliteAccessGrantRepository::new(pool.clone());
+        sqlx::query(
+            "INSERT INTO user_groups(id,name,created_at,updated_at) VALUES('g1','ops',0,0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = 1_800_000_000_000;
+        let expiry = now + 86_400_000;
+        repo.apply_approved(grant("due", expiry)).await.unwrap();
+        sqlx::query(
+            "INSERT INTO feishu_user_states(subject,app_id,blocked) VALUES('union-1','app',1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(repo.claim_expiry_reminder(now).await.unwrap().is_none());
+        sqlx::query("UPDATE feishu_user_states SET blocked=0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (first, concurrent) = tokio::join!(
+            repo.claim_expiry_reminder(now),
+            repo.claim_expiry_reminder(now)
+        );
+        let first = match (first.unwrap(), concurrent.unwrap()) {
+            (Some(claim), None) | (None, Some(claim)) => claim,
+            other => panic!("exactly one claim should succeed, got {other:?}"),
+        };
+        assert!(repo
+            .claim_expiry_reminder(now + REMINDER_LEASE_MS - 1)
+            .await
+            .unwrap()
+            .is_none());
+        let restarted = SqliteAccessGrantRepository::new(pool);
+        let now = now + REMINDER_LEASE_MS;
+        let retry = restarted.claim_expiry_reminder(now).await.unwrap().unwrap();
+        assert_eq!(retry.attempts, 2);
+        restarted
+            .finish_expiry_reminder(&first, true, now)
+            .await
+            .unwrap();
+        restarted
+            .finish_expiry_reminder(&retry, false, now)
+            .await
+            .unwrap();
+        assert!(restarted
+            .claim_expiry_reminder(now + 119_999)
+            .await
+            .unwrap()
+            .is_none());
+        let third = restarted
+            .claim_expiry_reminder(now + 120_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.attempts, 3);
+        restarted
+            .finish_expiry_reminder(&third, true, now + 120_000)
+            .await
+            .unwrap();
+        assert!(restarted
+            .claim_expiry_reminder(expiry - 1)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

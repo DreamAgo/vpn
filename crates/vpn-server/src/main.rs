@@ -304,6 +304,8 @@ async fn run(
         SqliteNotificationEventRepository::new(pool.clone()),
     ));
 
+    notification_service.spawn_expiry_reminders(SqliteAccessGrantRepository::new(pool.clone()));
+
     let feishu_approval_service = if config.feishu_approval.enabled() {
         let mut service = FeishuApprovalService::new(
             config.feishu_approval.clone(),
