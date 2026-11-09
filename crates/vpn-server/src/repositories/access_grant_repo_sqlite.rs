@@ -51,7 +51,6 @@ pub struct ApprovalMailRow {
     pub last_error: Option<String>,
 }
 
-const REMINDER_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const REMINDER_LEASE_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -98,6 +97,7 @@ impl SqliteAccessGrantRepository {
     pub(crate) async fn claim_expiry_reminder(
         &self,
         now: i64,
+        remind_through: i64,
     ) -> Result<Option<AccessExpiryReminderRow>> {
         // One write statement atomically selects and leases one deadline.
         sqlx::query_as(
@@ -114,7 +114,7 @@ impl SqliteAccessGrantRepository {
                RETURNING user_id, expires_at, sent, attempts, next_attempt_at"#,
         )
         .bind(now)
-        .bind(now + REMINDER_WINDOW_MS)
+        .bind(remind_through)
         .bind(now + REMINDER_LEASE_MS)
         .fetch_optional(&self.pool)
         .await
@@ -643,7 +643,7 @@ mod tests {
         .await
         .unwrap();
         let now = 1_800_000_000_000;
-        let expiry = now + REMINDER_WINDOW_MS;
+        let expiry = now + 86_400_000;
         repo.apply_approved(grant("expired", now)).await.unwrap();
         let mut approval = grant("due", expiry);
         approval.group_ids = ["g1", "g2", "g3", "g4"].map(String::from).to_vec();
@@ -658,7 +658,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let claim = repo.claim_expiry_reminder(now).await.unwrap().unwrap();
+        let claim = repo
+            .claim_expiry_reminder(now, now + 86_400_000)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(claim.expires_at, expiry);
         sqlx::query("UPDATE users SET email='current@example.com' WHERE id='u-new'")
             .execute(&pool)
@@ -690,8 +694,16 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(repo.claim_expiry_reminder(now).await.unwrap().is_none());
-        let next = repo.claim_expiry_reminder(now + 1).await.unwrap().unwrap();
+        assert!(repo
+            .claim_expiry_reminder(now, now + 86_400_000)
+            .await
+            .unwrap()
+            .is_none());
+        let next = repo
+            .claim_expiry_reminder(now + 1, now + 1 + 86_400_000)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(next.expires_at, expiry + 1);
         assert_eq!(
             repo.load_expiry_reminder(&next, now + 1)
@@ -722,27 +734,35 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(repo.claim_expiry_reminder(now).await.unwrap().is_none());
+        assert!(repo
+            .claim_expiry_reminder(now, expiry)
+            .await
+            .unwrap()
+            .is_none());
         sqlx::query("UPDATE feishu_user_states SET blocked=0")
             .execute(&pool)
             .await
             .unwrap();
         let (first, concurrent) = tokio::join!(
-            repo.claim_expiry_reminder(now),
-            repo.claim_expiry_reminder(now)
+            repo.claim_expiry_reminder(now, expiry),
+            repo.claim_expiry_reminder(now, expiry)
         );
         let first = match (first.unwrap(), concurrent.unwrap()) {
             (Some(claim), None) | (None, Some(claim)) => claim,
             other => panic!("exactly one claim should succeed, got {other:?}"),
         };
         assert!(repo
-            .claim_expiry_reminder(now + REMINDER_LEASE_MS - 1)
+            .claim_expiry_reminder(now + REMINDER_LEASE_MS - 1, expiry)
             .await
             .unwrap()
             .is_none());
         let restarted = SqliteAccessGrantRepository::new(pool);
         let now = now + REMINDER_LEASE_MS;
-        let retry = restarted.claim_expiry_reminder(now).await.unwrap().unwrap();
+        let retry = restarted
+            .claim_expiry_reminder(now, expiry)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(retry.attempts, 2);
         restarted
             .finish_expiry_reminder(&first, true, now)
@@ -753,12 +773,12 @@ mod tests {
             .await
             .unwrap();
         assert!(restarted
-            .claim_expiry_reminder(now + 119_999)
+            .claim_expiry_reminder(now + 119_999, expiry)
             .await
             .unwrap()
             .is_none());
         let third = restarted
-            .claim_expiry_reminder(now + 120_000)
+            .claim_expiry_reminder(now + 120_000, expiry)
             .await
             .unwrap()
             .unwrap();
@@ -768,7 +788,7 @@ mod tests {
             .await
             .unwrap();
         assert!(restarted
-            .claim_expiry_reminder(expiry - 1)
+            .claim_expiry_reminder(expiry - 1, expiry)
             .await
             .unwrap()
             .is_none());

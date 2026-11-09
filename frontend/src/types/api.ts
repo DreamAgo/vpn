@@ -139,6 +139,8 @@ export interface UpdateNetworkSettingsRequest {
 
 export interface EmailNotificationSettings {
   approvalEmailTemplate: { subject: string; body: string; html?: boolean };
+  accessExpiryEmailTemplate: { subject: string; body: string; html?: boolean };
+  accessExpiryReminderDays: number;
   enabled: boolean;
   smtpHost: string | null;
   smtpPort: number;
@@ -156,6 +158,8 @@ export interface EmailNotificationSettings {
 
 export interface UpdateEmailNotificationSettingsRequest {
   approvalEmailTemplate?: { subject: string; body: string; html?: boolean };
+  accessExpiryEmailTemplate?: { subject: string; body: string; html?: boolean };
+  accessExpiryReminderDays?: number;
   enabled: boolean;
   smtpHost?: string | null;
   smtpPort: number;

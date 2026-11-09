@@ -1,6 +1,6 @@
 //! Event notification service.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, FixedOffset, Utc};
 use reqwest::Url;
@@ -9,7 +9,7 @@ use uuid::Uuid;
 use vpn_api_types::system::{
     ApprovalEmailTemplate, EmailNotificationSettings, HttpNotificationChannelSettings,
     NotificationEventQuery, NotificationEventView, TestEmailNotificationRequest,
-    UpdateEmailNotificationSettingsRequest,
+    UpdateEmailNotificationSettingsRequest, DEFAULT_ACCESS_EXPIRY_REMINDER_DAYS,
 };
 use vpn_core::{AppError, Result};
 
@@ -27,6 +27,10 @@ use crate::{
         GatewayOfflineNotice,
     },
 };
+
+const KEY_ACCESS_EXPIRY_TEMPLATE: &str = "notify_access_expiry_email_template";
+const KEY_ACCESS_EXPIRY_REMINDER_DAYS: &str = "notify_access_expiry_reminder_days";
+const ACCESS_EXPIRY_REMINDER_DAYS: std::ops::RangeInclusive<u32> = 1..=365;
 
 const KEY_APPROVAL_TEMPLATE: &str = "notify_approval_email_template";
 const KEY_NOTIFY_EMAIL_ENABLED: &str = "notify_email_enabled";
@@ -105,9 +109,35 @@ impl NotificationService {
         let config = self.effective_config().await?;
         let rules = self.rules().await?;
         let channels = self.http_channels().await?;
-        let mut settings = config_to_settings(&config, rules, channels);
-        settings.approval_email_template = self.approval_template().await?;
-        Ok(settings)
+        Ok(EmailNotificationSettings {
+            approval_email_template: self
+                .email_template(KEY_APPROVAL_TEMPLATE, ApprovalEmailTemplate::default)
+                .await?,
+            access_expiry_email_template: self
+                .email_template(
+                    KEY_ACCESS_EXPIRY_TEMPLATE,
+                    ApprovalEmailTemplate::access_expiry_default,
+                )
+                .await?,
+            access_expiry_reminder_days: self.access_expiry_reminder_days().await?,
+            enabled: config.email_enabled,
+            smtp_host: config.smtp_host,
+            smtp_port: config.smtp_port,
+            smtp_username: config.smtp_username,
+            smtp_password_set: config
+                .smtp_password
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            from: config.email_from,
+            recipients: config.email_to,
+            quiet_minutes: rules.quiet_minutes,
+            gateway_offline_enabled: rules.gateway_offline_enabled,
+            gateway_recovered_enabled: rules.gateway_recovered_enabled,
+            webhook: channels.webhook,
+            feishu: channels.feishu,
+            dingtalk: channels.dingtalk,
+        })
     }
 
     pub async fn update_email_settings(
@@ -118,9 +148,6 @@ impl NotificationService {
             .config_service
             .as_ref()
             .ok_or_else(|| AppError::Config("config_service 未初始化".to_string()))?;
-        if let Some(template) = &req.approval_email_template {
-            validate_approval_template(template)?;
-        }
         let current = self.effective_config().await?;
         let smtp_host = clean_opt(req.smtp_host);
         let smtp_username = clean_opt(req.smtp_username);
@@ -200,29 +227,64 @@ impl NotificationService {
                 channel.url.as_deref().unwrap_or("").trim().into(),
             ));
         }
-        if let Some(template) = &req.approval_email_template {
-            values.push((
-                KEY_APPROVAL_TEMPLATE.into(),
-                serde_json::to_string(template).map_err(|e| AppError::Internal(Box::new(e)))?,
-            ));
-        }
-        config_store.set_many(&values).await?;
-        let updated = self.effective_config().await?;
-        let rules = self.rules().await?;
-        let channels = self.http_channels().await?;
-        let mut settings = config_to_settings(&updated, rules, channels);
-        settings.approval_email_template = self.approval_template().await?;
-        Ok(settings)
-    }
-
-    async fn approval_template(&self) -> Result<ApprovalEmailTemplate> {
-        if let Some(store) = &self.config_service {
-            if let Some(json) = store.get_string(KEY_APPROVAL_TEMPLATE).await? {
-                return serde_json::from_str(&json)
-                    .map_err(|e| AppError::Config(format!("审批邮件模板配置无效：{e}")));
+        for (key, template, variables) in [
+            (
+                KEY_APPROVAL_TEMPLATE,
+                req.approval_email_template,
+                APPROVAL_VARIABLES,
+            ),
+            (
+                KEY_ACCESS_EXPIRY_TEMPLATE,
+                req.access_expiry_email_template,
+                ACCESS_EXPIRY_VARIABLES,
+            ),
+        ] {
+            if let Some(template) = template {
+                validate_email_template(&template, variables)?;
+                values.push((
+                    key.into(),
+                    serde_json::to_string(&template)
+                        .map_err(|e| AppError::Internal(Box::new(e)))?,
+                ));
             }
         }
-        Ok(ApprovalEmailTemplate::default())
+        if let Some(days) = req.access_expiry_reminder_days {
+            if !ACCESS_EXPIRY_REMINDER_DAYS.contains(&days) {
+                return Err(AppError::Validation("授权到期提醒须提前 1–365 天".into()));
+            }
+            values.push((KEY_ACCESS_EXPIRY_REMINDER_DAYS.into(), days.to_string()));
+        }
+        config_store.set_many(&values).await?;
+        self.email_settings().await
+    }
+
+    async fn email_template(
+        &self,
+        key: &str,
+        default: fn() -> ApprovalEmailTemplate,
+    ) -> Result<ApprovalEmailTemplate> {
+        if let Some(store) = &self.config_service {
+            if let Some(json) = store.get_string(key).await? {
+                return serde_json::from_str(&json)
+                    .map_err(|e| AppError::Config(format!("邮件模板配置无效：{e}")));
+            }
+        }
+        Ok(default())
+    }
+
+    async fn access_expiry_reminder_days(&self) -> Result<u32> {
+        if let Some(store) = &self.config_service {
+            let days = store
+                .get_u32(
+                    KEY_ACCESS_EXPIRY_REMINDER_DAYS,
+                    DEFAULT_ACCESS_EXPIRY_REMINDER_DAYS,
+                )
+                .await?;
+            if ACCESS_EXPIRY_REMINDER_DAYS.contains(&days) {
+                return Ok(days);
+            }
+        }
+        Ok(DEFAULT_ACCESS_EXPIRY_REMINDER_DAYS)
     }
 
     pub async fn notify_approval_approved(
@@ -230,24 +292,26 @@ impl NotificationService {
         mail: &crate::repositories::access_grant_repo_sqlite::ApprovalMailRow,
     ) -> Result<()> {
         let event = "approval_approved";
-        let template = self.approval_template().await?;
-        let context: std::collections::BTreeMap<String, String> =
+        let template = self
+            .email_template(KEY_APPROVAL_TEMPLATE, ApprovalEmailTemplate::default)
+            .await?;
+        let context: BTreeMap<String, String> =
             serde_json::from_str(&mail.body).map_err(|e| AppError::Internal(Box::new(e)))?;
         let subject =
-            render_approval_template(&template.subject, &context)?.replace(['\r', '\n'], " ");
+            render_email_template(&template.subject, &context)?.replace(['\r', '\n'], " ");
         let escaped = context
             .iter()
             .map(|(k, v)| (k.clone(), escape_html(v)))
             .collect();
         let html_body = if template.html {
-            Some(render_approval_template(&template.body, &escaped)?)
+            Some(render_email_template(&template.body, &escaped)?)
         } else {
             None
         };
         let body = if template.html {
-            render_approval_template("您的 VPN 审批已通过。\n账号：{{username}}\n企业邮箱：{{applicant_email}}\n授权用户组：{{user_groups}}\n授权截止时间（北京时间）：{{expires_at}}\n审批编号：{{instance_code}}\n请使用飞书登录易链客户端。", &context)?
+            render_email_template("您的 VPN 审批已通过。\n账号：{{username}}\n企业邮箱：{{applicant_email}}\n授权用户组：{{user_groups}}\n授权截止时间（北京时间）：{{expires_at}}\n审批编号：{{instance_code}}\n请使用飞书登录易链客户端。", &context)?
         } else {
-            render_approval_template(&template.body, &context)?
+            render_email_template(&template.body, &context)?
         };
         let key = format!("approval_approved:{}", mail.instance_code);
         let metadata = serde_json::json!({"instance_code": mail.instance_code}).to_string();
@@ -305,10 +369,9 @@ impl NotificationService {
         if !self.email_enabled().await? {
             return Ok(false);
         }
-        let Some(reminder) = repo
-            .claim_expiry_reminder(Utc::now().timestamp_millis())
-            .await?
-        else {
+        let window_ms = i64::from(self.access_expiry_reminder_days().await?) * 86_400_000;
+        let now = Utc::now().timestamp_millis();
+        let Some(reminder) = repo.claim_expiry_reminder(now, now + window_ms).await? else {
             return Ok(false);
         };
         let sent = match self.send_expiry_reminder(repo, &reminder).await {
@@ -346,6 +409,12 @@ impl NotificationService {
         if !config.email_enabled {
             return Ok(false);
         }
+        let template = self
+            .email_template(
+                KEY_ACCESS_EXPIRY_TEMPLATE,
+                ApprovalEmailTemplate::access_expiry_default,
+            )
+            .await?;
         let Some(reminder) = repo
             .load_expiry_reminder(claim, Utc::now().timestamp_millis())
             .await?
@@ -356,12 +425,28 @@ impl NotificationService {
             .ok_or_else(|| AppError::Validation("授权到期时间非法".into()))?
             .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
             .format("%Y-%m-%d %H:%M:%S");
-        let body = format!(
-            "{}，您好！\n\n您的易链 VPN 网络授权即将到期。\n授权用户组：{}\n授权截止时间（北京时间）：{}\n\n如需继续访问，请在到期前通过飞书提交网络授权申请。",
-            reminder.username,
-            reminder.groups.join("、"),
-            expires_at,
-        );
+        let context = BTreeMap::from([
+            ("username".into(), reminder.username),
+            ("user_groups".into(), reminder.groups.join("、")),
+            ("expires_at".into(), expires_at.to_string()),
+        ]);
+        let subject =
+            render_email_template(&template.subject, &context)?.replace(['\r', '\n'], " ");
+        let (body, html_body) = if template.html {
+            let escaped = context
+                .iter()
+                .map(|(k, v)| (k.clone(), escape_html(v)))
+                .collect();
+            (
+                render_email_template(
+                    &ApprovalEmailTemplate::access_expiry_default().body,
+                    &context,
+                )?,
+                Some(render_email_template(&template.body, &escaped)?),
+            )
+        } else {
+            (render_email_template(&template.body, &context)?, None)
+        };
         let metadata = serde_json::json!({
             "user_id": claim.user_id,
             "expires_at": claim.expires_at,
@@ -378,9 +463,9 @@ impl NotificationService {
             NotificationMessage {
                 event_type: EVENT_ACCESS_EXPIRING.to_string(),
                 target: reminder.recipient,
-                subject: "易链通知：VPN 网络授权即将到期".to_string(),
+                subject,
                 body,
-                html_body: None,
+                html_body,
                 metadata: Some(metadata),
             },
             &key,
@@ -854,33 +939,6 @@ fn clean_string(value: String) -> Option<String> {
     }
 }
 
-fn config_to_settings(
-    config: &NotificationConfig,
-    rules: NotificationRules,
-    channels: HttpChannels,
-) -> EmailNotificationSettings {
-    EmailNotificationSettings {
-        approval_email_template: ApprovalEmailTemplate::default(),
-        enabled: config.email_enabled,
-        smtp_host: config.smtp_host.clone(),
-        smtp_port: config.smtp_port,
-        smtp_username: config.smtp_username.clone(),
-        smtp_password_set: config
-            .smtp_password
-            .as_deref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false),
-        from: config.email_from.clone(),
-        recipients: config.email_to.clone(),
-        quiet_minutes: rules.quiet_minutes,
-        gateway_offline_enabled: rules.gateway_offline_enabled,
-        gateway_recovered_enabled: rules.gateway_recovered_enabled,
-        webhook: channels.webhook,
-        feishu: channels.feishu,
-        dingtalk: channels.dingtalk,
-    }
-}
-
 fn validate_http_channel(name: &str, channel: &HttpNotificationChannelSettings) -> Result<()> {
     if !channel.enabled {
         return Ok(());
@@ -963,13 +1021,15 @@ fn gateway_metadata(gateway: &GatewayOfflineNotice) -> String {
     .to_string()
 }
 
-const APPROVAL_VARIABLES: [&str; 5] = [
+const APPROVAL_VARIABLES: &[&str] = &[
     "username",
     "applicant_email",
     "user_groups",
     "expires_at",
     "instance_code",
 ];
+
+const ACCESS_EXPIRY_VARIABLES: &[&str] = &["username", "user_groups", "expires_at"];
 
 fn escape_html(value: &str) -> String {
     value
@@ -980,10 +1040,7 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn render_approval_template(
-    template: &str,
-    values: &std::collections::BTreeMap<String, String>,
-) -> Result<String> {
+fn render_email_template(template: &str, values: &BTreeMap<String, String>) -> Result<String> {
     let mut rest = template;
     let mut output = String::new();
     while let Some(start) = rest.find("{{") {
@@ -997,15 +1054,10 @@ fn render_approval_template(
             .find("}}")
             .ok_or_else(|| AppError::Validation("邮件模板变量括号不匹配".into()))?;
         let name = rest[..end].trim();
-        if !APPROVAL_VARIABLES.contains(&name) {
-            return Err(AppError::Validation(format!(
-                "不支持的邮件模板变量：{name}"
-            )));
-        }
         output.push_str(
             values
                 .get(name)
-                .ok_or_else(|| AppError::Validation(format!("邮件模板变量缺失：{name}")))?,
+                .ok_or_else(|| AppError::Validation(format!("不支持的邮件模板变量：{name}")))?,
         );
         rest = &rest[end + 2..];
     }
@@ -1016,7 +1068,7 @@ fn render_approval_template(
     Ok(output)
 }
 
-fn validate_approval_template(template: &ApprovalEmailTemplate) -> Result<()> {
+fn validate_email_template(template: &ApprovalEmailTemplate, variables: &[&str]) -> Result<()> {
     if template.subject.trim().is_empty()
         || template.subject.chars().count() > 200
         || template.subject.contains(['\r', '\n'])
@@ -1028,12 +1080,12 @@ fn validate_approval_template(template: &ApprovalEmailTemplate) -> Result<()> {
     if template.body.trim().is_empty() || template.body.chars().count() > 20_000 {
         return Err(AppError::Validation("邮件正文须为 1–20000 字".into()));
     }
-    let values = APPROVAL_VARIABLES
+    let values = variables
         .iter()
         .map(|name| (name.to_string(), String::new()))
         .collect();
-    render_approval_template(&template.subject, &values)?;
-    render_approval_template(&template.body, &values)?;
+    render_email_template(&template.subject, &values)?;
+    render_email_template(&template.body, &values)?;
     Ok(())
 }
 
@@ -1051,7 +1103,7 @@ mod approval_mail_tests {
             "username".into(),
             escape_html("<img src=x> & \"quoted\" 'value' {{instance_code}}"),
         )]);
-        let rendered = render_approval_template("<p>{{username}}</p>", &values).unwrap();
+        let rendered = render_email_template("<p>{{username}}</p>", &values).unwrap();
         assert_eq!(
             rendered,
             "<p>&lt;img src=x&gt; &amp; &quot;quoted&quot; &#39;value&#39; {{instance_code}}</p>"
@@ -1060,29 +1112,35 @@ mod approval_mail_tests {
 
     #[test]
     fn templates_validate_and_replace_values_without_recursive_expansion() {
-        validate_approval_template(&ApprovalEmailTemplate::default()).unwrap();
+        validate_email_template(&ApprovalEmailTemplate::default(), APPROVAL_VARIABLES).unwrap();
         let values = std::collections::BTreeMap::from([
             ("username".into(), "alice {{instance_code}}".into()),
             ("user_groups".into(), "研发、运维".into()),
         ]);
         assert_eq!(
-            render_approval_template("你好 {{ username }}，授权 {{user_groups}}", &values).unwrap(),
+            render_email_template("你好 {{ username }}，授权 {{user_groups}}", &values).unwrap(),
             "你好 alice {{instance_code}}，授权 研发、运维"
         );
         for value in ["{{password}}", "{{username", "username}}", "{{{{username}}"] {
-            assert!(render_approval_template(value, &values).is_err());
+            assert!(render_email_template(value, &values).is_err());
         }
-        assert!(validate_approval_template(&ApprovalEmailTemplate {
-            html: false,
-            subject: "x\r\nBcc: other@example.com".into(),
-            body: "ok".into()
-        })
+        assert!(validate_email_template(
+            &ApprovalEmailTemplate {
+                html: false,
+                subject: "x\r\nBcc: other@example.com".into(),
+                body: "ok".into()
+            },
+            APPROVAL_VARIABLES
+        )
         .is_err());
-        assert!(validate_approval_template(&ApprovalEmailTemplate {
-            html: false,
-            subject: "ok".into(),
-            body: " ".into()
-        })
+        assert!(validate_email_template(
+            &ApprovalEmailTemplate {
+                html: false,
+                subject: "ok".into(),
+                body: " ".into()
+            },
+            APPROVAL_VARIABLES
+        )
         .is_err());
     }
 
@@ -1111,7 +1169,7 @@ mod approval_mail_tests {
             r#"INSERT INTO access_grants(id,approval_instance_code,user_id,group_id,expires_at,created_at,updated_at)
                VALUES('a1','instance','u1','g1',?1,0,0)"#,
         )
-        .bind(Utc::now().timestamp_millis() + 86_400_000)
+        .bind(Utc::now().timestamp_millis() + 2 * 86_400_000)
         .execute(&pool)
         .await
         .unwrap();
@@ -1132,10 +1190,67 @@ mod approval_mail_tests {
             config.clone(),
             events.clone(),
         );
+        let defaults = service.email_settings().await.unwrap();
+        assert_eq!(defaults.access_expiry_reminder_days, 1);
+        assert!(!defaults.access_expiry_email_template.html);
+        let mut request: UpdateEmailNotificationSettingsRequest =
+            serde_json::from_value(serde_json::to_value(&defaults).unwrap()).unwrap();
+        for days in [0, 366] {
+            request.access_expiry_reminder_days = Some(days);
+            assert!(service
+                .update_email_settings(request.clone())
+                .await
+                .is_err());
+        }
+        request.access_expiry_reminder_days = Some(3);
+        request.access_expiry_email_template = Some(ApprovalEmailTemplate {
+            subject: "续期提醒 · {{username}}".into(),
+            body: "<p>{{instance_code}}</p>".into(),
+            html: true,
+        });
+        assert!(service
+            .update_email_settings(request.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            service
+                .email_settings()
+                .await
+                .unwrap()
+                .access_expiry_reminder_days,
+            1
+        );
+
+        request.access_expiry_email_template.as_mut().unwrap().body =
+            "<p>{{user_groups}} 将于 {{expires_at}} 到期</p>".into();
+        let saved = service
+            .update_email_settings(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(saved.access_expiry_reminder_days, 3);
+        assert!(saved.access_expiry_email_template.html);
+        request.access_expiry_reminder_days = None;
+        request.access_expiry_email_template = None;
+        let unchanged = service.update_email_settings(request).await.unwrap();
+        assert_eq!(unchanged.access_expiry_reminder_days, 3);
+        assert_eq!(
+            unchanged.access_expiry_email_template.body,
+            saved.access_expiry_email_template.body
+        );
+
         let repo = SqliteAccessGrantRepository::new(pool.clone());
         assert!(!service.deliver_expiry_reminder(&repo).await.unwrap());
         config
             .set_bool(KEY_NOTIFY_EMAIL_ENABLED, true)
+            .await
+            .unwrap();
+        config
+            .set_u32(KEY_ACCESS_EXPIRY_REMINDER_DAYS, 1)
+            .await
+            .unwrap();
+        assert!(!service.deliver_expiry_reminder(&repo).await.unwrap());
+        config
+            .set_u32(KEY_ACCESS_EXPIRY_REMINDER_DAYS, 3)
             .await
             .unwrap();
         assert!(service.deliver_expiry_reminder(&repo).await.unwrap());
@@ -1145,6 +1260,7 @@ mod approval_mail_tests {
             .await
             .unwrap();
         assert_eq!(history.len(), 1);
+        assert_eq!(history[0].subject, "续期提醒 · alice");
         assert_eq!(history[0].target, "alice@example.com");
         assert_eq!(history[0].status, "failed");
 

@@ -447,10 +447,32 @@ impl Default for ApprovalEmailTemplate {
     }
 }
 
+pub const DEFAULT_ACCESS_EXPIRY_REMINDER_DAYS: u32 = 1;
+
+fn default_access_expiry_reminder_days() -> u32 {
+    DEFAULT_ACCESS_EXPIRY_REMINDER_DAYS
+}
+
+impl ApprovalEmailTemplate {
+    pub fn access_expiry_default() -> Self {
+        Self {
+            subject: "易链通知：VPN 网络授权即将到期".into(),
+            html: false,
+            body: include_str!("../../../templates/access-expiry.txt")
+                .trim_end()
+                .into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailNotificationSettings {
     #[serde(default)]
     pub approval_email_template: ApprovalEmailTemplate,
+    #[serde(default = "ApprovalEmailTemplate::access_expiry_default")]
+    pub access_expiry_email_template: ApprovalEmailTemplate,
+    #[serde(default = "default_access_expiry_reminder_days")]
+    pub access_expiry_reminder_days: u32,
     pub enabled: bool,
     pub smtp_host: Option<String>,
     pub smtp_port: u16,
@@ -476,6 +498,10 @@ pub struct EmailNotificationSettings {
 pub struct UpdateEmailNotificationSettingsRequest {
     #[serde(default)]
     pub approval_email_template: Option<ApprovalEmailTemplate>,
+    #[serde(default)]
+    pub access_expiry_email_template: Option<ApprovalEmailTemplate>,
+    #[serde(default)]
+    pub access_expiry_reminder_days: Option<u32>,
     pub enabled: bool,
     pub smtp_host: Option<String>,
     pub smtp_port: u16,

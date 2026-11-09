@@ -1,4 +1,5 @@
 import defaultApprovalHtml from '../../../templates/approval-approved.html?raw';
+import defaultAccessExpiryText from '../../../templates/access-expiry.txt?raw';
 import { useEffect } from 'react';
 import {
   Alert,
@@ -37,8 +38,16 @@ import type {
 
 const { Title, Text, Paragraph } = Typography;
 
+const defaultAccessExpiryTemplate = {
+  subject: '易链通知：VPN 网络授权即将到期',
+  body: defaultAccessExpiryText.trimEnd(),
+  html: false,
+};
+
 interface NotificationFormValues {
-  approvalEmailTemplate: { subject: string; body: string; html?: boolean };
+  approvalEmailTemplate: EmailNotificationSettings['approvalEmailTemplate'];
+  accessExpiryEmailTemplate: EmailNotificationSettings['accessExpiryEmailTemplate'];
+  accessExpiryReminderDays: number;
   enabled: boolean;
   smtpHost?: string;
   smtpPort: number;
@@ -62,6 +71,8 @@ interface ChannelFormValues {
 function toFormValues(settings: EmailNotificationSettings): NotificationFormValues {
   return {
     approvalEmailTemplate: settings.approvalEmailTemplate,
+    accessExpiryEmailTemplate: settings.accessExpiryEmailTemplate ?? defaultAccessExpiryTemplate,
+    accessExpiryReminderDays: settings.accessExpiryReminderDays ?? 1,
     enabled: settings.enabled,
     smtpHost: settings.smtpHost ?? undefined,
     smtpPort: settings.smtpPort || 587,
@@ -96,14 +107,21 @@ export function NotificationSettingsPage() {
   const [form] = Form.useForm<NotificationFormValues>();
   const enabled = Form.useWatch('enabled', form);
   const approvalTemplate = Form.useWatch('approvalEmailTemplate', form);
+  const accessExpiryTemplate = Form.useWatch('accessExpiryEmailTemplate', form);
   const previewValues: Record<string, string> = {
     username: 'zhangsan', applicant_email: 'zhangsan@example.com',
     user_groups: '研发组、运维组', expires_at: '2026-12-01 00:00:00（北京时间）',
     instance_code: 'example-approval-instance',
   };
-  const previewTemplate = (text?: string) => (text ?? '').replace(
-    /\{\{\s*([a-z_]+)\s*\}\}/g, (match, name: string) => previewValues[name] ?? match
+  const previewTemplate = (text?: string, values = previewValues) => (text ?? '').replace(
+    /\{\{\s*([a-z_]+)\s*\}\}/g, (match, name: string) => values[name] ?? match
   );
+  const expiryPreviewValues = {
+    username: previewValues.username,
+    user_groups: previewValues.user_groups,
+    expires_at: '2026-12-01 00:00:00',
+  };
+  const previewExpiry = (text?: string) => previewTemplate(text, expiryPreviewValues);
 
   const { data, isLoading } = useQuery({
     queryKey: ['email-notification-settings'],
@@ -149,6 +167,8 @@ export function NotificationSettingsPage() {
     const values = await form.validateFields();
     const payload: UpdateEmailNotificationSettingsRequest = {
       approvalEmailTemplate: values.approvalEmailTemplate,
+      accessExpiryEmailTemplate: values.accessExpiryEmailTemplate,
+      accessExpiryReminderDays: values.accessExpiryReminderDays,
       enabled: values.enabled,
       smtpHost: clean(values.smtpHost),
       smtpPort: values.smtpPort,
@@ -241,7 +261,7 @@ export function NotificationSettingsPage() {
         <Alert
           showIcon
           type="info"
-          message="当前支持：审批通过邮件、站点网关离线、站点网关恢复、测试邮件"
+          message="当前支持：审批通过邮件、授权到期提醒、站点网关离线、站点网关恢复、测试邮件"
           description="审批通过邮件发送给申请人的飞书企业邮箱，不使用下方管理员收件人。普通节点离线不会发送邮件；静默期内同一网关同一事件不会重复发送，历史里会记录 skipped。"
         />
 
@@ -252,6 +272,8 @@ export function NotificationSettingsPage() {
             initialValues={{
               enabled: false,
               smtpPort: 587,
+              accessExpiryReminderDays: 1,
+              accessExpiryEmailTemplate: defaultAccessExpiryTemplate,
               recipients: [],
               quietMinutes: 30,
               gatewayOfflineEnabled: true,
@@ -410,6 +432,48 @@ export function NotificationSettingsPage() {
                   srcDoc={'<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:;">' + previewTemplate(approvalTemplate?.body)}
                   style={{ width: '100%', height: 780, border: '1px solid #e2e8f0', borderRadius: 12, background: '#f1f5f9' }} />
               ) : <Paragraph style={{ whiteSpace: 'pre-wrap' }}>{previewTemplate(approvalTemplate?.body)}</Paragraph>}
+            </details>
+
+            <div className="settings-section-heading"><Text strong>授权到期提醒</Text></div>
+            <Paragraph type="secondary">
+              邮件发送至授权用户的账号邮箱。待发送和重试邮件使用最新模板。
+            </Paragraph>
+            <Row gutter={16}>
+              <Col xs={24} md={8}>
+                <Form.Item
+                  name="accessExpiryReminderDays"
+                  label="提前提醒"
+                  rules={[{ required: true, type: 'integer', min: 1, max: 365, message: '请输入 1–365 的整数' }]}
+                >
+                  <InputNumber min={1} max={365} addonAfter="天" style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Paragraph>
+              {'可用变量：{{username}} 账号、{{user_groups}} 即将到期的用户组、{{expires_at}} 到期时间（北京时间）。'}
+            </Paragraph>
+            <Space wrap style={{ marginBottom: 16 }}>
+              <Form.Item name={['accessExpiryEmailTemplate', 'html']} valuePropName="checked" label="HTML 邮件" style={{ marginBottom: 0 }}>
+                <Switch />
+              </Form.Item>
+              <Button onClick={() => form.setFieldValue('accessExpiryEmailTemplate', defaultAccessExpiryTemplate)}>恢复默认模板</Button>
+            </Space>
+            <Form.Item name={['accessExpiryEmailTemplate', 'subject']} label="到期邮件主题"
+              rules={[{ required: true, message: '请输入邮件主题' }, { max: 200 }]}>
+              <Input maxLength={200} />
+            </Form.Item>
+            <Form.Item name={['accessExpiryEmailTemplate', 'body']} label="到期邮件正文"
+              rules={[{ required: true, message: '请输入邮件正文' }, { max: 20000 }]}>
+              <Input.TextArea rows={8} showCount maxLength={20000} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+            </Form.Item>
+            <details style={{ marginBottom: 24 }}>
+              <summary>到期邮件预览（示例数据，不会发送邮件）</summary>
+              <Paragraph strong>{previewExpiry(accessExpiryTemplate?.subject)}</Paragraph>
+              {accessExpiryTemplate?.html ? (
+                <iframe title="到期邮件 HTML 预览" sandbox="" referrerPolicy="no-referrer"
+                  srcDoc={'<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:;">' + previewExpiry(accessExpiryTemplate?.body)}
+                  style={{ width: '100%', height: 480, border: '1px solid #e2e8f0', borderRadius: 12, background: '#f1f5f9' }} />
+              ) : <Paragraph style={{ whiteSpace: 'pre-wrap' }}>{previewExpiry(accessExpiryTemplate?.body)}</Paragraph>}
             </details>
 
             <div className="settings-section-heading notification-channel-heading">
