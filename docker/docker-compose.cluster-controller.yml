@@ -1,0 +1,23 @@
+# 启动前在宿主机配置 WireGuard 互联接口、IPv4 转发和私有 HTTPS 代理。
+services:
+  vpn-controller:
+    image: "${VPN_IMAGE:?请设置含集群功能的统一发行镜像}"
+    user: "0:0"
+    restart: unless-stopped
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_BIND_SERVICE, DAC_OVERRIDE]
+    env_file: ./controller.env
+    environment:
+      VPN_CLUSTER_GATEWAYS_FILE: /run/vpn-cluster/gateways.json
+    volumes:
+      - ./controller-secrets:/run/vpn-cluster:ro
+      - vpn-controller-data:/var/lib/vpn
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  vpn-controller-data:

@@ -14,12 +14,13 @@ use std::time::Instant;
 use tokio::sync::{watch, Mutex};
 use tracing::Instrument;
 use vpn_cli::api::ApiClient;
-use vpn_cli::config::DEFAULT_INTERFACE;
+use vpn_cli::cluster::{self, GatewayReconnect, GatewayRetry};
 #[cfg(not(target_os = "macos"))]
 use vpn_cli::config::{default_device_name, CredentialRepo};
+use vpn_cli::config::{DeviceIdentity, DEFAULT_INTERFACE};
 use vpn_cli::daemon::{self, SharedState};
 use vpn_cli::ipc::{ConnState, StatusResponse};
-use vpn_wireguard::{generate_keypair, WgKeypair};
+use vpn_wireguard::WgKeypair;
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
@@ -31,10 +32,35 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+type GatewayMonitor = tokio::task::JoinHandle<Option<GatewayReconnect>>;
+
+#[derive(Clone, Copy)]
+struct ConnectionGeneration {
+    epoch: u64,
+    owner: Option<u64>,
+}
+
+struct ActiveGatewayMonitor {
+    task: GatewayMonitor,
+    owner: u64,
+}
+
+struct AttemptError {
+    message: String,
+    retry_cluster: bool,
+}
+
+impl From<String> for AttemptError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retry_cluster: true,
+        }
+    }
+}
+
 /// 单进程连接管理器(放进 Tauri 托管状态,以 `Arc` 共享给命令与托盘)。
 pub struct VpnManager {
-    /// 本机 WireGuard 密钥对(启动生成一次,重连复用→服务端分配同一 VPN IP)。
-    keypair: WgKeypair,
     /// 对外暴露的连接状态(前端轮询读取)。
     shared: SharedState,
     /// 当前连接的关停信号发送端(隧道转发任务 + 心跳任务共用);None 表示未连接。
@@ -50,6 +76,8 @@ pub struct VpnManager {
     /// disconnect 在等待 operation 锁之前先递增；正在建连的 manager-owned task
     /// 在每个资源阶段检查，确保超时/会话切换不会迟到建立隧道。
     operation_epoch: AtomicU64,
+    /// Replaced only after a new connection has been installed.
+    connection_owner: AtomicU64,
     /// TUN 接口名。
     iface: String,
     /// 单调递增的连接尝试编号，仅用于关联本地日志。
@@ -59,7 +87,6 @@ pub struct VpnManager {
 impl VpnManager {
     pub fn new() -> Self {
         Self {
-            keypair: generate_keypair(),
             shared: SharedState::new(),
             shutdown: Mutex::new(None),
             stop_requested: Mutex::new(None),
@@ -67,6 +94,7 @@ impl VpnManager {
             cleanup_failure: Mutex::new(None),
             operation: Mutex::new(()),
             operation_epoch: AtomicU64::new(1),
+            connection_owner: AtomicU64::new(0),
             iface: std::env::var("VPN_CLI_INTERFACE")
                 .unwrap_or_else(|_| DEFAULT_INTERFACE.to_string()),
             attempt_seq: AtomicU64::new(0),
@@ -94,7 +122,10 @@ impl VpnManager {
             .refresh_token()
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "未登录:请先登录".to_string())?;
-        self.connect_with_credentials(server, refresh, default_device_name())
+        let identity = repo
+            .device_identity(&server)
+            .map_err(|error| error.to_string())?;
+        self.connect_with_credentials(server, refresh, default_device_name(), Some(identity))
             .await
     }
 
@@ -104,6 +135,7 @@ impl VpnManager {
         server: String,
         refresh: String,
         device: String,
+        device_identity: Option<DeviceIdentity>,
     ) -> Result<(), String> {
         let attempt_id = self
             .attempt_seq
@@ -115,16 +147,75 @@ impl VpnManager {
         // 变化）取消等待时，任务仍持有 operation 锁并完成登记；随后 disconnect 必须
         // 等它结束并通过 supervisor 清理，避免 detached TUN/路由迟到删除新连接路由。
         let manager = self.clone();
-        let expected_epoch = self.operation_epoch.load(Ordering::Acquire);
+        let epoch = self.operation_epoch.load(Ordering::Acquire);
         let task = tokio::spawn(
             async move {
-                manager
-                    .connect_attempt(attempt_id, expected_epoch, server, refresh, device)
-                    .await
+                let mut api = ApiClient::new(&server).map_err(|error| error.to_string())?;
+                let keypair = if let Some(identity) = device_identity {
+                    api = api
+                        .with_device_key(identity.device_key())
+                        .map_err(|error| error.to_string())?;
+                    identity.keypair().map_err(|error| error.to_string())?
+                } else {
+                    vpn_wireguard::generate_keypair()
+                };
+                api.set_refresh_token(refresh);
+                let api = Arc::new(api);
+                let mut retry = GatewayRetry::default();
+                let result = manager
+                    .connect_attempt(
+                        attempt_id,
+                        ConnectionGeneration { epoch, owner: None },
+                        api.clone(),
+                        &keypair,
+                        &device,
+                        &mut retry,
+                    )
+                    .await;
+                match result {
+                    Ok(Some(monitor)) => {
+                        tokio::spawn(manager.follow_gateway(
+                            ConnectionGeneration {
+                                epoch,
+                                owner: Some(monitor.owner),
+                            },
+                            api,
+                            keypair,
+                            device,
+                            retry,
+                            Some(monitor.task),
+                        ));
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(error) => {
+                        let owner = manager.connection_owner.load(Ordering::Acquire);
+                        let has_live_connection = manager
+                            .supervisor
+                            .lock()
+                            .await
+                            .as_ref()
+                            .is_some_and(|task| !task.is_finished());
+                        if api.cluster_seen() && error.retry_cluster && !has_live_connection {
+                            tokio::spawn(manager.follow_gateway(
+                                ConnectionGeneration {
+                                    epoch,
+                                    owner: Some(owner),
+                                },
+                                api,
+                                keypair,
+                                device,
+                                retry,
+                                None,
+                            ));
+                        }
+                        Err(error.message)
+                    }
+                }
             }
             .instrument(span.clone()),
         );
-        let result = task
+        let result: Result<(), String> = task
             .await
             .map_err(|error| format!("VPN 连接任务异常: {error}"))?;
         if let Err(error) = &result {
@@ -145,13 +236,14 @@ impl VpnManager {
     async fn connect_attempt(
         &self,
         attempt_id: u64,
-        expected_epoch: u64,
-        server: String,
-        refresh: String,
-        device: String,
-    ) -> Result<(), String> {
+        generation: ConnectionGeneration,
+        api: Arc<ApiClient>,
+        keypair: &WgKeypair,
+        device: &str,
+        retry: &mut GatewayRetry,
+    ) -> Result<Option<ActiveGatewayMonitor>, AttemptError> {
         let _operation = self.operation.lock().await;
-        self.ensure_connect_epoch(expected_epoch)?;
+        self.ensure_generation(generation)?;
         let connection_started = Instant::now();
         tracing::info!(attempt_id, iface = %self.iface, stage = "connect", result = "started", "开始建立 VPN 连接");
 
@@ -176,17 +268,14 @@ impl VpnManager {
                 "连接前 DNS 清理结束"
             );
             cleanup.map_err(|error| format!("连接前清理 DNS 失败：{error}"))?;
-            self.ensure_connect_epoch(expected_epoch)?;
+            self.ensure_generation(generation)?;
         }
-        let api = Arc::new(ApiClient::new(&server).map_err(|error| {
-            tracing::warn!(stage = "credentials", result = "failed", error = %error.safe_diagnostic(), "初始化控制面客户端失败");
-            error.to_string()
-        })?);
-        api.set_refresh_token(refresh);
-
-        self.shared
-            .set_state(ConnState::Connecting, now_unix())
-            .await;
+        let previous_healthy = self.shared.snapshot().await.state == ConnState::Connected;
+        if !previous_healthy {
+            self.shared
+                .set_state(ConnState::Connecting, now_unix())
+                .await;
+        }
 
         // 1) 控制平面:注册取 vpn_ip + allowed_routes + 服务端 endpoint。
         // **先注册再拆旧隧道**:托盘 Connect 始终可点,一次冗余点击叠加瞬时网络/服务端
@@ -199,15 +288,21 @@ impl VpnManager {
         );
         let params = match tokio::time::timeout(
             CONNECT_TIMEOUT,
-            daemon::connect_once(&api, &self.keypair, &device),
+            daemon::connect_once_with_retry(&api, keypair, device, retry),
         )
         .await
         {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
                 tracing::warn!(stage = "register", result = "failed", elapsed_ms = register_started.elapsed().as_millis(), error = %e.safe_diagnostic(), "注册 VPN 节点失败");
-                self.shared.set_error(e.to_string(), now_unix()).await;
-                return Err(e.to_string());
+                let message = e.to_string();
+                if !previous_healthy {
+                    self.shared.set_error(message.clone(), now_unix()).await;
+                }
+                return Err(AttemptError {
+                    message,
+                    retry_cluster: !e.stops_tunnel(),
+                });
             }
             Err(_) => {
                 let error = "注册 VPN 节点超时，请检查网络后重试".to_string();
@@ -218,11 +313,16 @@ impl VpnManager {
                     timeout_secs = CONNECT_TIMEOUT.as_secs(),
                     "注册 VPN 节点超时"
                 );
-                self.shared.set_error(error.clone(), now_unix()).await;
-                return Err(error);
+                if !previous_healthy {
+                    self.shared.set_error(error.clone(), now_unix()).await;
+                }
+                return Err(error.into());
             }
         };
-        self.ensure_connect_epoch(expected_epoch)?;
+        self.ensure_generation(generation)?;
+        self.shared
+            .set_state(ConnState::Connecting, now_unix())
+            .await;
         tracing::info!(
             stage = "register",
             result = "succeeded",
@@ -242,9 +342,9 @@ impl VpnManager {
         if let Err(error) = self.stop_current("重连替换旧连接").await {
             tracing::warn!(stage = "previous_connection_cleanup", result = "failed", elapsed_ms = cleanup_started.elapsed().as_millis(), error = %vpn_cli::error::redact_sensitive(&error), "旧连接任务清理失败");
             self.shared.set_error(error.clone(), now_unix()).await;
-            return Err(error);
+            return Err(error.into());
         }
-        self.ensure_connect_epoch(expected_epoch)?;
+        self.ensure_generation(generation)?;
         tracing::info!(
             stage = "previous_connection_cleanup",
             result = "succeeded",
@@ -252,6 +352,10 @@ impl VpnManager {
             "旧连接任务清理完成"
         );
 
+        // Discard any last health update from the previous gateway after its tasks exit.
+        self.shared
+            .set_state(ConnState::Connecting, now_unix())
+            .await;
         // 2) 数据面:用户态 boringtun 隧道(本进程内开 TUN + 加路由 + 转发循环)。
         let (tx, rx) = watch::channel(false);
         // 实时路由通道(P1.4):心跳检测到 allowed_routes 变化 → 转发循环增量更新路由。
@@ -266,7 +370,7 @@ impl VpnManager {
         );
         let forward = match daemon::bring_up_tunnel(
             &self.iface,
-            &self.keypair,
+            keypair,
             &params,
             rx.clone(),
             tx.clone(),
@@ -278,11 +382,23 @@ impl VpnManager {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(stage = "data_plane", result = "failed", elapsed_ms = data_plane_started.elapsed().as_millis(), error = %e.safe_diagnostic(), "创建 VPN 数据面失败");
-                self.shared.set_error(e.to_string(), now_unix()).await;
-                return Err(e.to_string());
+                let retry_cluster = if let (Some(gateway), true) =
+                    (&params.gateway, e.is_gateway_endpoint_error())
+                {
+                    retry.record_failure(gateway);
+                    true
+                } else {
+                    false
+                };
+                let message = e.to_string();
+                self.shared.set_error(message.clone(), now_unix()).await;
+                return Err(AttemptError {
+                    message,
+                    retry_cluster,
+                });
             }
         };
-        if self.ensure_connect_epoch(expected_epoch).is_err() {
+        if self.ensure_generation(generation).is_err() {
             let _ = tx.send(true);
             let mut cleanup = tokio::spawn(async move {
                 match forward.await {
@@ -303,22 +419,24 @@ impl VpnManager {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => {
                     *self.cleanup_failure.lock().await = Some(error.clone());
-                    return Err(error);
+                    return Err(error.into());
                 }
                 Ok(Err(error)) => {
                     let error = format!("连接取消后的清理监督任务异常: {error}");
                     *self.cleanup_failure.lock().await = Some(error.clone());
-                    return Err(error);
+                    return Err(error.into());
                 }
                 Err(_) => {
                     // 不能 drop JoinHandle：否则 forward 会 detached，disconnect 随后会
                     // 误判清理完成。登记到 supervisor 后，stop_current 会继续等待，
                     // 若仍超时则保留句柄并拒绝 console socket 移交。
                     *self.supervisor.lock().await = Some(cleanup);
-                    return Err("连接取消后的数据面清理超时，已阻止新连接".to_string());
+                    return Err("连接取消后的数据面清理超时，已阻止新连接"
+                        .to_string()
+                        .into());
                 }
             }
-            return Err("连接已被断开操作取消".to_string());
+            return Err("连接已被断开操作取消".to_string().into());
         }
         self.shared.set_vpn_ip(Some(params.vpn_ip.clone())).await;
         self.shared.set_channel_health(false, false).await;
@@ -330,7 +448,7 @@ impl VpnManager {
         let api_hb = api.clone();
         let shared = self.shared.clone();
         let hb_state = shared.clone();
-        let hb_pubkey = self.keypair.public_key.clone();
+        let hb_pubkey = keypair.public_key.clone();
         let connection_span = tracing::Span::current();
         let heartbeat = tokio::spawn(
             async move {
@@ -365,6 +483,16 @@ impl VpnManager {
             }
             .instrument(connection_span),
         );
+        let monitor = params.gateway.map(|gateway| {
+            tokio::spawn(cluster::monitor(
+                api,
+                keypair.public_key.clone(),
+                gateway,
+                self.shared.clone(),
+                tx.subscribe(),
+                retry.clone(),
+            ))
+        });
         *self.shutdown.lock().await = Some(tx);
         *self.stop_requested.lock().await = Some(stop_requested);
         *self.supervisor.lock().await = Some(supervisor);
@@ -375,7 +503,69 @@ impl VpnManager {
             elapsed_ms = connection_started.elapsed().as_millis(),
             "VPN 连接后台任务已进入运行状态"
         );
-        Ok(())
+        let owner = self
+            .connection_owner
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        Ok(monitor.map(|task| ActiveGatewayMonitor { task, owner }))
+    }
+
+    async fn follow_gateway(
+        self: Arc<Self>,
+        mut generation: ConnectionGeneration,
+        api: Arc<ApiClient>,
+        keypair: WgKeypair,
+        device: String,
+        mut retry: GatewayRetry,
+        mut monitor: Option<GatewayMonitor>,
+    ) {
+        let mut backoff =
+            vpn_cli::reconnect::Backoff::new(vpn_cli::reconnect::BackoffPolicy::default());
+        loop {
+            if let Some(task) = monitor.take() {
+                let Ok(Some(reason)) = task.await else { return };
+                if let Some(gateway) = reason.failed_gateway() {
+                    retry.record_failure(gateway);
+                    let _operation = self.operation.lock().await;
+                    if self.ensure_generation(generation).is_err() {
+                        return;
+                    }
+                    if let Err(error) = self.stop_current("更换未通过握手的网关").await {
+                        self.shared.set_error(error, now_unix()).await;
+                        return;
+                    }
+                    self.shared
+                        .set_state(ConnState::Reconnecting, now_unix())
+                        .await;
+                }
+            } else {
+                tokio::time::sleep(backoff.advance(0.5)).await;
+            }
+            if self.ensure_generation(generation).is_err()
+                || self.cleanup_failure.lock().await.is_some()
+            {
+                return;
+            }
+            let id = self
+                .attempt_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            match self
+                .connect_attempt(id, generation, api.clone(), &keypair, &device, &mut retry)
+                .await
+            {
+                Ok(Some(next)) => {
+                    generation.owner = Some(next.owner);
+                    monitor = Some(next.task);
+                    backoff.reset();
+                }
+                Ok(None) => return,
+                Err(error) if error.retry_cluster => {
+                    tracing::warn!(error = %vpn_cli::error::redact_sensitive(&error.message), "VPN 网关重连失败");
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     /// 断开:发关停信号(隧道转发任务自行删路由/关设备,心跳停止)。
@@ -399,6 +589,17 @@ impl VpnManager {
         } else {
             Err("连接已被断开操作取消".to_string())
         }
+    }
+
+    fn ensure_generation(&self, generation: ConnectionGeneration) -> Result<(), String> {
+        self.ensure_connect_epoch(generation.epoch)?;
+        if generation
+            .owner
+            .is_some_and(|owner| owner != self.connection_owner.load(Ordering::Acquire))
+        {
+            return Err("VPN 网关连接已被替换".into());
+        }
+        Ok(())
     }
 
     async fn stop_current(&self, reason: &str) -> Result<(), String> {
@@ -450,6 +651,26 @@ impl Default for VpnManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_ownership_depends_on_installed_connection_and_disconnect_epoch() {
+        let manager = VpnManager::new();
+        let epoch = manager.operation_epoch.load(Ordering::Acquire);
+        let original = ConnectionGeneration {
+            epoch,
+            owner: Some(0),
+        };
+        let replacement_attempt = ConnectionGeneration { epoch, owner: None };
+        assert!(manager.ensure_generation(replacement_attempt).is_ok());
+        assert!(manager.ensure_generation(original).is_ok());
+
+        manager.connection_owner.fetch_add(1, Ordering::AcqRel);
+        assert!(manager.ensure_generation(original).is_err());
+        assert!(manager.ensure_generation(replacement_attempt).is_ok());
+
+        manager.operation_epoch.fetch_add(1, Ordering::AcqRel);
+        assert!(manager.ensure_generation(replacement_attempt).is_err());
+    }
 
     #[test]
     fn disconnect_epoch_invalidates_inflight_connect() {

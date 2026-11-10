@@ -47,6 +47,21 @@ class ApiTest {
         api.acceptFeishu("https://example.com", JSONObject().put("username", "real-user").put("login", JSONObject().put("access_token", "new-access").put("refresh_token", "new-refresh")))
         assertEquals("real-user", store.value.getString("username")); assertEquals("new-refresh", store.value.getString("refresh")); assertEquals("old-private", store.value.getString("private"))
     }
+    @Test fun gatewayConnectSendsCompatibilityFieldsButConfirmationDoesNot() {
+        val requests = mutableMapOf<String, JSONObject>()
+        val api = Api(MemoryStore()) { path, body, _ -> requests[path] = body; ok() }
+        val choice = GatewayChoice("branch-gateway", 9)
+        api.selectGateway(choice)
+        api.confirmGateway(choice)
+        val connect = requests.getValue("/cluster/connect")
+        assertEquals(BuildConfig.VERSION_NAME, connect.getString("client_version"))
+        assertEquals("obfs-v1", connect.getJSONArray("capabilities").getString(0))
+        val confirmation = requests.getValue("/cluster/confirm")
+        assertEquals("branch-gateway", confirmation.getString("gateway_id"))
+        assertEquals(9L, confirmation.getLong("revision"))
+        assertFalse(confirmation.has("client_version"))
+        assertFalse(confirmation.has("capabilities"))
+    }
     @Test fun expiredAccessRefreshesOnceAndRetriesWithNewToken() {
         val store = MemoryStore(); val calls = mutableListOf<String>()
         val api = Api(store) { path, _, token ->

@@ -54,6 +54,44 @@ impl KernelWireGuardControl {
         listen_port: u16,
         mode: WgMode,
     ) -> Result<Self> {
+        Self::start_interface(
+            iface,
+            server_private_key,
+            server_public_key,
+            Some((server_addr, subnet_prefix)),
+            listen_port,
+            mode,
+        )
+        .await
+    }
+
+    /// 创建只承载 WireGuard peer 的接口，路由和地址由调用方管理。
+    pub async fn start_without_address(
+        iface: &str,
+        server_private_key: &str,
+        server_public_key: &str,
+        listen_port: u16,
+        mode: WgMode,
+    ) -> Result<Self> {
+        Self::start_interface(
+            iface,
+            server_private_key,
+            server_public_key,
+            None,
+            listen_port,
+            mode,
+        )
+        .await
+    }
+
+    async fn start_interface(
+        iface: &str,
+        server_private_key: &str,
+        server_public_key: &str,
+        address: Option<(Ipv4Addr, u8)>,
+        listen_port: u16,
+        mode: WgMode,
+    ) -> Result<Self> {
         // 幂等清理：忽略「不存在」错误
         let _ = run("ip", &["link", "del", iface]).await;
 
@@ -78,11 +116,16 @@ impl KernelWireGuardControl {
         let _ = std::fs::remove_file(&key_path);
         set_res?;
 
-        let addr = format!("{server_addr}/{subnet_prefix}");
-        run("ip", &["addr", "add", &addr, "dev", iface]).await?;
+        if let Some((addr, prefix)) = address {
+            run(
+                "ip",
+                &["addr", "add", &format!("{addr}/{prefix}"), "dev", iface],
+            )
+            .await?;
+        }
         run("ip", &["link", "set", iface, "up"]).await?;
 
-        tracing::info!(iface, %addr, listen_port, ?mode, "WireGuard 接口已就绪");
+        tracing::info!(iface, ?address, listen_port, ?mode, "WireGuard 接口已就绪");
 
         Ok(Self {
             iface: iface.to_string(),

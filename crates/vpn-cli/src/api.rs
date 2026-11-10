@@ -12,9 +12,11 @@
 //! 设计上把「信封解包」这一纯逻辑（[`unwrap_envelope`]）从 IO 中剥离，便于单测；
 //! 网络层用 `wiremock` 做端到端验证（见 tests/）。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use reqwest::header::HeaderValue;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use vpn_api_types::{
@@ -29,6 +31,7 @@ use vpn_api_types::{
     ApiResponse,
 };
 
+use crate::cluster::{Candidates, GatewayChoice, Selection};
 use crate::error::{CliError, CliResult};
 
 /// 纯逻辑：把已反序列化的 [`ApiResponse`] 信封解包为 `data`。
@@ -83,6 +86,8 @@ pub struct ApiClient {
     http: reqwest::Client,
     tokens: Mutex<Tokens>,
     refresh_lock: tokio::sync::Mutex<()>,
+    device_key: Option<HeaderValue>,
+    cluster_seen: AtomicBool,
 }
 
 /// Install the TLS crypto provider required by this client before any HTTP
@@ -136,6 +141,17 @@ impl ApiClient {
         // 既复用现有密码学后端，也保留 X25519/P-256 等传统回退。
         install_tls_crypto_provider()?;
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error("too many redirects");
+                }
+                if attempt.previous().first().is_some_and(|origin| {
+                    origin.scheme() == "https" && origin.origin() != attempt.url().origin()
+                }) {
+                    return attempt.stop();
+                }
+                attempt.follow()
+            }))
             .user_agent(concat!("vpn-cli/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self::with_http(base_url, http))
@@ -148,7 +164,30 @@ impl ApiClient {
             http,
             tokens: Mutex::new(Tokens::default()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            device_key: None,
+            cluster_seen: AtomicBool::new(false),
         }
+    }
+
+    /// Gateway identity is sent only to the authenticated HTTPS control origin.
+    pub fn with_device_key(mut self, key: &str) -> CliResult<Self> {
+        let secure = reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
+            url.scheme() == "https" && url.username().is_empty() && url.password().is_none()
+        });
+        if secure {
+            if key.len() != 64
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(CliError::Invalid("本机 VPN 设备凭证无效".into()));
+            }
+            let mut header = HeaderValue::from_str(key)
+                .map_err(|_| CliError::Invalid("本机 VPN 设备凭证无效".into()))?;
+            header.set_sensitive(true);
+            self.device_key = Some(header);
+        }
+        Ok(self)
     }
 
     /// 设置已持有的 refresh token（例如从凭证存储恢复后）。
@@ -308,6 +347,60 @@ impl ApiClient {
         Ok(resp.unwrap_or_default())
     }
 
+    pub fn cluster_seen(&self) -> bool {
+        self.cluster_seen.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn cluster_candidates(&self, key: &str) -> CliResult<Option<Candidates>> {
+        if self.device_key.is_none() {
+            return Ok(None);
+        }
+        let result = self
+            .post_json_authed(
+                "/api/v1/cluster/candidates",
+                &serde_json::json!({
+                    "wg_public_key": key,
+                }),
+            )
+            .await;
+        match result {
+            Ok(candidates) => {
+                self.cluster_seen.store(true, Ordering::Relaxed);
+                Ok(Some(candidates))
+            }
+            Err(CliError::ClusterNotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn cluster_connect(
+        &self,
+        key: &str,
+        choice: &GatewayChoice,
+    ) -> CliResult<PeerRegisterResponse> {
+        #[derive(Serialize)]
+        struct Connect<'a> {
+            #[serde(flatten)]
+            selection: Selection<'a>,
+            client_version: &'static str,
+            capabilities: [&'static str; 1],
+        }
+        self.post_json_authed(
+            "/api/v1/cluster/connect",
+            &Connect {
+                selection: choice.request(key),
+                client_version: env!("CARGO_PKG_VERSION"),
+                capabilities: ["obfs-v1"],
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn cluster_confirm(&self, key: &str, choice: &GatewayChoice) -> CliResult<()> {
+        self.post_json_authed("/api/v1/cluster/confirm", &choice.request(key))
+            .await
+    }
+
     /// 下载客户端 .conf 配置（非信封，纯文本附件）。
     pub async fn download_config(&self) -> CliResult<String> {
         let access = self.fresh_access().await?;
@@ -398,14 +491,61 @@ impl ApiClient {
         body: &B,
         access: &str,
     ) -> CliResult<T> {
-        let resp = self
+        let peer_request = path.starts_with("/api/v1/cluster/")
+            || matches!(path, "/api/v1/peers/register" | "/api/v1/peers/heartbeat");
+        let mut request = self
             .http
             .post(self.url(path))
             .bearer_auth(access)
-            .json(body)
-            .send()
-            .await?;
+            .json(body);
+        if peer_request {
+            if let Some(key) = &self.device_key {
+                request = request
+                    .header("X-Vpn-Device-Key", key.clone())
+                    .timeout(Duration::from_secs(10));
+            }
+        }
+        let resp = request.send().await?;
+        let status = resp.status();
+        let legacy_spa = status.is_success()
+            && resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+                });
+        if path == "/api/v1/cluster/candidates"
+            && (status == reqwest::StatusCode::NOT_FOUND || legacy_spa)
+        {
+            // Older servers route unknown API paths to their embedded SPA.
+            return Err(CliError::ClusterNotFound);
+        }
+        if path == "/api/v1/cluster/connect" && status == reqwest::StatusCode::CONFLICT {
+            return Err(CliError::GatewayPending);
+        }
         let text = resp.text().await?;
+        if path == "/api/v1/peers/register"
+            && self.device_key.is_some()
+            && status == reqwest::StatusCode::CONFLICT
+            && serde_json::from_str::<ApiResponse<serde_json::Value>>(&text)
+                .is_ok_and(|response| response.code == vpn_api_types::error_codes::VALIDATION_ERROR)
+        {
+            self.cluster_seen.store(true, Ordering::Relaxed);
+            return Err(CliError::GatewayPending);
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && path.starts_with("/api/v1/cluster/")
+            && serde_json::from_str::<ApiResponse<serde_json::Value>>(&text).is_err()
+        {
+            return Err(CliError::Api {
+                code: vpn_api_types::error_codes::TOKEN_EXPIRED,
+                message: "登录已过期".into(),
+            });
+        }
         parse_and_unwrap(&text)
     }
 }
@@ -429,6 +569,30 @@ fn normalize_base_url(mut url: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cluster_detection_accepts_old_server_spa_fallback() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cluster/candidates"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<!doctype html>", "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+        let mut api = ApiClient::with_http(server.uri(), reqwest::Client::new());
+        api.device_key = Some(HeaderValue::from_static("fixture"));
+        api.tokens.lock().unwrap().access_token = Some("fixture".into());
+        assert!(api
+            .cluster_candidates("public-key")
+            .await
+            .unwrap()
+            .is_none());
+    }
     use vpn_api_types::error_codes;
 
     fn envelope_json<T: Serialize>(code: i32, message: &str, data: Option<T>) -> String {

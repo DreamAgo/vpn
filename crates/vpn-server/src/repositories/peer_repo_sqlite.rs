@@ -123,9 +123,28 @@ impl SqlitePeerRepository {
     }
 
     /// 列出活跃 peer 的 (wg_public_key, vpn_ip, routed_subnets)，用于启动时向内核接口恢复配置。
+    pub async fn has_cluster_identity(&self, id: &str, key: &str) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM cluster_devices WHERE peer_id=? AND public_key=?)",
+        )
+        .bind(id)
+        .bind(key)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| AppError::Database(Box::new(error)))
+    }
+
+    pub async fn has_remote_lease(&self, vpn_ip: &str) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cluster_remote_leases WHERE vpn_ip=?)")
+            .bind(vpn_ip)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| AppError::Database(Box::new(error)))
+    }
+
     pub async fn list_active_peer_keys(&self) -> Result<Vec<(String, String, String)>> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT wg_public_key, vpn_ip, routed_subnets FROM peers WHERE status NOT IN ('deleted', 'force_removed') AND EXISTS (SELECT 1 FROM users u WHERE u.id=peers.user_id AND u.status='active') AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=peers.user_id AND f.blocked=1)",
+            "SELECT wg_public_key, vpn_ip, routed_subnets FROM peers WHERE status NOT IN ('deleted', 'force_removed') AND NOT EXISTS (SELECT 1 FROM cluster_remote_leases r WHERE r.vpn_ip=peers.vpn_ip) AND EXISTS (SELECT 1 FROM users u WHERE u.id=peers.user_id AND u.status='active') AND NOT EXISTS (SELECT 1 FROM external_identities e JOIN feishu_user_states f ON f.subject=e.subject WHERE e.provider='feishu' AND e.user_id=peers.user_id AND f.blocked=1)",
         )
         .fetch_all(&self.pool)
         .await
@@ -248,6 +267,13 @@ impl SqlitePeerRepository {
             }
             Err(e) => Err(AppError::Database(Box::new(e))),
         }
+    }
+
+    pub async fn update_client_version(&self, id: &str, key: &str, version: &str) -> Result<()> {
+        sqlx::query("UPDATE peers SET client_version=? WHERE id=? AND wg_public_key=? AND (client_version IS NULL OR client_version<>?)")
+            .bind(version).bind(id).bind(key).bind(version)
+            .execute(&self.pool).await.map_err(|error| AppError::Database(Box::new(error)))?;
+        Ok(())
     }
 
     /// 心跳（按终端）：更新指定 peer 的 last_seen_at / status='online' / endpoint（若有）

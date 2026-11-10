@@ -193,6 +193,7 @@ pub struct PeerService {
     dns_settings: Arc<RwLock<DnsNetworkSettings>>,
     local_route_bypass: Arc<RwLock<Vec<LocalRouteBypassRule>>>,
     registration_blocked: Arc<AtomicBool>,
+    cluster_routes: bool,
 }
 
 #[derive(Clone)]
@@ -247,6 +248,7 @@ impl PeerService {
             dns_settings: Arc::new(RwLock::new(DnsNetworkSettings::default())),
             local_route_bypass: Arc::new(RwLock::new(Vec::new())),
             registration_blocked: Arc::new(AtomicBool::new(false)),
+            cluster_routes: false,
         }
     }
 
@@ -345,6 +347,33 @@ impl PeerService {
         self.subnet.to_string()
     }
 
+    pub(crate) fn requires_obfs(&self) -> bool {
+        self.obfs_transport.is_some()
+    }
+
+    pub fn with_cluster_routes(mut self, enabled: bool) -> Self {
+        self.cluster_routes = enabled;
+        self
+    }
+
+    pub async fn validate_cluster_routes(repo: &SqlitePeerRepository) -> Result<()> {
+        let mut prefixes = std::collections::BTreeSet::new();
+        for (_, _, csv) in repo.list_active_gateway_routes().await? {
+            for subnet in parse_csv_subnets(&csv) {
+                if !prefixes.insert(subnet.clone()) {
+                    return Err(AppError::Config(format!(
+                        "启用集群前需为站点网段 {subnet} 保留唯一设备归属"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_user_available(&self, user_id: &str) -> Result<()> {
+        self.user_repo.ensure_available(user_id).await
+    }
+
     /// Story 4.5 / 多终端模式：注册终端。
     ///
     /// 终端识别：先按 (user, wg_public_key) 匹配，再按 (user, device_name)（客户端
@@ -358,8 +387,19 @@ impl PeerService {
         user_id: &str,
         req: &PeerRegisterRequest,
     ) -> Result<PeerRegisterResponse> {
+        self.register_device(user_id, req, true).await
+    }
+
+    pub(crate) async fn register_device(
+        &self,
+        user_id: &str,
+        req: &PeerRegisterRequest,
+        attach_local: bool,
+    ) -> Result<PeerRegisterResponse> {
         self.user_repo.ensure_available(user_id).await?;
-        if self.obfs_transport.is_some() && !req.capabilities.iter().any(|value| value == "obfs-v1")
+        if attach_local
+            && self.obfs_transport.is_some()
+            && !req.capabilities.iter().any(|value| value == "obfs-v1")
         {
             return Err(AppError::Validation(
                 "服务端已强制启用 obfs-v1；当前客户端版本过旧，请升级客户端".to_string(),
@@ -373,11 +413,27 @@ impl PeerService {
             ));
         }
         let peers = self.peer_repo.list_active_by_user(user_id).await?;
-        // 终端匹配：公钥优先（同一运行内重连），其次设备名（重启后换了密钥对）。
-        let matched = peers
+        let mut matched = peers
             .iter()
-            .find(|p| p.wg_public_key == req.wg_public_key)
-            .or_else(|| peers.iter().find(|p| p.device_name == req.device_name));
+            .find(|peer| peer.wg_public_key == req.wg_public_key);
+        if matched.is_none() {
+            for peer in peers
+                .iter()
+                .filter(|peer| peer.device_name == req.device_name)
+            {
+                // A name can migrate an old slot, but cannot replace an
+                // enrolled device (same-model phones often use the same name).
+                if !self.cluster_routes
+                    || !self
+                        .peer_repo
+                        .has_cluster_identity(&peer.id, &peer.wg_public_key)
+                        .await?
+                {
+                    matched = Some(peer);
+                    break;
+                }
+            }
+        }
         let matched_existing = matched.is_some();
 
         // 复用槽位的目标终端：匹配到的既有终端，或达上限时被接管的离线终端。
@@ -521,14 +577,15 @@ impl PeerService {
         let vpn_ip_parsed: Ipv4Addr = vpn_ip
             .parse()
             .map_err(|e| AppError::Internal(Box::new(e)))?;
-        self.control
-            .configure_peer(&WgPeerConfig {
+        if attach_local {
+            self.configure_local_peer(&WgPeerConfig {
                 public_key: req.wg_public_key.clone(),
                 vpn_ip: vpn_ip_parsed,
                 endpoint: None,
                 allowed_subnets: routed_subnets.clone(),
             })
             .await?;
+        }
 
         // 换公钥：摘除旧 wg peer，避免接口上残留持旧公钥（及其旧 allowed-ips）的幽灵 peer。
         if let Some(old) = &old_pubkey {
@@ -544,6 +601,16 @@ impl PeerService {
                 let _ = self.control.remove_routes(&removed).await;
             }
         }
+        self.connection_config(user_id, vpn_ip, &routed_subnets)
+            .await
+    }
+
+    pub(crate) async fn connection_config(
+        &self,
+        user_id: &str,
+        vpn_ip: String,
+        routed_subnets: &[String],
+    ) -> Result<PeerRegisterResponse> {
         let dns_settings = self.dns_settings.read().await;
         let dns = if dns_settings.mode == ClientDnsMode::Disabled {
             None
@@ -565,14 +632,50 @@ impl PeerService {
             server_endpoint: self.server_endpoint.clone(),
             vpn_subnet: self.subnet_cidr(),
             // 客户端应路由：VPN 子网 + 组网段(或全局默认) + 其他站点的 LAN 网段。
-            allowed_routes: self
-                .compute_allowed_routes(user_id, &routed_subnets)
-                .await?,
+            allowed_routes: self.compute_allowed_routes(user_id, routed_subnets).await?,
             transport: self.obfs_transport.as_ref().map(ObfsTransportSecret::dto),
             network_settings: Some(self.network_settings.read().await.clone()),
             local_route_bypass: self.local_route_bypass.read().await.clone(),
             dns,
         })
+    }
+
+    async fn configure_local_peer(&self, config: &WgPeerConfig) -> Result<()> {
+        if !self
+            .peer_repo
+            .has_remote_lease(&config.vpn_ip.to_string())
+            .await?
+        {
+            self.control.configure_peer(config).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn attach_local_peer(
+        &self,
+        row: &crate::repositories::peer_repo_sqlite::PeerRow,
+    ) -> Result<()> {
+        self.configure_local_peer(&WgPeerConfig {
+            public_key: row.wg_public_key.clone(),
+            vpn_ip: row
+                .vpn_ip
+                .parse()
+                .map_err(|error| AppError::Internal(Box::new(error)))?,
+            endpoint: None,
+            allowed_subnets: parse_csv_subnets(&row.routed_subnets),
+        })
+        .await
+    }
+
+    pub(crate) async fn detach_local_peer(
+        &self,
+        row: &crate::repositories::peer_repo_sqlite::PeerRow,
+    ) -> Result<()> {
+        self.control.remove_peer(&row.wg_public_key).await?;
+        let subnets = self
+            .filter_releasable_routes(parse_csv_subnets(&row.routed_subnets), Some(&row.id), None)
+            .await?;
+        self.control.remove_routes(&subnets).await
     }
 
     /// 计算客户端应导入隧道的网段（访问控制）：
@@ -715,6 +818,11 @@ impl PeerService {
             for s in csv.split(',').filter(|s| !s.is_empty()) {
                 if let Ok(other) = s.parse::<Ipv4Net>() {
                     for n in &news {
+                        if self.cluster_routes && n == &other {
+                            return Err(AppError::Conflict(format!(
+                                "集群中的站点网段 {n} 已分配给节点 {pid}"
+                            )));
+                        }
                         if Self::nets_overlap(n, &other) {
                             let behavior = if n == &other {
                                 "网段完全相同，后配置或重连的节点可能接管流量"
@@ -1125,14 +1233,13 @@ impl PeerService {
         // 重新下发到 WireGuard（仅对未删除/未强制下线的 peer 生效）。
         if peer.status != "deleted" && peer.status != "force_removed" {
             if let Ok(ip) = peer.vpn_ip.parse::<Ipv4Addr>() {
-                self.control
-                    .configure_peer(&WgPeerConfig {
-                        public_key: peer.wg_public_key,
-                        vpn_ip: ip,
-                        endpoint: None,
-                        allowed_subnets: normalized.clone(),
-                    })
-                    .await?;
+                self.configure_local_peer(&WgPeerConfig {
+                    public_key: peer.wg_public_key,
+                    vpn_ip: ip,
+                    endpoint: None,
+                    allowed_subnets: normalized.clone(),
+                })
+                .await?;
                 // 缩减网段：删除被移除网段的残留 OS 路由（best-effort，避免黑洞）。
                 // 保留仍被其他活跃网关接管的网段，避免删掉别人正在用的路由。
                 let removed: Vec<String> = old_routed

@@ -21,18 +21,22 @@ import {
   Tag,
 } from 'antd';
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components';
+import { useQuery } from '@tanstack/react-query';
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import 'dayjs/locale/zh-cn';
 import { useNavigate } from 'react-router-dom';
 
 import { peersApi } from '@/services/peers';
+import { clusterApi, clusterGatewaysQueryKey } from '@/services/cluster';
 import { ApiError } from '@/services/http';
 import { ErrorCodes } from '@/types/api';
 import type { AdminPeerView } from '@/types/api';
 import { NodeStatusDot } from '@/components/NodeStatusDot';
 import { EmptyStateWithAction } from '@/components/EmptyStateWithAction';
 import { EditPeerRoutesModal } from '@/components/EditPeerRoutesModal';
+import { ClusterGatewaysModal } from '@/components/ClusterGatewaysModal';
+import { EditPeerGatewayModal } from '@/components/EditPeerGatewayModal';
 
 dayjs.extend(relativeTime);
 dayjs.locale('zh-cn');
@@ -70,6 +74,14 @@ export function PeersPage() {
 
   const [detail, setDetail] = useState<AdminPeerView | null>(null);
   const [editRoutes, setEditRoutes] = useState<AdminPeerView | null>(null);
+  const [showGateways, setShowGateways] = useState(false);
+  const [editGateway, setEditGateway] = useState<AdminPeerView | null>(null);
+  const gateways = useQuery({
+    queryKey: clusterGatewaysQueryKey,
+    queryFn: clusterApi.listGateways,
+    refetchInterval: (query) => query.state.data === null ? false : 10_000,
+  });
+  const clusterEnabled = gateways.data != null;
 
   const reload = useCallback(() => actionRef.current?.reload(), []);
 
@@ -174,15 +186,20 @@ export function PeersPage() {
       {
         title: '操作',
         key: 'action',
-        width: 280,
+        width: clusterEnabled ? 370 : 300,
         render: (_, record) => (
           <Space size="small">
             <Button type="link" size="small" onClick={() => setDetail(record)}>
               详情
             </Button>
             <Button type="link" size="small" onClick={() => setEditRoutes(record)}>
-              设置网关
+              设置站点网关
             </Button>
+            {clusterEnabled && (
+              <Button type="link" size="small" onClick={() => setEditGateway(record)}>
+                连接网关
+              </Button>
+            )}
             <Popconfirm
               title="强制下线"
               description="将立即撤销该节点的接入，确定强制下线？"
@@ -212,7 +229,7 @@ export function PeersPage() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
+    [clusterEnabled]
   );
 
   return (
@@ -222,7 +239,7 @@ export function PeersPage() {
       </Title>
 
       <ProTable<AdminPeerView>
-        scroll={{ x: 1100 }}
+        scroll={{ x: clusterEnabled ? 1200 : 1100 }}
         actionRef={actionRef}
         rowKey="id"
         columns={columns}
@@ -231,6 +248,11 @@ export function PeersPage() {
         options={{ reload: true, density: false, setting: false }}
         pagination={{ defaultPageSize: 10, showSizeChanger: true }}
         toolbar={{
+          actions: clusterEnabled ? [
+            <Button key="cluster-gateways" onClick={() => setShowGateways(true)}>集群网关</Button>,
+          ] : gateways.isError ? [
+            <Button key="cluster-gateways-retry" onClick={() => void gateways.refetch()}>重试读取集群网关</Button>,
+          ] : undefined,
           search: (
             <Space>
               <Input.Search
@@ -361,6 +383,17 @@ export function PeersPage() {
           peer={editRoutes}
           onClose={() => setEditRoutes(null)}
           onSaved={reload}
+        />
+      )}
+      {showGateways && gateways.data && (
+        <ClusterGatewaysModal gateways={gateways.data} onClose={() => setShowGateways(false)} />
+      )}
+      {editGateway && gateways.data && (
+        <EditPeerGatewayModal
+          key={editGateway.id}
+          peer={editGateway}
+          gateways={gateways.data}
+          onClose={() => setEditGateway(null)}
         />
       )}
     </div>

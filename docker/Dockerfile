@@ -59,6 +59,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
+        iproute2 \
+        iputils-ping \
+        nftables \
+        wireguard-tools \
+        wireguard-go \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建非 root 用户

@@ -1,0 +1,20 @@
+# 在独立 Linux 网关主机运行。先在主机上启动预配置的 WireGuard 互联接口。
+services:
+  vpn-gateway:
+    image: "${VPN_IMAGE:?请设置含集群功能的统一发行镜像}"
+    user: "0:0"
+    restart: unless-stopped
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    env_file: ./gateway.env
+    environment:
+      VPN_GATEWAY_MODE: agent
+      VPN_GATEWAY_TOKEN_FILE: /run/vpn-gateway-secrets/token
+      VPN_GATEWAY_WG_KEY_FILE: /run/vpn-gateway-secrets/client-wg.key
+    volumes:
+      - ./gateway-secrets:/run/vpn-gateway-secrets:ro
+      - /run/yilian-vpn-gateway:/run/yilian-vpn-gateway
+    # 若 VPN_WG_BACKEND=userspace，取消下面两行注释。
+    # devices:
+    #   - /dev/net/tun:/dev/net/tun

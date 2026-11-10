@@ -83,12 +83,13 @@ http.interceptors.response.use(
         accessToken = null;
       }
 
-      const body = keysToCamel<ApiResponse<unknown>>(error.response.data);
+      const body = keysToCamel<ApiResponse<unknown> | null>(error.response.data);
       return Promise.reject(
         new ApiError(
-          body.code ?? error.response.status,
-          body.message ?? error.message,
-          body.requestId ?? ''
+          body?.code ?? error.response.status,
+          body?.message ?? error.message,
+          body?.requestId ?? '',
+          error.response.status
         )
       );
     }
@@ -100,10 +101,12 @@ http.interceptors.response.use(
 export class ApiError extends Error {
   code: number;
   requestId: string;
-  constructor(code: number, message: string, requestId: string) {
+  status?: number;
+  constructor(code: number, message: string, requestId: string, status?: number) {
     super(message);
     this.code = code;
     this.requestId = requestId;
+    this.status = status;
     this.name = 'ApiError';
   }
 }
