@@ -31,7 +31,7 @@ use vpn_api_types::{
     ApiResponse,
 };
 
-use crate::cluster::{Candidates, GatewayChoice, Selection};
+use crate::cluster::{Candidates, GatewayChoice, GatewayQuality, Selection};
 use crate::error::{CliError, CliResult};
 
 /// 纯逻辑：把已反序列化的 [`ApiResponse`] 信封解包为 `data`。
@@ -396,9 +396,27 @@ impl ApiClient {
         .await
     }
 
-    pub(crate) async fn cluster_confirm(&self, key: &str, choice: &GatewayChoice) -> CliResult<()> {
-        self.post_json_authed("/api/v1/cluster/confirm", &choice.request(key))
-            .await
+    pub(crate) async fn cluster_confirm(
+        &self,
+        key: &str,
+        choice: &GatewayChoice,
+        quality: Option<&GatewayQuality>,
+    ) -> CliResult<()> {
+        #[derive(Serialize)]
+        struct Confirm<'a> {
+            #[serde(flatten)]
+            selection: Selection<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            quality: Option<&'a GatewayQuality>,
+        }
+        self.post_json_authed(
+            "/api/v1/cluster/confirm",
+            &Confirm {
+                selection: choice.request(key),
+                quality,
+            },
+        )
+        .await
     }
 
     /// 下载客户端 .conf 配置（非信封，纯文本附件）。

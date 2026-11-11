@@ -149,6 +149,30 @@ export function PeersPage() {
         width: 140,
         render: (_, record) => <Text code>{record.vpnIp}</Text>,
       },
+      ...(clusterEnabled ? [{
+        title: '当前网关',
+        key: 'currentGateway',
+        width: 220,
+        render: (_: unknown, record: AdminPeerView) => {
+          const id = record.currentGatewayId;
+          if (!id) return <Text type="secondary">—</Text>;
+          const name = gateways.data?.find((gateway) => gateway.id === id)?.name ?? id;
+          const quality = record.gatewayQuality;
+          return (
+            <div style={{ overflowWrap: 'anywhere' }}>
+              <Text>{name}</Text>
+              <div>
+                {quality ? (
+                  <Space size={[8, 0]} wrap title={`UDP 探测 · ${dayjs(quality.reportedAt).format('HH:mm:ss')}`}>
+                    <Text type="secondary">延迟 {quality.rttMs == null ? '—' : `${quality.rttMs} ms`}</Text>
+                    <Text type="secondary">丢包率 {quality.lossPct}%</Text>
+                  </Space>
+                ) : <Text type="secondary">暂无测量</Text>}
+              </div>
+            </div>
+          );
+        },
+      }] : []),
       {
         title: '最后心跳',
         dataIndex: 'lastSeenAt',
@@ -229,7 +253,7 @@ export function PeersPage() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [clusterEnabled]
+    [clusterEnabled, gateways.data]
   );
 
   return (
@@ -239,7 +263,7 @@ export function PeersPage() {
       </Title>
 
       <ProTable<AdminPeerView>
-        scroll={{ x: clusterEnabled ? 1200 : 1100 }}
+        scroll={{ x: clusterEnabled ? 1420 : 1100 }}
         actionRef={actionRef}
         rowKey="id"
         columns={columns}

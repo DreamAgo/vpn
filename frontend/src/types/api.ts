@@ -429,6 +429,12 @@ export interface AdminPeerView {
   rttMs: number | null; // 客户端最近上报的心跳往返延迟（毫秒）
   lossPct: number | null; // 客户端最近上报的心跳丢包率（0-100）
   clientVersion: string | null; // 客户端版本
+  currentGatewayId?: string;
+  gatewayQuality?: {
+    rttMs: number | null;
+    lossPct: number;
+    reportedAt: number;
+  };
 }
 
 /** 节点属性变更记录（OS / IP / Endpoint / 设备名 / 版本；节点健康监控）。 */

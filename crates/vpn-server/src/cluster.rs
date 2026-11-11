@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
-use vpn_api_types::peer::{ObfsMode, ObfsTransport, PeerRegisterRequest, PeerRegisterResponse};
+use vpn_api_types::peer::{
+    AdminPeerView, GatewayQualityView, ObfsMode, ObfsTransport, PeerRegisterRequest,
+    PeerRegisterResponse,
+};
 use vpn_core::{AppError, Result};
 
 use crate::{
@@ -28,6 +31,7 @@ pub const BUILTIN: &str = "local";
 const LEASE_MS: i64 = 10_000;
 const CLIENT_HOLD_MS: i64 = 90_000;
 const READY_MS: u64 = 6_000;
+const QUALITY_TTL: Duration = Duration::from_secs(60);
 const DEFAULT_CONFIG_KEY: &str = "cluster_default_gateway";
 const TOPOLOGY_CONFIG_KEY: &str = "cluster_managed_interfaces";
 
@@ -364,6 +368,7 @@ struct RemoteLease {
     public_key: String,
     gateway_id: String,
     issued_until: i64,
+    client_until: i64,
     draining: bool,
 }
 
@@ -373,10 +378,51 @@ struct Agent {
     applied_at: Option<Instant>,
 }
 
+#[derive(Deserialize)]
+pub struct GatewayQualityReport {
+    rtt_ms: Option<u64>,
+    loss_pct: f64,
+}
+
+impl GatewayQualityReport {
+    fn validate(self) -> Result<GatewayQualityView> {
+        if !(0.0..=100.0).contains(&self.loss_pct)
+            || self.rtt_ms.is_some_and(|rtt| rtt > 1000)
+            || (self.loss_pct == 100.0) != self.rtt_ms.is_none()
+        {
+            return Err(AppError::Validation("网关延迟或丢包率无效".into()));
+        }
+        Ok(GatewayQualityView {
+            rtt_ms: self.rtt_ms,
+            loss_pct: self.loss_pct,
+            reported_at: now_ms(),
+        })
+    }
+}
+
+struct GatewayQuality {
+    gateway_id: String,
+    public_key: String,
+    revision: i64,
+    received: Instant,
+    sample: GatewayQualityView,
+}
+
+#[derive(sqlx::FromRow)]
+struct GatewayStatus {
+    id: String,
+    public_key: String,
+    gateway_id: String,
+    revision: Option<i64>,
+    confirmed_gateway_id: Option<String>,
+    confirmed_revision: Option<i64>,
+}
+
 #[derive(Default)]
 struct Runtime {
     agents: HashMap<String, Agent>,
     fences: HashMap<String, Instant>,
+    quality: HashMap<String, GatewayQuality>,
     resume_agents_after: Option<Instant>,
 }
 
@@ -607,7 +653,7 @@ impl Cluster {
     }
 
     async fn lease(&self, ip: &str) -> Result<Option<RemoteLease>> {
-        sqlx::query_as("SELECT vpn_ip,peer_id,public_key,gateway_id,issued_until,draining FROM cluster_remote_leases WHERE vpn_ip=?")
+        sqlx::query_as("SELECT vpn_ip,peer_id,public_key,gateway_id,issued_until,client_until,draining FROM cluster_remote_leases WHERE vpn_ip=?")
             .bind(ip).fetch_optional(&self.pool).await.map_err(db)
     }
 
@@ -761,6 +807,81 @@ impl Cluster {
             .await?
             .ok_or(AppError::PeerNotFound)?;
         self.read_device(&peer).await
+    }
+
+    /// Decorate only this page, using a single query to recheck current
+    /// ownership and authorization before attaching a recent measurement.
+    pub async fn fill_gateway_status(&self, peers: &mut [AdminPeerView]) -> Result<()> {
+        let online: Vec<&str> = peers
+            .iter()
+            .filter(|peer| peer.status == "online")
+            .map(|peer| peer.id.as_str())
+            .collect();
+        if online.is_empty() {
+            return Ok(());
+        }
+        let runtime = self.runtime.lock().await;
+        let default = self.default_gateway().await?;
+        let rows = sqlx::query_as::<_, GatewayStatus>(
+            r#"WITH active AS (
+                SELECT p.id, p.wg_public_key AS public_key, d.revision,
+                       d.confirmed_gateway_id, d.confirmed_revision,
+                       CASE WHEN r.vpn_ip IS NOT NULL THEN
+                           CASE WHEN r.peer_id=p.id AND r.public_key=p.wg_public_key
+                                     AND r.draining=0 AND r.issued_until>?1 AND r.client_until>?1
+                                THEN r.gateway_id END
+                            WHEN l.client_until>?1 THEN ?2
+                       END AS gateway_id
+                FROM peers p
+                JOIN users u ON u.id=p.user_id AND u.status='active'
+                LEFT JOIN cluster_devices d ON d.peer_id=p.id AND d.public_key=p.wg_public_key
+                LEFT JOIN cluster_remote_leases r ON r.vpn_ip=p.vpn_ip
+                LEFT JOIN cluster_local_leases l ON l.vpn_ip=p.vpn_ip AND l.peer_id=p.id AND l.public_key=p.wg_public_key
+                WHERE p.status='online' AND p.id IN (SELECT value FROM json_each(?3))
+                AND NOT EXISTS (
+                    SELECT 1 FROM external_identities e
+                    JOIN feishu_user_states f ON f.subject=e.subject
+                    WHERE e.provider='feishu' AND e.user_id=u.id AND f.blocked=1
+                )
+            )
+            SELECT * FROM active a WHERE a.gateway_id=?4
+            OR (a.revision IS NOT NULL AND EXISTS (
+                SELECT 1 FROM cluster_device_grants g WHERE g.peer_id=a.id AND g.gateway_id=a.gateway_id
+            ))"#,
+        )
+        .bind(now_ms())
+        .bind(BUILTIN)
+        .bind(serde_json::json!(online).to_string())
+        .bind(default)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut rows: HashMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+        for peer in peers {
+            let Some(row) = rows.remove(&peer.id) else {
+                continue;
+            };
+            if row.public_key != peer.wg_public_key
+                || !self.has_gateway(&row.gateway_id)
+                || (row.revision.is_some()
+                    && row.confirmed_gateway_id.as_deref() != Some(&row.gateway_id))
+            {
+                continue;
+            }
+            peer.gateway_quality = runtime
+                .quality
+                .get(&peer.id)
+                .filter(|report| {
+                    report.received.elapsed() < QUALITY_TTL
+                        && report.public_key == row.public_key
+                        && report.gateway_id == row.gateway_id
+                        && Some(report.revision) == row.revision
+                        && row.confirmed_revision == row.revision
+                })
+                .map(|report| report.sample.clone());
+            peer.current_gateway_id = Some(row.gateway_id);
+        }
+        Ok(())
     }
 
     pub async fn update_device(&self, id: &str, mut input: DeviceUpdate) -> Result<Device> {
@@ -932,6 +1053,7 @@ impl Cluster {
         if !self.has_gateway(gateway) || !Self::ready(runtime, gateway) {
             return Err(unavailable());
         }
+        runtime.quality.remove(&peer.id);
         if let Some(old) = self.lease(&peer.vpn_ip).await? {
             let same = old.peer_id == peer.id
                 && old.public_key == peer.wg_public_key
@@ -1021,8 +1143,9 @@ impl Cluster {
         secret: Option<&str>,
         gateway: &str,
         revision: i64,
+        quality: Option<GatewayQualityReport>,
     ) -> Result<()> {
-        let _runtime = self.runtime.lock().await;
+        let mut runtime = self.runtime.lock().await;
         let peer = self.peer_by_key(user, key).await?;
         self.verify(&peer, secret, true).await?;
         let device = self.read_device(&peer).await?;
@@ -1035,6 +1158,7 @@ impl Cluster {
                     && lease.peer_id == peer.id
                     && lease.public_key == key
                     && lease.issued_until > now_ms()
+                    && lease.client_until > now_ms()
             },
         );
         if !owned
@@ -1043,8 +1167,26 @@ impl Cluster {
         {
             return Err(AppError::Conflict("网关归属或配置已变更".into()));
         }
-        sqlx::query("UPDATE cluster_devices SET confirmed_gateway_id=?,confirmed_revision=? WHERE peer_id=?")
-            .bind(gateway).bind(revision).bind(&peer.id).execute(&self.pool).await.map_err(db)?;
+        let confirmed = device.confirmed_gateway_id.as_deref() == Some(gateway)
+            && device.confirmed_revision == Some(revision);
+        if let Some(report) = quality {
+            if !confirmed {
+                return Err(AppError::Conflict("网关尚未确认握手".into()));
+            }
+            runtime.quality.insert(
+                peer.id,
+                GatewayQuality {
+                    gateway_id: gateway.to_owned(),
+                    public_key: peer.wg_public_key,
+                    revision,
+                    received: Instant::now(),
+                    sample: report.validate()?,
+                },
+            );
+        } else if !confirmed {
+            sqlx::query("UPDATE cluster_devices SET confirmed_gateway_id=?,confirmed_revision=? WHERE peer_id=?")
+                .bind(gateway).bind(revision).bind(&peer.id).execute(&self.pool).await.map_err(db)?;
+        }
         Ok(())
     }
 
@@ -1219,6 +1361,9 @@ impl Cluster {
                 runtime
                     .fences
                     .retain(|_, deadline| *deadline > Instant::now());
+                runtime
+                    .quality
+                    .retain(|_, report| report.received.elapsed() < QUALITY_TTL);
                 if let Err(error) = self.refresh_transit().await {
                     tracing::error!(%error, "集群互联路由同步失败");
                 }
@@ -1384,7 +1529,7 @@ mod tests {
         assert_eq!(issued.peers[0].vpn_ip, initial.vpn_ip);
         assert!(issued.peers[0].ttl_ms <= 10_000);
         cluster
-            .confirm("user", &a.wg_public_key, Some(SECRET_A), "edge", 2)
+            .confirm("user", &a.wg_public_key, Some(SECRET_A), "edge", 2, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1432,6 +1577,210 @@ mod tests {
             .unwrap();
         assert_eq!(returned.vpn_ip, initial.vpn_ip);
         assert!(cluster.local_owner(&peer).await.unwrap());
+    }
+
+    async fn listed_device(cluster: &Cluster, id: &str) -> AdminPeerView {
+        let mut page = cluster
+            .peer
+            .list_admin_peers(&vpn_api_types::peer::AdminPeerQuery {
+                page: None,
+                page_size: None,
+                search: None,
+                status: None,
+            })
+            .await
+            .unwrap();
+        cluster.fill_gateway_status(&mut page.items).await.unwrap();
+        page.items.into_iter().find(|peer| peer.id == id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_list_shows_only_fresh_quality_for_the_confirmed_current_gateway() {
+        let cluster = fixture().await;
+        let a = registration("Laptop", 7);
+        cluster.register("user", &a, Some(SECRET_A)).await.unwrap();
+        let peer = cluster.peer_by_key("user", &a.wg_public_key).await.unwrap();
+        cluster
+            .peer
+            .peer_repo
+            .touch_heartbeat_by_id(&peer.id, None, Some(72), Some(40.0), now_ms())
+            .await
+            .unwrap();
+
+        let online = listed_device(&cluster, &peer.id).await;
+        assert!(online.current_gateway_id.is_none());
+        assert_eq!(online.rtt_ms, Some(72));
+        assert_eq!(online.loss_pct, Some(40.0));
+        cluster
+            .confirm("user", &a.wg_public_key, Some(SECRET_A), BUILTIN, 1, None)
+            .await
+            .unwrap();
+        let connected = listed_device(&cluster, &peer.id).await;
+        assert_eq!(connected.current_gateway_id.as_deref(), Some(BUILTIN));
+        assert!(connected.gateway_quality.is_none());
+
+        cluster
+            .confirm(
+                "user",
+                &a.wg_public_key,
+                Some(SECRET_A),
+                BUILTIN,
+                1,
+                Some(GatewayQualityReport {
+                    rtt_ms: Some(23),
+                    loss_pct: 5.0,
+                }),
+            )
+            .await
+            .unwrap();
+        let measured = listed_device(&cluster, &peer.id)
+            .await
+            .gateway_quality
+            .unwrap();
+        assert_eq!(measured.rtt_ms, Some(23));
+        assert_eq!(measured.loss_pct, 5.0);
+        cluster
+            .runtime
+            .lock()
+            .await
+            .quality
+            .get_mut(&peer.id)
+            .unwrap()
+            .received = Instant::now() - QUALITY_TTL;
+        assert!(listed_device(&cluster, &peer.id)
+            .await
+            .gateway_quality
+            .is_none());
+
+        cluster
+            .confirm(
+                "user",
+                &a.wg_public_key,
+                Some(SECRET_A),
+                BUILTIN,
+                1,
+                Some(GatewayQualityReport {
+                    rtt_ms: Some(8),
+                    loss_pct: 0.0,
+                }),
+            )
+            .await
+            .unwrap();
+        ready(&cluster).await;
+        cluster
+            .update_device(
+                &peer.id,
+                DeviceUpdate {
+                    granted_gateway_ids: vec!["edge".into()],
+                    target_gateway_id: None,
+                    revision: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let revised = listed_device(&cluster, &peer.id).await;
+        assert_eq!(revised.current_gateway_id.as_deref(), Some(BUILTIN));
+        assert!(revised.gateway_quality.is_none());
+
+        cluster
+            .connect("user", &a.wg_public_key, Some(SECRET_A), "edge", 2, &[])
+            .await
+            .unwrap();
+        cluster.sync("edge", TOKEN, request(None)).await.unwrap();
+        assert!(listed_device(&cluster, &peer.id)
+            .await
+            .current_gateway_id
+            .is_none());
+        assert!(matches!(
+            cluster
+                .confirm(
+                    "user",
+                    &a.wg_public_key,
+                    Some(SECRET_A),
+                    BUILTIN,
+                    2,
+                    Some(GatewayQualityReport {
+                        rtt_ms: Some(1),
+                        loss_pct: 0.0,
+                    })
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let report = || GatewayQualityReport {
+            rtt_ms: None,
+            loss_pct: 100.0,
+        };
+        assert!(matches!(
+            cluster
+                .confirm(
+                    "user",
+                    &a.wg_public_key,
+                    Some(SECRET_A),
+                    "edge",
+                    2,
+                    Some(report())
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        cluster
+            .confirm("user", &a.wg_public_key, Some(SECRET_A), "edge", 2, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE cluster_remote_leases SET client_until=0 WHERE peer_id=?")
+            .bind(&peer.id)
+            .execute(&cluster.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cluster
+                .confirm(
+                    "user",
+                    &a.wg_public_key,
+                    Some(SECRET_A),
+                    "edge",
+                    2,
+                    Some(report())
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        cluster.heartbeat(&peer, Some(SECRET_A)).await.unwrap();
+        cluster
+            .confirm(
+                "user",
+                &a.wg_public_key,
+                Some(SECRET_A),
+                "edge",
+                2,
+                Some(GatewayQualityReport {
+                    rtt_ms: None,
+                    loss_pct: 100.0,
+                }),
+            )
+            .await
+            .unwrap();
+        let edge = listed_device(&cluster, &peer.id).await;
+        assert_eq!(edge.current_gateway_id.as_deref(), Some("edge"));
+        let quality = edge.gateway_quality.unwrap();
+        assert_eq!(quality.rtt_ms, None);
+        assert_eq!(quality.loss_pct, 100.0);
+
+        cluster
+            .update_device(
+                &peer.id,
+                DeviceUpdate {
+                    granted_gateway_ids: vec![],
+                    target_gateway_id: None,
+                    revision: 2,
+                },
+            )
+            .await
+            .unwrap();
+        let revoked = listed_device(&cluster, &peer.id).await;
+        assert!(revoked.current_gateway_id.is_none());
+        assert!(revoked.gateway_quality.is_none());
     }
 
     #[tokio::test]

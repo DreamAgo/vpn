@@ -128,8 +128,10 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
         post("/cluster/connect", choice.addTo(peerBody())
             .put("client_version", BuildConfig.VERSION_NAME)
             .put("capabilities", org.json.JSONArray().put("obfs-v1")))
-    @Synchronized internal fun confirmGateway(choice: GatewayChoice) {
-        post("/cluster/confirm", choice.addTo(peerBody()))
+    @Synchronized internal fun confirmGateway(choice: GatewayChoice, quality: GatewayQualityStats? = null) {
+        val body = choice.addTo(peerBody())
+        if (quality != null) body.put("quality", quality.toJson())
+        post("/cluster/confirm", body)
     }
     @Synchronized private fun post(path: String, body: JSONObject, auth: Boolean = true): JSONObject {
         try { return once(path, body, auth) }
