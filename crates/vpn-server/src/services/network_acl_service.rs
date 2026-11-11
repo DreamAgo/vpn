@@ -39,6 +39,11 @@ impl NetworkAclService {
         })
     }
 
+    pub fn with_interfaces(mut self, interfaces: &[String]) -> Result<Self> {
+        self.controller = self.controller.with_interfaces(interfaces)?;
+        Ok(self)
+    }
+
     /// kernel 后端启动必须先成功建立 fail-closed 快照，再对外提供服务。
     pub async fn start(&self) -> Result<()> {
         self.controller.verify_available().await?;

@@ -10,7 +10,7 @@ use crate::services::client_update_service::ClientUpdateService;
 use axum::Extension;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -40,11 +40,12 @@ fn success<T: serde::Serialize>(state: &AppState, data: T) -> Json<ApiResponse<T
 }
 
 /// Story 4.5：POST /api/v1/peers/register
-#[tracing::instrument(skip(state, body, current, updates))]
+#[tracing::instrument(skip(state, body, current, updates, headers))]
 pub async fn register(
     State(state): State<AppState>,
     current: CurrentUser,
     Extension(updates): Extension<Arc<ClientUpdateService>>,
+    headers: HeaderMap,
     Json(body): Json<PeerRegisterRequest>,
 ) -> Result<Json<ApiResponse<PeerRegisterResponse>>, ApiError> {
     updates
@@ -52,17 +53,28 @@ pub async fn register(
         .await
         .map_err(vpn_core::AppError::NoAccessReason)?;
     let svc = state.peer_service()?;
-    let resp = svc.register(&current.user_id, &body).await?;
+    let resp = if let Some(cluster) = &state.cluster {
+        cluster
+            .register(
+                &current.user_id,
+                &body,
+                super::cluster::device_key(&headers),
+            )
+            .await?
+    } else {
+        svc.register(&current.user_id, &body).await?
+    };
     state.refresh_network_acl().await?;
     Ok(success(&state, resp))
 }
 
 /// Story 4.6：POST /api/v1/peers/heartbeat
-#[tracing::instrument(skip(state, body, current, updates))]
+#[tracing::instrument(skip(state, body, current, updates, headers))]
 pub async fn heartbeat(
     State(state): State<AppState>,
     current: CurrentUser,
     Extension(updates): Extension<Arc<ClientUpdateService>>,
+    headers: HeaderMap,
     Json(body): Json<PeerHeartbeatRequest>,
 ) -> Result<Json<ApiResponse<PeerHeartbeatResponse>>, ApiError> {
     let svc = state.peer_service()?;
@@ -81,6 +93,11 @@ pub async fn heartbeat(
                 .enforce_client_version(peer.client_version.as_deref())
                 .await
                 .map_err(vpn_core::AppError::NoAccessReason)?;
+        }
+        if let Some(cluster) = &state.cluster {
+            cluster
+                .heartbeat(&peer, super::cluster::device_key(&headers))
+                .await?;
         }
     }
     // Story 5.5：若该 peer 已被 admin 强制下线，心跳被拒（TokenExpired → 401，提示重新登录）。
@@ -243,6 +260,7 @@ mod version_policy_tests {
                 role: "user".into(),
             },
             Extension(policy),
+            HeaderMap::new(),
             Json(PeerRegisterRequest {
                 device_name: "old-client".into(),
                 wg_public_key: "invalid-key".into(),

@@ -32,4 +32,5 @@ export const auditActionLabels: Record<string, string> = {
   'group.create': '创建用户组', 'group.update': '更新用户组', 'group.delete': '删除用户组',
   'subnet.create': '创建子网', 'subnet.update': '更新子网', 'subnet.delete': '删除子网',
   'peer.routes.update': '更新节点路由', 'peer.purge': '清理节点', 'auth.rejected': '认证拒绝',
+  'cluster.default.update': '更新集群默认网关', 'cluster.device.update': '更新设备网关设置',
 };

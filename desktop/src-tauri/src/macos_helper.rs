@@ -420,6 +420,7 @@ async fn handle_request(request: HelperRequest, manager: Arc<VpnManager>) -> Hel
             server_url,
             refresh_token,
             device_name,
+            device_identity,
         } => {
             let Ok(_connect_guard) = CONNECT_GUARD.try_lock() else {
                 return HelperResponse::Error {
@@ -441,7 +442,12 @@ async fn handle_request(request: HelperRequest, manager: Arc<VpnManager>) -> Hel
             }
             match tokio::time::timeout(
                 SERVER_CONNECT_TIMEOUT,
-                manager.connect_with_credentials(server_url, refresh_token, device_name),
+                manager.connect_with_credentials(
+                    server_url,
+                    refresh_token,
+                    device_name,
+                    device_identity,
+                ),
             )
             .await
             {
@@ -720,12 +726,16 @@ pub async fn connect() -> Result<(), String> {
         .refresh_token()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "未登录:请先登录".to_string())?;
+    let device_identity = repo
+        .device_identity(&server_url)
+        .map_err(|error| error.to_string())?;
     ensure_ready().await?;
     response_result(
         request(&HelperRequest::Connect {
             server_url,
             refresh_token,
             device_name: default_device_name(),
+            device_identity: Some(device_identity),
         })
         .await?,
     )

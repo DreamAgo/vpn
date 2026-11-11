@@ -4,6 +4,9 @@
 
 pub mod app;
 pub mod auth;
+pub mod cluster;
+pub mod cluster_gateway;
+mod cluster_transit;
 pub mod config;
 pub mod dns_service;
 pub mod error;

@@ -82,21 +82,32 @@ class TunnelService : VpnService() {
     }
     override fun onRevoke() { shutdown(); super.onRevoke() }
     override fun onDestroy() { stopping.set(true); lifetime.stop(generation); api?.cancel(); closeIO(); worker?.interrupt(); if (worker == null) lifetime.finish(generation); super.onDestroy() }
+    private class GatewayMove : java.io.IOException("服务端已更新 VPN 网关")
+    private class GatewayUnavailable(val gateway: GatewayChoice, reason: String) : java.io.IOException(reason)
+
     private fun runConnection() {
         var delay = 1000L
+        val cluster = GatewayCluster { socket -> protect(socket) }
         try {
             while (!stopping.get()) {
                 try {
                     val physical = PhysicalNetwork.choose(cm) ?: throw java.io.IOException("等待网络")
                     val client = Api(Vault(this)).also { it.network = physical; api = it }
                     report("正在注册设备")
-                    val config = client.register()
+                    client.ensureDeviceIdentity()
+                    val connection = cluster.prepare(client, physical)
                     check(!stopping.get())
                     handshaken = false
-                    runTunnel(client, physical, config)
+                    runTunnel(client, physical, connection, cluster)
                     delay = 1000L
                 } catch (e: Exception) {
                     if (stopping.get()) break
+                    if (e is GatewayMove) {
+                        delay = 1000L
+                        report("正在切换 VPN 网关")
+                        continue
+                    }
+                    if (e is GatewayUnavailable) cluster.failed(e.gateway)
                     if (e is ApiError && e.stopsTunnel || e is IllegalArgumentException || e is IllegalStateException || e is org.json.JSONException) {
                         report("连接停止：${Diagnostics.error(e)}", "连接停止：${Diagnostics.logError(e)}"); break
                     }
@@ -116,19 +127,33 @@ class TunnelService : VpnService() {
     private fun localAddresses(network: Network): JSONArray = JSONArray().apply {
         cm.getLinkProperties(network)?.linkAddresses?.forEach { if (it.address is Inet4Address) put(it.address.hostAddress) }
     }
-    private fun runTunnel(client: Api, network: Network, initial: JSONObject) {
-        var config = initial
+    private fun runTunnel(client: Api, network: Network, connection: GatewayCluster.Connection, cluster: GatewayCluster) {
+        val config = connection.config
+        val currentGateway = AtomicReference(connection.gateway)
+        val confirmedRevision = AtomicReference<Long?>(null)
+        val dataPlaneReady = AtomicBoolean(false)
         var physicalAddresses = localAddresses(network)
         var plan = Native.request("plan", JSONObject().put("config", config).put("local", physicalAddresses))
         val endpoint = plan.getString("endpoint")
         val split = endpoint.lastIndexOf(':')
         val host = endpoint.substring(0, split)
-        val address = network.getAllByName(host).firstOrNull { it is Inet4Address } ?: throw IllegalArgumentException("首版需要 IPv4 VPN 服务端地址")
+        val address = try {
+            network.getAllByName(host).firstOrNull { it is Inet4Address }
+                ?: throw if (connection.gateway != null) UnknownHostException("未找到 IPv4 地址")
+                    else IllegalArgumentException("首版需要 IPv4 VPN 服务端地址")
+        } catch (e: UnknownHostException) {
+            throw connection.gateway?.let { GatewayUnavailable(it, "无法解析 VPN 网关地址") } ?: e
+        }
         val udp = DatagramSocket(null)
         socket = udp
         if (!protect(udp)) throw java.io.IOException("无法保护 VPN 外层 socket")
         network.bindSocket(udp)
-        udp.bind(InetSocketAddress(0)); udp.connect(address, endpoint.substring(split + 1).toInt()); udp.soTimeout = 1
+        udp.bind(InetSocketAddress(0))
+        try { udp.connect(address, endpoint.substring(split + 1).toInt()) }
+        catch (e: SocketException) {
+            throw connection.gateway?.let { GatewayUnavailable(it, "无法连接 VPN 网关 UDP 地址") } ?: e
+        }
+        udp.soTimeout = 1
         setUnderlyingNetworks(arrayOf(network))
         val handle = Native.request("create", JSONObject().put("config", config).put("private", client.saved().getString("private"))).getLong("id")
         val heartbeat = Executors.newSingleThreadExecutor()
@@ -141,10 +166,15 @@ class TunnelService : VpnService() {
             send(handle, 3, byteArrayOf(), udp)
             val buffer = ByteArray(65535)
             var lastNetworkCheck = 0L
-            var lastTimer = 0L; var lastStatus = 0L; var lastHeartbeat = SystemClock.elapsedRealtime()
+            var lastTimer = 0L; var lastStatus = 0L; var lastHeartbeat = 0L; var lastConfirmation = 0L
             val started = SystemClock.elapsedRealtime()
             val rateMeter = TrafficRateMeter(started)
             report("正在进行 WireGuard 握手")
+            fun refreshGateway(current: GatewayChoice): GatewayChoice {
+                val candidates = client.candidates() ?: return current
+                if (cluster.instructedSwitch(candidates, current)) throw GatewayMove()
+                return current.copy(revision = candidates.revision).also(currentGateway::set)
+            }
             while (!stopping.get()) {
                 failure.getAndSet(null)?.let { throw it }
                 val newConfig = update.getAndSet(null)
@@ -189,18 +219,45 @@ class TunnelService : VpnService() {
                     val stats = Native.request("stats", JSONObject().put("id", handle))
                     if (!stats.isNull("handshake_seconds")) {
                         handshaken = true
-                        if (stats.getLong("handshake_seconds") > 180) throw java.io.IOException("WireGuard 握手已失效")
+                        if (stats.getLong("handshake_seconds") > 180) {
+                            throw currentGateway.get()?.let { GatewayUnavailable(it, "WireGuard 握手已失效") }
+                                ?: java.io.IOException("WireGuard 握手已失效")
+                        }
+                        dataPlaneReady.set(true)
                         details = "VPN IP：${plan.getString("address")}\n连接时长：${(now - started) / 1000} 秒\n上传：${stats.getLong("tx_bytes")} B\n下载：${stats.getLong("rx_bytes")} B\nDNS：${plan.optString("dns", "系统默认")}\n路由：${plan.getJSONArray("routes")}\n最近握手：${stats.getLong("handshake_seconds")} 秒前"
                         val (up, down) = rateMeter.sample(now, stats.getLong("tx_bytes"), stats.getLong("rx_bytes"))
                         report("已连接 ${plan.getString("address")} · ↑ ${TrafficFormat.rate(up)} ↓ ${TrafficFormat.rate(down)}")
-                    } else if (now - started > 20000) throw java.io.IOException("WireGuard 握手超时")
+                    } else if (now - started > 20000) {
+                        throw currentGateway.get()?.let { GatewayUnavailable(it, "WireGuard 握手超时") }
+                            ?: java.io.IOException("WireGuard 握手超时")
+                    }
                     lastStatus = now
                 }
-                if (now - lastHeartbeat >= 30000 && heartbeatBusy.compareAndSet(false, true)) {
-                    lastHeartbeat = now
+                val heartbeatDue = now - lastHeartbeat >= 30000
+                val confirmationDue = dataPlaneReady.get() && currentGateway.get()?.revision?.let { it != confirmedRevision.get() } == true
+                    && now - lastConfirmation >= 5000
+                if ((heartbeatDue || confirmationDue) && heartbeatBusy.compareAndSet(false, true)) {
+                    if (heartbeatDue) lastHeartbeat = now
+                    if (confirmationDue) lastConfirmation = now
                     heartbeat.execute {
-                        try { update.set(client.heartbeat()) } catch (e: Exception) { failure.set(e) }
-                        finally { heartbeatBusy.set(false) }
+                        try {
+                            var current = currentGateway.get()
+                            if (heartbeatDue) {
+                                update.set(client.heartbeat())
+                                if (current != null) current = refreshGateway(current)
+                            }
+                            if (current != null && dataPlaneReady.get() && confirmedRevision.get() != current.revision) {
+                                try {
+                                    client.confirmGateway(current)
+                                    confirmedRevision.set(current.revision)
+                                } catch (_: GatewayPending) {
+                                    refreshGateway(current)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            if (connection.gateway == null || e is GatewayMove || e is ApiError && e.stopsTunnel) failure.set(e)
+                            else if (!stopping.get()) Diagnostics.event("网关管理请求失败：${Diagnostics.logError(e)}")
+                        } finally { heartbeatBusy.set(false) }
                     }
                 }
                 if (!traffic) Thread.sleep(15)

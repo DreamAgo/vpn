@@ -54,6 +54,9 @@ pub fn status_code(error: &AppError) -> StatusCode {
     if !error.is_client_error() {
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
+    if matches!(error, AppError::Conflict(_)) {
+        return StatusCode::CONFLICT;
+    }
     match error.code() {
         1001..=1099 => StatusCode::UNAUTHORIZED,
         2001..=2099 => StatusCode::FORBIDDEN,

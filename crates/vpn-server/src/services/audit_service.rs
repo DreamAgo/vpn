@@ -210,6 +210,10 @@ pub fn infer_action(method: &str, path: &str) -> String {
     // 归一化路径：去掉末尾斜杠，便于匹配。
     let p = path.trim_end_matches('/');
     match (m.as_str(), p) {
+        ("PUT", "/api/v1/admin/cluster/default") => "cluster.default.update".into(),
+        ("PUT", path) if path.starts_with("/api/v1/admin/cluster/devices/") => {
+            "cluster.device.update".into()
+        }
         ("PUT", "/api/v1/admin/network/settings") => "network.settings.update".into(),
         ("PUT", "/api/v1/admin/system/routes") => "network.routes.update".into(),
         ("PUT", "/api/v1/admin/integrations/settings") => "integration.settings.update".into(),

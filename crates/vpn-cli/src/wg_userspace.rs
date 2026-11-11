@@ -632,7 +632,7 @@ impl UserspaceTunnel {
                 .collect(),
             Err(error) => {
                 tracing::warn!(stage = "endpoint_resolution", result = "failed", elapsed_ms = endpoint_started.elapsed().as_millis(), error = %crate::error::redact_sensitive(&error.to_string()), "解析 VPN endpoint 失败");
-                return Err(CliError::Other(format!(
+                return Err(CliError::GatewayEndpoint(format!(
                     "解析服务端 endpoint 失败: {error}"
                 )));
             }
@@ -645,7 +645,7 @@ impl UserspaceTunnel {
                 reason = "no_addresses",
                 "VPN endpoint 未解析到地址"
             );
-            return Err(CliError::Other(format!(
+            return Err(CliError::GatewayEndpoint(format!(
                 "无法解析 endpoint: {server_endpoint}"
             )));
         }
@@ -709,7 +709,8 @@ impl UserspaceTunnel {
             "开始连接 VPN UDP endpoint"
         );
         let mut udp_connected: Option<(UdpSocket, SocketAddr)> = None;
-        let mut last_err: Option<String> = None;
+        let mut last_connect_error = None;
+        let mut last_bind_error = None;
         for addr in &server_addrs {
             let bind_addr = if addr.is_ipv6() {
                 "[::]:0"
@@ -722,17 +723,19 @@ impl UserspaceTunnel {
                         udp_connected = Some((sock, *addr));
                         break;
                     }
-                    Err(e) => last_err = Some(format!("{addr}: {e}")),
+                    Err(error) => last_connect_error = Some(format!("{addr}: {error}")),
                 },
-                Err(e) => last_err = Some(format!("bind {bind_addr}: {e}")),
+                Err(error) => last_bind_error = Some(format!("{bind_addr}: {error}")),
             }
         }
         let (udp, server_addr) = udp_connected.ok_or_else(|| {
-            tracing::warn!(stage = "udp_connect", result = "failed", elapsed_ms = udp_started.elapsed().as_millis(), attempts = server_addrs.len(), error = %crate::error::redact_sensitive(last_err.as_deref().unwrap_or_default()), "连接 VPN UDP endpoint 失败");
-            CliError::Other(format!(
-                "连接服务端 UDP 失败（已尝试全部解析地址）: {}",
-                last_err.unwrap_or_default()
-            ))
+            let error = if let Some(error) = last_connect_error {
+                CliError::GatewayEndpoint(format!("连接服务端 UDP 失败（已尝试全部解析地址）: {error}"))
+            } else {
+                CliError::Other(format!("无法创建本机 UDP socket: {}", last_bind_error.unwrap_or_default()))
+            };
+            tracing::warn!(stage = "udp_connect", result = "failed", elapsed_ms = udp_started.elapsed().as_millis(), attempts = server_addrs.len(), error = %error.safe_diagnostic(), "连接 VPN UDP endpoint 失败");
+            error
         })?;
         tracing::info!(
             stage = "udp_connect",

@@ -26,6 +26,7 @@ use vpn_api_types::system::NetworkSettings;
 use zeroize::Zeroizing;
 
 use crate::api::ApiClient;
+use crate::cluster::{self, GatewayChoice, GatewayReconnect, GatewayRetry};
 use crate::config::DaemonConfig;
 use crate::error::{CliError, CliResult};
 use crate::ipc::{ConnState, IpcRequest, IpcResponse, StatusResponse};
@@ -47,6 +48,7 @@ pub struct SharedState {
     inner: Arc<Mutex<StatusResponse>>,
     health: Arc<Mutex<(bool, bool)>>,
     changes: tokio::sync::watch::Sender<()>,
+    heartbeats: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for SharedState {
@@ -62,6 +64,7 @@ impl SharedState {
             inner: Arc::new(Mutex::new(StatusResponse::disconnected())),
             health: Arc::new(Mutex::new((false, false))),
             changes: tokio::sync::watch::channel(()).0,
+            heartbeats: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -120,6 +123,14 @@ impl SharedState {
                 self.notify_change(&before, &status);
             }
         }
+    }
+
+    pub(crate) fn subscribe_heartbeats(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.heartbeats.subscribe()
+    }
+
+    pub(crate) async fn channel_health(&self) -> (bool, bool) {
+        *self.health.lock().await
     }
 
     /// 设置已分配的 VPN IP。
@@ -212,6 +223,7 @@ pub enum ControlMsg {
     Connect,
     /// 请求断开连接。
     Disconnect,
+    GatewayReconnect(u64, GatewayReconnect),
 }
 
 /// 一次连接尝试的产出：握手 / 注册得到的隧道参数。
@@ -237,6 +249,7 @@ pub struct TunnelParams {
     pub network_settings: NetworkSettings,
     /// 服务端下发的可选 DNS 策略。
     pub dns: Option<vpn_api_types::peer::ClientDnsSettings>,
+    pub gateway: Option<GatewayChoice>,
 }
 
 /// 已验证并以可清零内存保存的客户端混淆配置。
@@ -332,6 +345,15 @@ pub async fn connect_once(
     keypair: &vpn_wireguard::WgKeypair,
     device_name: &str,
 ) -> CliResult<TunnelParams> {
+    connect_once_with_retry(api, keypair, device_name, &GatewayRetry::default()).await
+}
+
+pub async fn connect_once_with_retry(
+    api: &ApiClient,
+    keypair: &vpn_wireguard::WgKeypair,
+    device_name: &str,
+    retry: &GatewayRetry,
+) -> CliResult<TunnelParams> {
     let started = Instant::now();
     // 1) 确保有可用 access token：优先用 refresh。
     if api.access_token().is_none() {
@@ -368,12 +390,32 @@ pub async fn connect_once(
         result = "started",
         "发送节点注册请求"
     );
-    let resp = match api.register_peer(&req).await {
-        Ok(resp) => resp,
-        Err(error) => {
-            tracing::warn!(stage = "peer_register_request", result = "failed", elapsed_ms = register_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "节点注册请求失败");
-            return Err(error);
-        }
+    // An enrolled device can reconnect directly to a gateway without first
+    // moving its lease to the default gateway.
+    let mut candidates = api.cluster_candidates(&keypair.public_key).await?;
+    let registration = if candidates.is_none() {
+        let response = match cluster::enroll(api, &req).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(stage = "peer_register_request", result = "failed", elapsed_ms = register_started.elapsed().as_millis(), error = %error.safe_diagnostic(), "节点注册请求失败");
+                return Err(error);
+            }
+        };
+        candidates = api.cluster_candidates(&keypair.public_key).await?;
+        Some(response)
+    } else {
+        None
+    };
+
+    let (resp, gateway) = if let Some(candidates) = candidates {
+        let (response, gateway) =
+            cluster::acquire(api, &keypair.public_key, candidates, retry).await?;
+        (response, Some(gateway))
+    } else {
+        (
+            registration.ok_or_else(|| CliError::Decode("未收到网关配置".into()))?,
+            None,
+        )
     };
     tracing::info!(
         stage = "peer_register_request",
@@ -395,10 +437,14 @@ pub async fn connect_once(
     } else {
         "VPN_ENDPOINT_OVERRIDE"
     };
-    let server_endpoint = std::env::var(endpoint_override)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| advertised_endpoint.clone());
+    let server_endpoint = if gateway.as_ref().is_none_or(|gateway| gateway.id == "local") {
+        std::env::var(endpoint_override)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| advertised_endpoint.clone())
+    } else {
+        advertised_endpoint.clone()
+    };
     if server_endpoint != advertised_endpoint {
         tracing::info!(
             stage = "endpoint_select",
@@ -464,6 +510,7 @@ pub async fn connect_once(
         transport,
         network_settings,
         dns: resp.dns,
+        gateway,
     })
 }
 
@@ -627,7 +674,10 @@ pub async fn run_heartbeat(
                             ),
                             _ => {}
                         }
-                        if let Some(s) = &state { s.set_channel_health(false, true).await; }
+                        if let Some(s) = &state {
+                            s.set_channel_health(false, true).await;
+                            s.heartbeats.send_modify(|value| *value = value.wrapping_add(1));
+                        }
                         // HTTP 恢复不代表 WireGuard 握手恢复。
                         if failures > 0 {
                             failures = 0;
@@ -637,7 +687,7 @@ pub async fn run_heartbeat(
                     // 致命错误 → 交上层拆隧道、回登录，而非当瞬时错误无限重连、把死隧道挂着黑洞流量：
                     // - token+refresh 都失效（被管理员强制下线）；
                     // - 服务端已无此 peer（被管理员彻底删除）→ PeerNotFound。
-                    Err(e) if e.is_token_expired() || e.is_peer_gone() => {
+                    Err(e) if e.stops_tunnel() => {
                         tracing::error!(stage = "heartbeat", result = "fatal", elapsed_ms = started.elapsed().as_millis(), error = %e.safe_diagnostic(), "VPN 心跳遇到不可恢复错误");
                         return Err(e);
                     }
@@ -800,7 +850,9 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
         .await
         .map_err(|error| CliError::Cleanup(format!("启动时清理 DNS 失败：{error}")))?;
     let state = SharedState::new();
-    let api = Arc::new(ApiClient::new(&config.server_url)?);
+    let api = Arc::new(
+        ApiClient::new(&config.server_url)?.with_device_key(config.device_identity.device_key())?,
+    );
     if let Some(rt) = &config.refresh_token {
         api.set_refresh_token(rt.clone());
     } else {
@@ -833,7 +885,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
 
     // 主循环：响应控制消息。Connect → 注册 + 建内核隧道 + 启动心跳任务；
     // Disconnect → 停心跳 + 拆隧道。保证不 panic 且可被 Disconnect 优雅关停。
-    let keypair = vpn_wireguard::generate_keypair();
+    let keypair = config.device_identity.keypair()?;
     // 每条活跃连接持有一个心跳任务关停信号；重连/断开时替换或清空。
     let mut active_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
     // supervisor 持有转发与心跳任务；重连前必须等它完成路由清理。
@@ -843,11 +895,22 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
     // fail-closed。重启 daemon 是当前唯一安全的人工恢复边界。
     let mut cleanup_failure: Option<String> = None;
     let mut reconnect_tick = tokio::time::interval(Duration::from_secs(60));
+    let mut gateway_retry = GatewayRetry::default();
+    let mut monitor: Option<tokio::task::JoinHandle<()>> = None;
+    let mut monitor_generation = 0u64;
+    let mut cluster_retry = false;
+    let mut connect_backoff =
+        crate::reconnect::Backoff::new(crate::reconnect::BackoffPolicy::default());
+    let mut retry_at = tokio::time::Instant::now();
     'control: loop {
         let msg = tokio::select! {
             message = ctrl_rx.recv() => {
                 let Some(message) = message else { break };
                 message
+            }
+            _ = tokio::time::sleep_until(retry_at), if cluster_retry => {
+                cluster_retry = false;
+                ControlMsg::Connect
             }
             _ = reconnect_tick.tick(), if auto_connect => {
                 // A headless node may boot before its server is reachable.
@@ -858,6 +921,19 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                 }
                 ControlMsg::Connect
             }
+        };
+        let (msg, stop_before_connect) = match msg {
+            ControlMsg::GatewayReconnect(generation, reason) => {
+                if monitor.is_none() || generation != monitor_generation {
+                    continue 'control;
+                }
+                let failed = reason.failed_gateway().is_some();
+                if let Some(gateway) = reason.failed_gateway() {
+                    gateway_retry.record_failure(gateway);
+                }
+                (ControlMsg::Connect, failed)
+            }
+            other => (other, false),
         };
         match msg {
             ControlMsg::Connect => {
@@ -870,6 +946,22 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         .await;
                     continue 'control;
                 }
+                if stop_before_connect {
+                    if let Err(error) = stop_daemon_tasks(
+                        &mut active_stop_requested,
+                        &mut active_shutdown,
+                        &mut active_supervisor,
+                    )
+                    .await
+                    {
+                        if error.is_cleanup_failure() {
+                            cleanup_failure = Some(error.safe_diagnostic());
+                        }
+                        state.set_error(error.to_string(), now_unix()).await;
+                        continue 'control;
+                    }
+                }
+                let previous_healthy = state.snapshot().await.state == ConnState::Connected;
                 if active_supervisor
                     .as_ref()
                     .is_none_or(|task| task.is_finished())
@@ -881,50 +973,38 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         continue 'control;
                     }
                 }
-                state.set_state(ConnState::Connecting, now_unix()).await;
-                match connect_once(&api, &keypair, &config.device_name).await {
+                if !previous_healthy || stop_before_connect {
+                    state.set_state(ConnState::Connecting, now_unix()).await;
+                }
+                match connect_once_with_retry(&api, &keypair, &config.device_name, &gateway_retry)
+                    .await
+                {
                     Ok(params) => {
+                        cluster_retry = false;
+                        state.set_state(ConnState::Connecting, now_unix()).await;
+                        if let Some(task) = monitor.take() {
+                            task.abort();
+                        }
                         // 注册成功后再拆旧连接（先提交后拆）：避免一次冗余 Connect 叠加瞬时失败
                         // 把正在工作的隧道毁掉。先发关停信号，再**等待**旧转发任务退出（它会删自己
                         // 加的路由）——否则旧任务的 `route delete` 可能删掉下面新隧道刚加的同 CIDR
                         // 路由，导致重连黑洞；固定 TUN 名也可能因旧设备未释放而 EBUSY。
-                        if let Some(requested) = active_stop_requested.take() {
-                            requested.store(true, Ordering::Release);
-                        }
-                        if let Some(tx) = active_shutdown.take() {
-                            let _ = tx.send(true);
-                        }
-                        if let Some(mut old) = active_supervisor.take() {
-                            match tokio::time::timeout(Duration::from_secs(45), &mut old).await {
-                                Ok(Ok(Ok(()))) => {}
-                                Ok(Ok(Err(error))) => {
-                                    let diagnostic = error.safe_diagnostic();
-                                    cleanup_failure = Some(diagnostic.clone());
-                                    state
-                                        .set_error(
-                                            format!("旧 VPN 数据面清理失败: {diagnostic}"),
-                                            now_unix(),
-                                        )
-                                        .await;
-                                    continue 'control;
-                                }
-                                Ok(Err(error)) => {
-                                    let error = crate::error::redact_sensitive(&error.to_string());
-                                    cleanup_failure = Some(error.clone());
-                                    state
-                                        .set_error(format!("旧 VPN 任务异常: {error}"), now_unix())
-                                        .await;
-                                    continue 'control;
-                                }
-                                Err(_) => {
-                                    active_supervisor = Some(old);
-                                    state
-                                        .set_error("旧 VPN 任务停止超时，已阻止重连", now_unix())
-                                        .await;
-                                    continue 'control;
-                                }
+                        if let Err(error) = stop_daemon_tasks(
+                            &mut active_stop_requested,
+                            &mut active_shutdown,
+                            &mut active_supervisor,
+                        )
+                        .await
+                        {
+                            if error.is_cleanup_failure() {
+                                cleanup_failure = Some(error.safe_diagnostic());
                             }
+                            state.set_error(error.to_string(), now_unix()).await;
+                            continue 'control;
                         }
+                        // The old tunnel may have published one last health update during shutdown.
+                        // Reset both channels after it exits before the new gateway can be confirmed.
+                        state.set_state(ConnState::Connecting, now_unix()).await;
                         // 关停信号：隧道转发任务与心跳任务共用，Disconnect 一并停止。
                         let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
                         // 实时路由通道(P1.4):心跳→转发循环下发新 allowed_routes。
@@ -943,6 +1023,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                         .await
                         {
                             Ok(forward) => {
+                                connect_backoff.reset();
                                 state.set_vpn_ip(Some(params.vpn_ip.clone())).await;
                                 state.set_channel_health(false, false).await;
                                 // 启动心跳任务：每 30s 上报，daemon 在线即自动保活。
@@ -962,6 +1043,34 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                                     )
                                     .await
                                 });
+                                if let Some(gateway) = params.gateway.clone() {
+                                    let monitor_api = api.clone();
+                                    let monitor_state = state.clone();
+                                    let monitor_shutdown = sd_tx.subscribe();
+                                    let monitor_ctrl = ctrl_tx.clone();
+                                    let monitor_key = keypair.public_key.clone();
+                                    monitor_generation = monitor_generation.wrapping_add(1);
+                                    let generation = monitor_generation;
+                                    let retry = gateway_retry.clone();
+                                    monitor = Some(tokio::spawn(async move {
+                                        if let Some(reason) = cluster::monitor(
+                                            monitor_api,
+                                            monitor_key,
+                                            gateway,
+                                            monitor_state,
+                                            monitor_shutdown,
+                                            retry,
+                                        )
+                                        .await
+                                        {
+                                            let _ = monitor_ctrl
+                                                .send(ControlMsg::GatewayReconnect(
+                                                    generation, reason,
+                                                ))
+                                                .await;
+                                        }
+                                    }));
+                                }
                                 let stop_requested = Arc::new(AtomicBool::new(false));
                                 let supervisor = tokio::spawn(supervise_connection_tasks(
                                     forward,
@@ -976,48 +1085,49 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                                 tracing::info!(vpn_ip = %params.vpn_ip, iface = %config.interface, "已连接，心跳已启动");
                             }
                             Err(e) => {
+                                if let (Some(gateway), true) =
+                                    (&params.gateway, e.is_gateway_endpoint_error())
+                                {
+                                    gateway_retry.record_failure(gateway);
+                                    retry_at = tokio::time::Instant::now()
+                                        + connect_backoff.advance(rand::random());
+                                    cluster_retry = true;
+                                }
                                 // 建隧道失败：sd_tx 随作用域 drop（未 spawn 任务）。
                                 state.set_error(e.to_string(), now_unix()).await;
                             }
                         }
                     }
                     Err(e) => {
-                        state.set_error(e.to_string(), now_unix()).await;
+                        if !previous_healthy || stop_before_connect {
+                            state.set_error(e.to_string(), now_unix()).await;
+                        }
+                        if api.cluster_seen() && !e.stops_tunnel() {
+                            retry_at = tokio::time::Instant::now()
+                                + connect_backoff.advance(rand::random());
+                            cluster_retry = true;
+                        }
                     }
                 }
             }
+            ControlMsg::GatewayReconnect(..) => unreachable!(),
             ControlMsg::Disconnect => {
-                if let Some(requested) = active_stop_requested.take() {
-                    requested.store(true, Ordering::Release);
+                cluster_retry = false;
+                if let Some(task) = monitor.take() {
+                    task.abort();
                 }
-                if let Some(tx) = active_shutdown.take() {
-                    let _ = tx.send(true);
-                }
-                if let Some(mut old) = active_supervisor.take() {
-                    match tokio::time::timeout(Duration::from_secs(45), &mut old).await {
-                        Ok(Ok(Ok(()))) => {}
-                        Ok(Ok(Err(error))) => {
-                            let diagnostic = error.safe_diagnostic();
-                            cleanup_failure = Some(diagnostic.clone());
-                            state
-                                .set_error(format!("VPN 数据面清理失败: {diagnostic}"), now_unix())
-                                .await;
-                            continue 'control;
-                        }
-                        Ok(Err(error)) => {
-                            let error = crate::error::redact_sensitive(&error.to_string());
-                            cleanup_failure = Some(error.clone());
-                            state
-                                .set_error(format!("VPN 后台任务异常: {error}"), now_unix())
-                                .await;
-                            continue 'control;
-                        }
-                        Err(_) => {
-                            active_supervisor = Some(old);
-                            state.set_error("VPN 后台任务停止超时", now_unix()).await;
-                            continue 'control;
-                        }
+                if let Err(error) = stop_daemon_tasks(
+                    &mut active_stop_requested,
+                    &mut active_shutdown,
+                    &mut active_supervisor,
+                )
+                .await
+                {
+                    if error.is_cleanup_failure() {
+                        cleanup_failure = Some(error.safe_diagnostic());
                     }
+                    state.set_error(error.to_string(), now_unix()).await;
+                    continue 'control;
                 }
                 tear_down_tunnel(&config.interface).await;
                 state.set_state(ConnState::Disconnected, now_unix()).await;
@@ -1025,6 +1135,32 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+async fn stop_daemon_tasks(
+    requested: &mut Option<Arc<AtomicBool>>,
+    shutdown: &mut Option<tokio::sync::watch::Sender<bool>>,
+    supervisor: &mut Option<tokio::task::JoinHandle<CliResult<()>>>,
+) -> CliResult<()> {
+    if let Some(requested) = requested.take() {
+        requested.store(true, Ordering::Release);
+    }
+    if let Some(shutdown) = shutdown.take() {
+        let _ = shutdown.send(true);
+    }
+    let Some(mut old) = supervisor.take() else {
+        return Ok(());
+    };
+    match tokio::time::timeout(Duration::from_secs(45), &mut old).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(CliError::Cleanup(crate::error::redact_sensitive(
+            &error.to_string(),
+        ))),
+        Err(_) => {
+            *supervisor = Some(old);
+            Err(CliError::Other("旧 VPN 任务停止超时，已阻止重连".into()))
+        }
+    }
 }
 
 pub(crate) fn now_unix() -> i64 {
@@ -1183,6 +1319,8 @@ mod tests {
             vpn_ip: "10.8.0.5".into(),
             vpn_subnet: "10.8.0.0/24".into(),
             server_public_key: "spub".into(),
+            gateway: None,
+
             server_endpoint: "1.2.3.4:51820".into(),
             client_private_key: "priv".into(),
             allowed_routes: allowed,

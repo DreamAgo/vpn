@@ -39,6 +39,10 @@ pub fn build_router(state: AppState) -> Router {
     // 公开路由（无需认证）
     let public_routes = Router::new()
         .route("/health", get(handlers::health::health_handler))
+        .route(
+            "/api/v1/cluster/agents/{id}/sync",
+            post(handlers::cluster::sync),
+        )
         .route("/api/v1/openapi.json", get(handlers::openapi::openapi_json))
         .route(
             "/api/v1/auth/setup-status",
@@ -84,6 +88,24 @@ pub fn build_router(state: AppState) -> Router {
     let authed_routes = if state.auth_service.is_some() {
         Router::new()
             .route("/api/v1/auth/logout", post(handlers::auth::logout))
+            .route(
+                "/api/v1/cluster/candidates",
+                post(handlers::cluster::candidates),
+            )
+            .route("/api/v1/cluster/connect", post(handlers::cluster::connect))
+            .route("/api/v1/cluster/confirm", post(handlers::cluster::confirm))
+            .route(
+                "/api/v1/admin/cluster/gateways",
+                get(handlers::cluster::gateways),
+            )
+            .route(
+                "/api/v1/admin/cluster/default",
+                axum::routing::put(handlers::cluster::set_default),
+            )
+            .route(
+                "/api/v1/admin/cluster/devices/{id}",
+                get(handlers::cluster::device).put(handlers::cluster::update_device),
+            )
             .route(
                 "/api/v1/admin/client-updates",
                 get(handlers::client_updates::status).put(handlers::client_updates::configure),

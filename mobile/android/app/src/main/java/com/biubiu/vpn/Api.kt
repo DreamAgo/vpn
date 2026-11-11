@@ -3,7 +3,12 @@ package com.biubiu.vpn
 import android.net.Network
 import org.json.JSONObject
 import java.net.URL
+import java.io.IOException
+import java.security.SecureRandom
 import javax.net.ssl.HttpsURLConnection
+
+internal class GatewayPending : IOException("VPN 网关切换暂未就绪")
+private class GatewayListMissing : IOException("VPN 网关列表不可用")
 
 class ApiError(val code: Int, message: String) : Exception(message) {
     val fatal: Boolean get() = code in setOf(1002, 1004, 1007, 3002)
@@ -21,6 +26,30 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
     private fun save() { synchronized(commitLock) { check(!cancelled) { "操作已取消" }; vault.write(session) } }
     private fun clearSession() { synchronized(commitLock) { check(!cancelled) { "操作已取消" }; session = JSONObject(); vault.clear() } }
     @Synchronized fun saved(): JSONObject = JSONObject(session.toString())
+
+    private fun deviceIdentity(server: String, username: String, previous: JSONObject): JSONObject {
+        return synchronized(commitLock) {
+            check(!cancelled) { "操作已取消" }
+            vault.deviceIdentity(server, username) {
+                val keys = if (previous.optString("server") == server && previous.optString("username") == username && previous.has("private")) previous
+                    else Native.request("keys")
+                JSONObject().put("private", keys.getString("private")).put("public", keys.getString("public"))
+                    .put("deviceKey", keys.optString("deviceKey").ifBlank { ByteArray(32).also(SecureRandom()::nextBytes).toHex() })
+            }
+        }
+    }
+
+    private fun applyDeviceIdentity(identity: JSONObject) {
+        session.put("private", identity.getString("private")).put("public", identity.getString("public"))
+            .put("deviceKey", identity.getString("deviceKey"))
+    }
+
+    @Synchronized fun ensureDeviceIdentity() {
+        if (!session.has("deviceKey")) {
+            applyDeviceIdentity(deviceIdentity(session.getString("server"), session.getString("username"), session))
+            save()
+        }
+    }
     @Synchronized fun login(server: String, username: String, password: String): Boolean {
         val url = URL(server.trim().trimEnd('/'))
         require(url.protocol == "https" && url.host.isNotEmpty() && url.userInfo == null && url.query == null && url.ref == null && (url.path.isEmpty() || url.path == "/")) { "请输入 HTTPS 服务器地址（不含路径）" }
@@ -30,8 +59,8 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
             val data = post("/auth/login", JSONObject().put("username", username).put("password", password), false)
             session.put("access", data.getString("access_token")).put("refresh", data.getString("refresh_token"))
                 .put("mustChange", data.optBoolean("must_change_password"))
-            val keys = if (previous.optString("server") == session.getString("server") && previous.optString("username") == username && previous.has("private")) previous else Native.request("keys")
-            session.put("private", keys.getString("private")).put("public", keys.getString("public")).put("username", username)
+            applyDeviceIdentity(deviceIdentity(session.getString("server"), username, previous))
+            session.put("username", username)
             save()
             return session.getBoolean("mustChange")
         } catch (e: Exception) { session = previous; throw e }
@@ -46,11 +75,11 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
         try {
             val user = response.getString("username").also { require(it.isNotBlank()) }
             val login = response.getJSONObject("login")
-            val keys = if (previous.optString("server") == server && previous.optString("username") == user && previous.has("private")) previous else Native.request("keys")
+            val identity = deviceIdentity(server, user, previous)
             session = JSONObject().put("server", server).put("username", user)
                 .put("access", login.getString("access_token")).put("refresh", login.getString("refresh_token"))
                 .put("mustChange", login.optBoolean("must_change_password"))
-                .put("private", keys.getString("private")).put("public", keys.getString("public"))
+            applyDeviceIdentity(identity)
             save()
         } catch (e: Exception) { revokeFeishu(server, response); session = previous; throw e }
     }
@@ -90,7 +119,18 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
             .put("os_info", "Android ${android.os.Build.VERSION.RELEASE}").put("client_version", BuildConfig.VERSION_NAME)
             .put("capabilities", org.json.JSONArray().put("obfs-v1")))
     }
-    @Synchronized fun heartbeat(): JSONObject = post("/peers/heartbeat", JSONObject().put("wg_public_key", session.getString("public")))
+    @Synchronized fun heartbeat(): JSONObject = post("/peers/heartbeat", peerBody())
+    private fun peerBody() = JSONObject().put("wg_public_key", session.getString("public"))
+    @Synchronized internal fun candidates(): GatewayCandidates? = try {
+        GatewayCandidates.parse(post("/cluster/candidates", peerBody()))
+    } catch (_: GatewayListMissing) { null }
+    @Synchronized internal fun selectGateway(choice: GatewayChoice): JSONObject =
+        post("/cluster/connect", choice.addTo(peerBody())
+            .put("client_version", BuildConfig.VERSION_NAME)
+            .put("capabilities", org.json.JSONArray().put("obfs-v1")))
+    @Synchronized internal fun confirmGateway(choice: GatewayChoice) {
+        post("/cluster/confirm", choice.addTo(peerBody()))
+    }
     @Synchronized private fun post(path: String, body: JSONObject, auth: Boolean = true): JSONObject {
         try { return once(path, body, auth) }
         catch (e: ApiError) {
@@ -128,9 +168,17 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
             conn.connectTimeout = 10000; conn.readTimeout = 10000
             conn.requestMethod = method; conn.doOutput = method != "GET"
             conn.setRequestProperty("Content-Type", "application/json")
-            if (auth) conn.setRequestProperty("Authorization", "Bearer " + session.getString("access"))
+            if (auth) {
+                conn.setRequestProperty("Authorization", "Bearer " + session.getString("access"))
+                if (path.startsWith("/cluster/") || path == "/peers/register" || path == "/peers/heartbeat") {
+                    session.optString("deviceKey").takeIf { it.isNotBlank() }?.let { conn.setRequestProperty("X-Vpn-Device-Key", it) }
+                }
+            }
             if (method != "GET") conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val status = conn.responseCode
+            val legacySpa = status in 200..299 && conn.contentType?.substringBefore(';')?.trim().equals("text/html", ignoreCase = true)
+            if (path == "/cluster/candidates" && (status == 404 || legacySpa)) throw GatewayListMissing()
+            if (status == 409 && (path == "/cluster/connect" || path == "/cluster/confirm")) throw GatewayPending()
             if (status in 300..399) throw java.io.IOException("服务器重定向被拒绝")
             val stream = if (status >= 400) conn.errorStream else conn.inputStream
             val text = stream?.use { stream ->
@@ -143,6 +191,7 @@ class Api(private val vault: CredentialStore, private val exchange: ((String, JS
             }
             ensureResponseActive(path, result)
             val code = result.getInt("code")
+            if (status == 409 && path == "/peers/register" && code == 6001) throw GatewayPending()
             if (code != 0) throw ApiError(code, result.optString("message", "请求失败 ($code)"))
             if (status !in 200..299) throw java.io.IOException("HTTP $status")
             return result.optJSONObject("data") ?: JSONObject()

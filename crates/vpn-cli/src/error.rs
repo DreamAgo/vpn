@@ -15,6 +15,16 @@ pub enum CliError {
     #[error("网络请求失败: {0}")]
     Http(String),
 
+    /// 切换正在等待旧租约释放或新网关准备。
+    #[error("VPN 网关切换暂未就绪")]
+    GatewayPending,
+    #[error("VPN 网关列表不可用")]
+    ClusterNotFound,
+
+    /// A selected gateway's address cannot be resolved or reached.
+    #[error("{0}")]
+    GatewayEndpoint(String),
+
     /// 服务端返回业务错误（非 0 code）。
     #[error("服务端错误 [code={code}]: {message}")]
     Api {
@@ -78,6 +88,26 @@ impl CliError {
         )
     }
 
+    pub fn is_gateway_endpoint_error(&self) -> bool {
+        matches!(self, Self::GatewayEndpoint(_))
+    }
+
+    pub fn stops_tunnel(&self) -> bool {
+        use vpn_api_types::error_codes as codes;
+        matches!(
+            self,
+            Self::NotLoggedIn
+                | Self::Api {
+                    code: codes::TOKEN_EXPIRED
+                        | codes::ACCOUNT_DISABLED
+                        | codes::MISSING_AUTH
+                        | codes::MUST_CHANGE_PASSWORD
+                        | codes::PEER_NOT_FOUND,
+                    ..
+                }
+        )
+    }
+
     /// 是否需要上层 fail-closed，阻止新隧道覆盖可能残留的路由。
     pub fn is_cleanup_failure(&self) -> bool {
         matches!(self, CliError::Cleanup(_))
@@ -102,6 +132,8 @@ pub fn redact_sensitive(value: &str) -> String {
         "authorization",
         "bearer",
         "private_key",
+        "device_key",
+        "x-vpn-device-key",
         "private key",
         "refresh_token",
         "access_token",

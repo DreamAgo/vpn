@@ -27,6 +27,7 @@ pub struct AclLease {
 #[derive(Debug, Clone)]
 pub struct NftAclController {
     iface: String,
+    extra_interfaces: Vec<String>,
     vpn_subnet: Ipv4Net,
 }
 
@@ -40,7 +41,31 @@ impl NftAclController {
         {
             return Err(AppError::Config("WireGuard 接口名不能用于 nft ACL".into()));
         }
-        Ok(Self { iface, vpn_subnet })
+        Ok(Self {
+            iface,
+            extra_interfaces: Vec::new(),
+            vpn_subnet,
+        })
+    }
+
+    pub fn with_interfaces(mut self, interfaces: &[String]) -> Result<Self> {
+        for iface in interfaces {
+            Self::new(iface, self.vpn_subnet)?;
+        }
+        self.extra_interfaces = interfaces.to_vec();
+        Ok(self)
+    }
+
+    fn match_interfaces(&self) -> String {
+        if self.extra_interfaces.is_empty() {
+            return format!("\"{}\"", self.iface);
+        }
+        let names = std::iter::once(&self.iface)
+            .chain(&self.extra_interfaces)
+            .map(|iface| format!("\"{iface}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ {names} }}")
     }
 
     /// 生产 kernel 后端启动前探测 nft。任何失败都直接返回，禁止软降级。
@@ -104,7 +129,9 @@ impl NftAclController {
             .await
             .map_err(|error| AppError::WireGuard(format!("探测 nft ACL table 失败: {error}")))?
             .success();
-        let batch = render_nft_batch(&self.iface, self.vpn_subnet, leases, site_sources, exists);
+        let interfaces = self.match_interfaces();
+        let batch =
+            render_nft_for_interfaces(&interfaces, self.vpn_subnet, leases, site_sources, exists);
         run_nft_batch(&batch, true).await?;
         // `nft --check` 也会消耗租约时间；实际事务必须使用扣减后的 timeout，不能
         // 让校验时延把授权推过数据库中的独占 expires_at。
@@ -120,8 +147,8 @@ impl NftAclController {
                 })
             })
             .collect::<Vec<_>>();
-        let batch = render_nft_batch(
-            &self.iface,
+        let batch = render_nft_for_interfaces(
+            &interfaces,
             self.vpn_subnet,
             &adjusted,
             site_sources,
@@ -173,6 +200,22 @@ pub fn render_nft_batch(
     site_sources: &[Ipv4Net],
     table_exists: bool,
 ) -> String {
+    render_nft_for_interfaces(
+        &format!("\"{iface}\""),
+        vpn_subnet,
+        leases,
+        site_sources,
+        table_exists,
+    )
+}
+
+fn render_nft_for_interfaces(
+    interfaces: &str,
+    vpn_subnet: Ipv4Net,
+    leases: &[AclLease],
+    site_sources: &[Ipv4Net],
+    table_exists: bool,
+) -> String {
     let mut script = String::new();
     if table_exists {
         // delete + recreate 位于同一 nft transaction，不产生中间放行窗口，也不依赖
@@ -185,14 +228,14 @@ pub fn render_nft_batch(
     ));
     // VPN 内基础通信始终允许。该规则不允许访问任意业务网段。
     script.push_str(&format!(
-        "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname \"{iface}\" ip daddr {vpn_subnet} accept\n"
+        "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname {interfaces} ip daddr {vpn_subnet} accept\n"
     ));
 
     let mut sites = BTreeSet::new();
     sites.extend(site_sources.iter().copied());
     for source in sites {
         script.push_str(&format!(
-            "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname \"{iface}\" ip saddr {source} ip daddr {vpn_subnet} accept\n"
+            "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname {interfaces} ip saddr {source} ip daddr {vpn_subnet} accept\n"
         ));
     }
 
@@ -221,11 +264,11 @@ pub fn render_nft_batch(
             "add element {TABLE_FAMILY} {TABLE_NAME} {set_name} {{ {elements} }}\n"
         ));
         script.push_str(&format!(
-            "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname \"{iface}\" ip saddr @{set_name} ip daddr {destination} accept\n"
+            "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname {interfaces} ip saddr @{set_name} ip daddr {destination} accept\n"
         ));
     }
     script.push_str(&format!(
-        "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname \"{iface}\" counter drop\n"
+        "add rule {TABLE_FAMILY} {TABLE_NAME} forward iifname {interfaces} counter drop\n"
     ));
     script
 }

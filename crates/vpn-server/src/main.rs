@@ -37,6 +37,9 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let runtime = tokio::runtime::Runtime::new()?;
+    if std::env::var("VPN_GATEWAY_MODE").as_deref() == Ok("agent") {
+        return runtime.block_on(vpn_server::cluster_gateway::run_from_env());
+    }
     let (restart_tx, restart_rx) = tokio::sync::watch::channel(false);
     runtime.block_on(run(restart_tx, restart_rx.clone()))?;
     // 先销毁运行时，释放监听端口、数据库连接和所有后台任务，再替换进程。
@@ -110,11 +113,43 @@ async fn run(
         .context("初始化网络参数失败")?,
     );
     let applied_network = network_settings_service.applied().clone();
+    let cluster_config = vpn_server::cluster::ClusterConfig::from_env()?;
+    let transit_interfaces: Vec<_> = cluster_config
+        .iter()
+        .flat_map(|config| {
+            config
+                .gateways
+                .values()
+                .map(|gateway| gateway.transit_interface.clone())
+        })
+        .collect();
+    if cluster_config.is_some() && applied_network.vpn.wg_backend != "kernel" {
+        anyhow::bail!("VPN 集群控制面要求 wg_backend=kernel");
+    }
     let subnet: ipnet::Ipv4Net = applied_network
         .vpn
         .vpn_subnet
         .parse()
         .with_context(|| format!("vpn_subnet 非法 CIDR：{}", applied_network.vpn.vpn_subnet))?;
+    if cluster_config.is_some() {
+        let addr: std::net::SocketAddr = config.bind_addr.parse()?;
+        anyhow::ensure!(
+            addr.ip().is_loopback(),
+            "集群控制面 HTTP 必须绑定回环地址，请通过 HTTPS 反向代理提供 API"
+        );
+        let forwarding = tokio::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").await?;
+        anyhow::ensure!(
+            forwarding.trim() == "1",
+            "集群控制面必须启用 net.ipv4.ip_forward"
+        );
+        PeerService::validate_cluster_routes(&peer_repo).await?;
+    }
+    vpn_server::cluster::ClusterConfig::reconcile_topology(
+        cluster_config.as_ref(),
+        &pool,
+        &applied_network.vpn.wg_interface,
+    )
+    .await?;
     let obfs = config
         .obfs_config(&applied_network.obfs)
         .context("装配 UDP 混淆配置失败")?;
@@ -197,10 +232,11 @@ async fn run(
 
     // Epic 4：装配 PeerService（load-or-generate 服务端 WG 密钥 + IpPool 回填 + Noop control）
     const APPROVAL_ACL_MARKER: &str = "feishu_approval_acl_installed";
-    if config.feishu_approval.enabled() {
+    if config.feishu_approval.enabled() || cluster_config.is_some() {
         // WireGuard 接口恢复已有 peer 前先安装最小 drop ACL，关闭重启期间的数据面窗口。
         let bootstrap_acl =
-            vpn_wireguard::NftAclController::new(&applied_network.vpn.wg_interface, subnet)?;
+            vpn_wireguard::NftAclController::new(&applied_network.vpn.wg_interface, subnet)?
+                .with_interfaces(&transit_interfaces)?;
         bootstrap_acl.verify_available().await?;
         // 先持久化清理义务，再触碰内核状态；即使后续安装或启动失败，下次关闭功能
         // 也不会把可能残留的 final-drop 误判为“无需清理”。
@@ -224,6 +260,15 @@ async fn run(
             .context("清理已停用的审批 nftables ACL 失败")?;
         config_repo.set(APPROVAL_ACL_MARKER, "0").await?;
     }
+    let prepared_transit = if let Some(cluster) = &cluster_config {
+        Some(
+            cluster
+                .prepare_transit(&applied_network.vpn.wg_interface, subnet)
+                .await?,
+        )
+    } else {
+        None
+    };
     let peer_service = Arc::new(
         build_peer_service_with_backend(
             peer_repo,
@@ -240,6 +285,7 @@ async fn run(
         )
         .await
         .context("装配 PeerService 失败")?
+        .with_cluster_routes(cluster_config.is_some())
         .with_obfs_transport(obfs.as_ref())
         .with_network_settings(network_settings_service.shared_settings())
         .with_dns_settings(network_settings_service.shared_dns_settings())
@@ -266,18 +312,43 @@ async fn run(
         network_settings_service.shared_dns_settings(),
     )?;
     tracing::info!(gateway = %dns_server.gateway(), "VPN DNS 仅绑定隧道网关地址");
-    let network_acl_service = if config.feishu_approval.enabled() {
-        let service = Arc::new(NetworkAclService::new(
-            pool.clone(),
-            peer_service.clone(),
-            &applied_network.vpn.wg_interface,
-            subnet,
-        )?);
+    let network_acl_service = if config.feishu_approval.enabled() || cluster_config.is_some() {
+        let service = Arc::new(
+            NetworkAclService::new(
+                pool.clone(),
+                peer_service.clone(),
+                &applied_network.vpn.wg_interface,
+                subnet,
+            )?
+            .with_interfaces(&transit_interfaces)?,
+        );
         service
             .start()
             .await
             .context("初始化 nftables 强制 ACL 失败（拒绝启动）")?;
         service.clone().spawn();
+        Some(service)
+    } else {
+        None
+    };
+    let cluster = if let (Some(cluster_config), Some(transit)) = (cluster_config, prepared_transit)
+    {
+        let socket = tokio::net::UdpSocket::bind(cluster_config.probe_bind)
+            .await
+            .context("绑定内置网关 UDP 探测端口失败")?;
+        let service = vpn_server::cluster::Cluster::start(
+            pool.clone(),
+            peer_service.clone(),
+            cluster_config,
+            transit,
+        )
+        .await?;
+        service.clone().spawn();
+        tokio::spawn(async move {
+            if let Err(error) = vpn_server::cluster_gateway::run_probe(socket, None).await {
+                tracing::error!(%error, "内置网关 UDP 探测退出");
+            }
+        });
         Some(service)
     } else {
         None
@@ -360,6 +431,7 @@ async fn run(
         .with_domain_event_service(domain_event_service)
         .with_notification_service(notification_service)
         .with_db_pool(pool.clone());
+    state.cluster = cluster;
     if let Some(service) = network_acl_service {
         state = state.with_network_acl_service(service);
     }

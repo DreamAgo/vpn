@@ -5,6 +5,13 @@
 //! 主路径 keyring，失败时降级到加密文件。
 
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use vpn_wireguard::{generate_keypair, public_key_from_private, WgKeypair};
+use zeroize::Zeroizing;
 
 use vpn_platform::{CredentialStore, FileCredentialStore, KeyringCredentialStore};
 
@@ -28,6 +35,7 @@ pub struct DaemonConfig {
     pub server_url: String,
     /// 已保存的 refresh token（缺失则无法启动）。
     pub refresh_token: Option<String>,
+    pub device_identity: DeviceIdentity,
     /// 设备名（register 上送）。
     pub device_name: String,
     /// IPC socket 路径。
@@ -35,6 +43,45 @@ pub struct DaemonConfig {
     /// 客户端 WireGuard 接口名（内核数据面用）。
     pub interface: String,
 }
+
+/// 同一服务器和登录账户在本机持有的稳定身份。仅经本地凭证存储和受保护 IPC 传递。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceIdentity {
+    private_key: Zeroizing<String>,
+    device_key: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for DeviceIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceIdentity([REDACTED])")
+    }
+}
+
+impl DeviceIdentity {
+    pub fn keypair(&self) -> CliResult<WgKeypair> {
+        let public_key = public_key_from_private(&self.private_key)
+            .map_err(|_| CliError::Invalid("本机 WireGuard 凭证无效".into()))?;
+        Ok(WgKeypair {
+            private_key: self.private_key.to_string(),
+            public_key,
+        })
+    }
+
+    pub fn device_key(&self) -> &str {
+        &self.device_key
+    }
+
+    pub fn generate() -> Self {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(bytes.as_mut());
+        Self {
+            private_key: Zeroizing::new(generate_keypair().private_key),
+            device_key: Zeroizing::new(bytes.iter().map(|byte| format!("{byte:02x}")).collect()),
+        }
+    }
+}
+
+static IDENTITY_WRITE: Mutex<()> = Mutex::new(());
 
 /// 凭证仓库：封装底层 [`CredentialStore`]，提供 server_url / refresh_token 读写。
 pub struct CredentialRepo {
@@ -90,6 +137,28 @@ impl CredentialRepo {
         Ok(self.store.load(KEY_USERNAME)?)
     }
 
+    pub fn device_identity(&self, server: &str) -> CliResult<DeviceIdentity> {
+        let _write = IDENTITY_WRITE
+            .lock()
+            .map_err(|_| CliError::Other("设备凭证存储状态异常".into()))?;
+        let url =
+            reqwest::Url::parse(server).map_err(|_| CliError::Invalid("服务器地址无效".into()))?;
+        let mut profile = Sha256::new();
+        profile.update(url.origin().ascii_serialization().as_bytes());
+        profile.update([0]);
+        profile.update(url.path().trim_end_matches('/').as_bytes());
+        profile.update([0]);
+        profile.update(self.username()?.unwrap_or_default().as_bytes());
+        let key = format!("device-identity-{:x}", profile.finalize());
+        if let Some(saved) = self.store.load(&key)? {
+            return Ok(serde_json::from_str(&Zeroizing::new(saved))?);
+        }
+        let identity = DeviceIdentity::generate();
+        self.store
+            .save(&key, &Zeroizing::new(serde_json::to_string(&identity)?))?;
+        Ok(identity)
+    }
+
     /// 清除所有凭证（logout）。
     pub fn clear(&self) -> CliResult<()> {
         self.store.delete(KEY_REFRESH_TOKEN)?;
@@ -111,6 +180,7 @@ impl CredentialRepo {
             return Err(CliError::NotLoggedIn);
         }
         Ok(DaemonConfig {
+            device_identity: self.device_identity(&server_url)?,
             server_url,
             refresh_token,
             device_name,
@@ -226,6 +296,30 @@ mod tests {
         assert_eq!(cfg.server_url, "https://s");
         assert_eq!(cfg.refresh_token, Some("rtk".to_string()));
         assert_eq!(cfg.device_name, "dev");
+    }
+
+    #[test]
+    fn device_identity_survives_session_changes_but_is_scoped_to_profile() {
+        let dir = tempdir().unwrap();
+        let server = "https://vpn.example.com";
+        let repo = file_repo(dir.path());
+        repo.save_login(server, "alice-first", Some("alice"))
+            .unwrap();
+        let first = repo.device_identity(server).unwrap();
+        assert_eq!(first.device_key().len(), 64);
+        assert_ne!(
+            first,
+            repo.device_identity("https://other.example.com").unwrap()
+        );
+        repo.clear().unwrap();
+        drop(repo);
+
+        let repo = file_repo(dir.path());
+        repo.save_login(server, "alice-next", Some("alice"))
+            .unwrap();
+        assert_eq!(first, repo.device_identity(&format!("{server}/")).unwrap());
+        repo.save_login(server, "bob", Some("bob")).unwrap();
+        assert_ne!(first, repo.device_identity(server).unwrap());
     }
 
     #[test]

@@ -80,6 +80,8 @@ pub enum HelperRequest {
         server_url: String,
         refresh_token: String,
         device_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_identity: Option<crate::config::DeviceIdentity>,
     },
     Disconnect,
     /// 原子禁止当前登录令牌再次连接并断开隧道。
@@ -437,6 +439,7 @@ mod tests {
             server_url: "https://vpn.example.com".to_string(),
             refresh_token: "refresh-secret".to_string(),
             device_name: "MacBook".to_string(),
+            device_identity: None,
         };
         let line = encode_helper_line(&request).unwrap();
         assert_eq!(decode_helper_request(&line).unwrap(), request);
@@ -460,6 +463,7 @@ mod tests {
             server_url: "https://vpn.example.com".to_string(),
             refresh_token: oversized,
             device_name: "MacBook".to_string(),
+            device_identity: None,
         })
         .is_err());
     }

@@ -93,6 +93,9 @@ pub enum AppError {
     // ===== 6xxx 请求/校验 =====
     #[error("{0}")]
     Validation(String),
+
+    #[error("{0}")]
+    Conflict(String),
 }
 
 impl AppError {
@@ -122,7 +125,7 @@ impl AppError {
             AppError::WireGuard(_) => error_codes::WIREGUARD_ERROR,
             AppError::Internal(_) => error_codes::INTERNAL_ERROR,
             AppError::Config(_) => error_codes::CONFIG_ERROR,
-            AppError::Validation(_) => error_codes::VALIDATION_ERROR,
+            AppError::Validation(_) | AppError::Conflict(_) => error_codes::VALIDATION_ERROR,
         }
     }
 
