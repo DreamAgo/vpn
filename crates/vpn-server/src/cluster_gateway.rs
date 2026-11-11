@@ -399,7 +399,7 @@ mod linux {
             );
             bytes.extend_from_slice(&chunk);
         }
-        Ok(serde_json::from_slice(&bytes).context("控制面返回了无效的网关快照")?)
+        serde_json::from_slice(&bytes).context("控制面返回了无效的网关快照")
     }
 
     struct Gateway {
