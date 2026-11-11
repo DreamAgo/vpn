@@ -928,9 +928,7 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                     continue 'control;
                 }
                 let failed = reason.failed_gateway().is_some();
-                if let Some(gateway) = reason.failed_gateway() {
-                    gateway_retry.record_failure(gateway);
-                }
+                gateway_retry.apply_reconnect(&reason);
                 (ControlMsg::Connect, failed)
             }
             other => (other, false),
@@ -976,7 +974,8 @@ pub async fn run(config: DaemonConfig) -> CliResult<()> {
                 if !previous_healthy || stop_before_connect {
                     state.set_state(ConnState::Connecting, now_unix()).await;
                 }
-                match connect_once_with_retry(&api, &keypair, &config.device_name, &gateway_retry)
+                let attempt_retry = gateway_retry.for_connect_attempt();
+                match connect_once_with_retry(&api, &keypair, &config.device_name, &attempt_retry)
                     .await
                 {
                     Ok(params) => {

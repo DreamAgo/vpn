@@ -286,9 +286,10 @@ impl VpnManager {
             result = "started",
             "开始刷新会话并注册 VPN 节点"
         );
+        let attempt_retry = retry.for_connect_attempt();
         let params = match tokio::time::timeout(
             CONNECT_TIMEOUT,
-            daemon::connect_once_with_retry(&api, keypair, device, retry),
+            daemon::connect_once_with_retry(&api, keypair, device, &attempt_retry),
         )
         .await
         {
@@ -524,8 +525,8 @@ impl VpnManager {
         loop {
             if let Some(task) = monitor.take() {
                 let Ok(Some(reason)) = task.await else { return };
-                if let Some(gateway) = reason.failed_gateway() {
-                    retry.record_failure(gateway);
+                retry.apply_reconnect(&reason);
+                if reason.failed_gateway().is_some() {
                     let _operation = self.operation.lock().await;
                     if self.ensure_generation(generation).is_err() {
                         return;

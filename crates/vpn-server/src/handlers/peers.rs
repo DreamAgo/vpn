@@ -186,7 +186,10 @@ pub async fn list_admin_peers(
     Query(query): Query<AdminPeerQuery>,
 ) -> Result<Json<ApiResponse<Page<AdminPeerView>>>, ApiError> {
     let svc = state.peer_service()?;
-    let page = svc.list_admin_peers(&query).await?;
+    let mut page = svc.list_admin_peers(&query).await?;
+    if let Some(cluster) = &state.cluster {
+        cluster.fill_gateway_status(&mut page.items).await?;
+    }
     Ok(success(&state, page))
 }
 

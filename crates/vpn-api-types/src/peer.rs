@@ -150,6 +150,15 @@ pub struct PeerDto {
     pub routed_subnets: Vec<String>,
 }
 
+/// 设备到当前集群网关的 UDP 探测结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayQualityView {
+    pub rtt_ms: Option<u64>,
+    pub loss_pct: f64,
+    /// 服务端收到该测量的时间（unix ms）。
+    pub reported_at: i64,
+}
+
 /// admin peer 列表项：节点信息 + 所属用户（Story 5.5）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminPeerView {
@@ -179,6 +188,11 @@ pub struct AdminPeerView {
     /// 客户端版本。
     #[serde(default)]
     pub client_version: Option<String>,
+    /// 已连接的集群网关，等待握手或离线时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_gateway_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_quality: Option<GatewayQualityView>,
 }
 
 /// 节点属性变更记录（OS / IP / Endpoint / 设备名 / 版本；节点健康监控）。

@@ -61,6 +61,23 @@ class ApiTest {
         assertEquals(9L, confirmation.getLong("revision"))
         assertFalse(confirmation.has("client_version"))
         assertFalse(confirmation.has("capabilities"))
+        assertFalse(confirmation.has("quality"))
+    }
+    @Test fun gatewayQualityReportsUseTheConfirmedGatewayRevisionAndNullableLatency() {
+        val requests = mutableListOf<JSONObject>()
+        val api = Api(MemoryStore()) { path, body, _ ->
+            assertEquals("/cluster/confirm", path)
+            requests.add(body)
+            ok()
+        }
+        val choice = GatewayChoice("east", 12)
+        api.confirmGateway(choice, GatewayQualityStats(0L, 10))
+        api.confirmGateway(choice, GatewayQualityStats(null, 100))
+        assertTrue(requests.all { it.getString("gateway_id") == choice.id && it.getLong("revision") == choice.revision })
+        assertEquals(0L, requests[0].getJSONObject("quality").getLong("rtt_ms"))
+        assertEquals(10, requests[0].getJSONObject("quality").getInt("loss_pct"))
+        assertTrue(requests[1].getJSONObject("quality").isNull("rtt_ms"))
+        assertEquals(100, requests[1].getJSONObject("quality").getInt("loss_pct"))
     }
     @Test fun expiredAccessRefreshesOnceAndRetriesWithNewToken() {
         val store = MemoryStore(); val calls = mutableListOf<String>()

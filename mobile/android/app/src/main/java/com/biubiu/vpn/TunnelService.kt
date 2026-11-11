@@ -12,8 +12,12 @@ import org.json.JSONObject
 import java.net.*
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.random.Random
 
 class TunnelService : VpnService() {
     companion object {
@@ -23,6 +27,13 @@ class TunnelService : VpnService() {
         val running: Boolean get() = lifetime.running()
         const val STOP = "com.biubiu.vpn.STOP"
         private const val GENERATION = "generation"
+        private const val QUALITY_SAMPLE_INTERVAL_MS = 2000L
+        private const val QUALITY_SAMPLE_BUDGET_MS = 1500L
+        private const val QUALITY_MAX_POLICY_AGE_MS = 45000L
+        private const val QUALITY_MAX_SAMPLE_AGE_MS = 5000L
+        private const val QUALITY_REPORT_INTERVAL_MS = 15000L
+        private const val QUALITY_SWITCH_COOLDOWN_MS = 60000L
+        private const val QUALITY_MAX_PROBE_WORKERS = 16
         fun requestStart(context: android.content.Context) {
             val token = lifetime.begin() ?: return
             try { context.startForegroundService(Intent(context, TunnelService::class.java).putExtra(GENERATION, token)) }
@@ -82,12 +93,28 @@ class TunnelService : VpnService() {
     }
     override fun onRevoke() { shutdown(); super.onRevoke() }
     override fun onDestroy() { stopping.set(true); lifetime.stop(generation); api?.cancel(); closeIO(); worker?.interrupt(); if (worker == null) lifetime.finish(generation); super.onDestroy() }
-    private class GatewayMove : java.io.IOException("服务端已更新 VPN 网关")
+    private class GatewayMove(val quality: QualityProposal? = null) :
+        java.io.IOException("VPN 网关选择已更新")
     private class GatewayUnavailable(val gateway: GatewayChoice, reason: String) : java.io.IOException(reason)
+    private data class QualityPolicy(val candidates: GatewayCandidates, val refreshedAt: Long)
+    private data class QualityProposal(
+        val move: GatewayQualityMove,
+        val network: Network,
+        val addresses: String,
+        val sampledAt: Long,
+    )
+    private data class QualityObservation(
+        val context: GatewayQualityContext,
+        val stats: GatewayQualityStats,
+        val addresses: String,
+        val sampledAt: Long,
+    )
 
     private fun runConnection() {
         var delay = 1000L
         val cluster = GatewayCluster { socket -> protect(socket) }
+        var qualityPreference: QualityProposal? = null
+        var qualityCooldownUntil = 0L
         try {
             while (!stopping.get()) {
                 try {
@@ -95,14 +122,22 @@ class TunnelService : VpnService() {
                     val client = Api(Vault(this)).also { it.network = physical; api = it }
                     report("正在注册设备")
                     client.ensureDeviceIdentity()
-                    val connection = cluster.prepare(client, physical)
+                    val preferred = qualityPreference?.takeIf {
+                        physical == it.network && localAddresses(physical).toString() == it.addresses
+                    }?.move
+                    qualityPreference = null
+                    val connection = cluster.prepare(client, physical, preferred)
                     check(!stopping.get())
                     handshaken = false
-                    runTunnel(client, physical, connection, cluster)
+                    runTunnel(client, physical, connection, cluster, qualityCooldownUntil)
                     delay = 1000L
                 } catch (e: Exception) {
                     if (stopping.get()) break
                     if (e is GatewayMove) {
+                        qualityPreference = e.quality
+                        if (e.quality != null) {
+                            qualityCooldownUntil = SystemClock.elapsedRealtime() + QUALITY_SWITCH_COOLDOWN_MS
+                        }
                         delay = 1000L
                         report("正在切换 VPN 网关")
                         continue
@@ -127,7 +162,13 @@ class TunnelService : VpnService() {
     private fun localAddresses(network: Network): JSONArray = JSONArray().apply {
         cm.getLinkProperties(network)?.linkAddresses?.forEach { if (it.address is Inet4Address) put(it.address.hostAddress) }
     }
-    private fun runTunnel(client: Api, network: Network, connection: GatewayCluster.Connection, cluster: GatewayCluster) {
+    private fun runTunnel(
+        client: Api,
+        network: Network,
+        connection: GatewayCluster.Connection,
+        cluster: GatewayCluster,
+        qualityCooldownUntil: Long,
+    ) {
         val config = connection.config
         val currentGateway = AtomicReference(connection.gateway)
         val confirmedRevision = AtomicReference<Long?>(null)
@@ -158,6 +199,17 @@ class TunnelService : VpnService() {
         val handle = Native.request("create", JSONObject().put("config", config).put("private", client.saved().getString("private"))).getLong("id")
         val heartbeat = Executors.newSingleThreadExecutor()
         val heartbeatBusy = AtomicBoolean(false)
+        val sampler = connection.gateway?.let { Executors.newSingleThreadExecutor() }
+        val probeWorkers = connection.gateway?.let {
+            ThreadPoolExecutor(1, QUALITY_MAX_PROBE_WORKERS, 10L, TimeUnit.SECONDS, LinkedBlockingQueue()).apply {
+                allowCoreThreadTimeOut(true)
+            }
+        }
+        val sampling = AtomicBoolean(false)
+        val quality = GatewayQuality()
+        val qualityPolicy = AtomicReference<QualityPolicy?>(null)
+        val qualityProposal = AtomicReference<QualityProposal?>(null)
+        val qualityObservation = AtomicReference<QualityObservation?>(null)
         val update = AtomicReference<JSONObject?>(null)
         val failure = AtomicReference<Exception?>(null)
         try {
@@ -168,12 +220,33 @@ class TunnelService : VpnService() {
             var lastNetworkCheck = 0L
             var lastTimer = 0L; var lastStatus = 0L; var lastHeartbeat = 0L; var lastConfirmation = 0L
             val started = SystemClock.elapsedRealtime()
+            var nextSample = started + Random.nextLong(QUALITY_SAMPLE_INTERVAL_MS)
+            var lastQualityReport = 0L
             val rateMeter = TrafficRateMeter(started)
             report("正在进行 WireGuard 握手")
+            fun clearQualityPolicy() {
+                qualityPolicy.set(null)
+                qualityProposal.set(null)
+                qualityObservation.set(null)
+            }
+            fun matchesPhysicalNetwork(addresses: String, sampledAt: Long): Boolean =
+                !stopping.get() && SystemClock.elapsedRealtime() - sampledAt <= QUALITY_MAX_SAMPLE_AGE_MS &&
+                    PhysicalNetwork.choose(cm, network) == network && localAddresses(network).toString() == addresses
+
             fun refreshGateway(current: GatewayChoice): GatewayChoice {
-                val candidates = client.candidates() ?: return current
+                val candidates = client.candidates()
+                if (candidates == null) {
+                    clearQualityPolicy()
+                    return current
+                }
                 if (cluster.instructedSwitch(candidates, current)) throw GatewayMove()
-                return current.copy(revision = candidates.revision).also(currentGateway::set)
+                return current.copy(revision = candidates.revision).also {
+                    currentGateway.set(it)
+                    qualityPolicy.set(QualityPolicy(candidates, SystemClock.elapsedRealtime()))
+                    val context = candidates.qualityContext(it)
+                    qualityProposal.updateAndGet { proposal -> proposal?.takeIf { pending -> pending.move.context == context } }
+                    qualityObservation.updateAndGet { observation -> observation?.takeIf { reading -> reading.context == context } }
+                }
             }
             while (!stopping.get()) {
                 failure.getAndSet(null)?.let { throw it }
@@ -233,18 +306,76 @@ class TunnelService : VpnService() {
                     }
                     lastStatus = now
                 }
+                if (sampler != null && probeWorkers != null && now >= nextSample &&
+                    sampling.compareAndSet(false, true)) {
+                    nextSample = now + QUALITY_SAMPLE_INTERVAL_MS
+                    val policy = qualityPolicy.get()
+                    val context = if (dataPlaneReady.get() &&
+                        policy != null && now - policy.refreshedAt <= QUALITY_MAX_POLICY_AGE_MS) {
+                        currentGateway.get()?.let { policy.candidates.qualityContext(it) }
+                    } else null
+                    val addresses = physicalAddresses.toString()
+                    sampler.execute {
+                        try {
+                            if (context == null) {
+                                quality.reset()
+                                qualityProposal.set(null)
+                                qualityObservation.set(null)
+                            } else {
+                                probeWorkers.corePoolSize = minOf(QUALITY_MAX_PROBE_WORKERS, context.gateways.size)
+                                val samples = cluster.sample(context.gateways, network, probeWorkers, 1, QUALITY_SAMPLE_BUDGET_MS)
+                                if (qualityPolicy.get()?.candidates?.qualityContext(context.current) != context) {
+                                    quality.reset()
+                                    qualityProposal.set(null)
+                                    qualityObservation.set(null)
+                                } else {
+                                    val reading = quality.record(context, addresses, now, samples) { !cluster.coolingDown(it) }
+                                    qualityObservation.set(reading?.let { QualityObservation(context, it.stats, addresses, now) })
+                                    val move = reading?.move
+                                    if (move != null && now >= qualityCooldownUntil) {
+                                        qualityProposal.set(QualityProposal(move, network, addresses, now))
+                                    }
+                                }
+                            }
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                        } catch (e: Exception) {
+                            quality.reset()
+                            qualityProposal.set(null)
+                            qualityObservation.set(null)
+                            if (!stopping.get()) Diagnostics.event("网关质量探测失败：${Diagnostics.logError(e)}")
+                        } finally {
+                            sampling.set(false)
+                        }
+                    }
+                }
                 val heartbeatDue = now - lastHeartbeat >= 30000
                 val confirmationDue = dataPlaneReady.get() && currentGateway.get()?.revision?.let { it != confirmedRevision.get() } == true
                     && now - lastConfirmation >= 5000
-                if ((heartbeatDue || confirmationDue) && heartbeatBusy.compareAndSet(false, true)) {
+                val qualityMoveDue = qualityProposal.get() != null
+                val qualityReportDue = qualityObservation.get() != null && now - lastQualityReport >= QUALITY_REPORT_INTERVAL_MS
+                if ((heartbeatDue || confirmationDue || qualityMoveDue || qualityReportDue) &&
+                    heartbeatBusy.compareAndSet(false, true)) {
                     if (heartbeatDue) lastHeartbeat = now
                     if (confirmationDue) lastConfirmation = now
+                    if (qualityReportDue) lastQualityReport = now
                     heartbeat.execute {
                         try {
                             var current = currentGateway.get()
                             if (heartbeatDue) {
                                 update.set(client.heartbeat())
                                 if (current != null) current = refreshGateway(current)
+                            }
+                            val proposal = if (qualityMoveDue) qualityProposal.getAndSet(null) else null
+                            if (proposal != null && current != null && current == proposal.move.from &&
+                                matchesPhysicalNetwork(proposal.addresses, proposal.sampledAt)) {
+                                if (!heartbeatDue) current = refreshGateway(current)
+                                val target = qualityPolicy.get()?.candidates?.preferredGateway(proposal.move)
+                                if (current == proposal.move.from && target != null && !cluster.coolingDown(target.id) &&
+                                    matchesPhysicalNetwork(proposal.addresses, proposal.sampledAt)) {
+                                    Diagnostics.event("VPN 网关持续丢包，切换至丢包率更低的网关 ${target.id}")
+                                    throw GatewayMove(proposal)
+                                }
                             }
                             if (current != null && dataPlaneReady.get() && confirmedRevision.get() != current.revision) {
                                 try {
@@ -253,8 +384,22 @@ class TunnelService : VpnService() {
                                 } catch (_: GatewayPending) {
                                     refreshGateway(current)
                                 }
+                            } else if (current != null && dataPlaneReady.get() && qualityReportDue) {
+                                val policy = qualityPolicy.get()
+                                val observation = qualityObservation.get()
+                                if (observation != null && policy != null &&
+                                    SystemClock.elapsedRealtime() - policy.refreshedAt <= QUALITY_MAX_POLICY_AGE_MS &&
+                                    policy.candidates.qualityContext(current) == observation.context &&
+                                    matchesPhysicalNetwork(observation.addresses, observation.sampledAt)) {
+                                    try {
+                                        client.confirmGateway(observation.context.current, observation.stats)
+                                    } catch (_: GatewayPending) {
+                                        refreshGateway(current)
+                                    }
+                                }
                             }
                         } catch (e: Exception) {
+                            clearQualityPolicy()
                             if (connection.gateway == null || e is GatewayMove || e is ApiError && e.stopsTunnel) failure.set(e)
                             else if (!stopping.get()) Diagnostics.event("网关管理请求失败：${Diagnostics.logError(e)}")
                         } finally { heartbeatBusy.set(false) }
@@ -263,7 +408,7 @@ class TunnelService : VpnService() {
                 if (!traffic) Thread.sleep(15)
             }
         } finally {
-            client.cancel(); heartbeat.shutdownNow(); closeIO()
+            client.cancel(); heartbeat.shutdownNow(); sampler?.shutdownNow(); probeWorkers?.shutdownNow(); closeIO()
             Native.request("destroy", JSONObject().put("id", handle))
         }
     }

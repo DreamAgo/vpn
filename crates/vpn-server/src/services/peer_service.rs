@@ -1298,6 +1298,8 @@ impl PeerService {
                 rtt_ms: r.rtt_ms,
                 loss_pct: r.loss_pct,
                 client_version: r.client_version,
+                current_gateway_id: None,
+                gateway_quality: None,
             })
             .collect();
         Ok(vpn_api_types::Page::new(items, total, page, page_size))

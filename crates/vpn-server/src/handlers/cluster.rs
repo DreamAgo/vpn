@@ -11,7 +11,10 @@ use vpn_core::AppError;
 
 use crate::{
     auth::{CurrentUser, RequireAdmin},
-    cluster::{Candidates, Cluster, Device, DeviceUpdate, Gateway, SyncRequest, SyncResponse},
+    cluster::{
+        Candidates, Cluster, Device, DeviceUpdate, Gateway, GatewayQualityReport, SyncRequest,
+        SyncResponse,
+    },
     error::ApiError,
     services::client_update_service::ClientUpdateService,
     state::AppState,
@@ -57,6 +60,13 @@ pub struct ConnectRequest {
     client_version: Option<String>,
     #[serde(default)]
     capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ConfirmRequest {
+    #[serde(flatten)]
+    selection: SelectRequest,
+    quality: Option<GatewayQualityReport>,
 }
 
 #[derive(Deserialize)]
@@ -122,15 +132,16 @@ pub async fn confirm(
     State(state): State<AppState>,
     current: CurrentUser,
     headers: HeaderMap,
-    Json(body): Json<SelectRequest>,
+    Json(body): Json<ConfirmRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     cluster(&state)?
         .confirm(
             &current.user_id,
-            &body.wg_public_key,
+            &body.selection.wg_public_key,
             device_key(&headers),
-            &body.gateway_id,
-            body.revision,
+            &body.selection.gateway_id,
+            body.selection.revision,
+            body.quality,
         )
         .await?;
     Ok(success(&state, ()))
