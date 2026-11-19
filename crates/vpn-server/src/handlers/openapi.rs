@@ -41,6 +41,18 @@ pub async fn openapi_json() -> Json<Value> {
                     "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
                 }
             },
+            "/api/v1/admin/traffic": {
+                "get": {
+                    "tags": ["System"],
+                    "summary": "管理员查看终端流量统计",
+                    "description": "客户端视角的上传、下载计数与速率。日期按北京时间汇总，历史从启用采集后开始。",
+                    "parameters": [{
+                        "name": "days", "in": "query",
+                        "schema": { "type": "integer", "enum": [1, 7, 30], "default": 1 }
+                    }],
+                    "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+                }
+            },
             "/api/v1/auth/setup-status": {
                 "get": {
                     "tags": ["Auth"],

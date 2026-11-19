@@ -345,6 +345,8 @@ pub struct SyncRequest {
     server_public_key: String,
     vpn_subnet: String,
     transport_fingerprint: Option<String>,
+    #[serde(default)]
+    traffic: Option<vpn_api_types::traffic::TrafficReport>,
 }
 
 #[derive(Serialize)]
@@ -427,6 +429,7 @@ struct Runtime {
 }
 
 pub struct Cluster {
+    traffic: Arc<crate::services::traffic_service::TrafficService>,
     pool: SqlitePool,
     peer: Arc<PeerService>,
     config: ClusterConfig,
@@ -488,6 +491,21 @@ fn routes(peer: &PeerRow) -> Vec<String> {
 }
 
 impl Cluster {
+    pub fn traffic_service(&self) -> Arc<crate::services::traffic_service::TrafficService> {
+        self.traffic.clone()
+    }
+
+    pub fn traffic_sources(&self) -> Vec<(String, String)> {
+        std::iter::once((BUILTIN.into(), "内置网关".into()))
+            .chain(
+                self.config
+                    .gateways
+                    .values()
+                    .map(|g| (g.id.clone(), g.name.clone())),
+            )
+            .collect()
+    }
+
     pub async fn start(
         pool: SqlitePool,
         peer: Arc<PeerService>,
@@ -518,6 +536,9 @@ impl Cluster {
             ..Runtime::default()
         };
         let cluster = Arc::new(Self {
+            traffic: Arc::new(crate::services::traffic_service::TrafficService::new(
+                pool.clone(),
+            )),
             pool,
             peer,
             config,
@@ -1254,6 +1275,8 @@ impl Cluster {
         self.refresh_transit().await?;
         let ttl_ms = (LEASE_MS as u64).saturating_sub(start.elapsed().as_millis() as u64);
         let agent = runtime.agents.entry(id.to_owned()).or_default();
+        let accept_traffic =
+            agent.issued_epoch.is_some() && input.applied_epoch == agent.issued_epoch;
         if agent.issued_epoch.is_some() && input.applied_epoch == agent.issued_epoch {
             agent.applied_at = Some(Instant::now());
         }
@@ -1269,6 +1292,30 @@ impl Cluster {
                 ttl_ms,
             })
             .collect();
+        drop(_route_guard);
+        drop(runtime);
+        if accept_traffic {
+            if let Some(report) = input.traffic {
+                // Telemetry must never delay lease delivery or hold routing locks.
+                let traffic = self.traffic.clone();
+                let gateway = id.to_owned();
+                let sampled_at = now_ms();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        traffic.record(&gateway, &report, sampled_at),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, %gateway, "远程网关流量报告处理失败")
+                        }
+                        Err(_) => tracing::warn!(%gateway, "远程网关流量报告处理超时"),
+                    }
+                });
+            }
+        }
         Ok(SyncResponse { epoch, peers })
     }
 
@@ -1441,6 +1488,7 @@ mod tests {
 
     fn request(applied_epoch: Option<String>) -> SyncRequest {
         SyncRequest {
+            traffic: None,
             applied_epoch,
             server_public_key: STANDARD.encode([42; 32]),
             vpn_subnet: "10.8.0.0/24".into(),

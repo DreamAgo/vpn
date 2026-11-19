@@ -18,3 +18,5 @@ pub mod users;
 
 pub mod client_updates;
 pub mod feishu_directory;
+
+pub mod traffic;

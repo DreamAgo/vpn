@@ -18,6 +18,7 @@ use crate::services::{
 pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub cluster: Option<Arc<crate::cluster::Cluster>>,
+    pub traffic: Option<Arc<crate::services::traffic_service::TrafficService>>,
     pub trusted_proxies: Vec<std::net::IpAddr>,
     pub restart_tx: Option<tokio::sync::watch::Sender<bool>>,
     pub auth_service: Option<Arc<AuthService>>,
@@ -46,6 +47,7 @@ impl AppState {
         Self {
             clock: Arc::new(SystemClock),
             cluster: None,
+            traffic: None,
             trusted_proxies: Vec::new(),
             restart_tx: None,
             auth_service: None,

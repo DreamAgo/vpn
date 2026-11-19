@@ -275,6 +275,7 @@ mod linux {
         server_public_key: &'a str,
         vpn_subnet: String,
         transport_fingerprint: Option<String>,
+        traffic: Option<vpn_api_types::traffic::TrafficReport>,
     }
 
     #[derive(Deserialize)]
@@ -370,12 +371,17 @@ mod linux {
         }
     }
 
-    async fn fetch_snapshot(config: &Config, applied_epoch: Option<&str>) -> Result<Snapshot> {
+    async fn fetch_snapshot(
+        config: &Config,
+        applied_epoch: Option<&str>,
+        traffic: Option<vpn_api_types::traffic::TrafficReport>,
+    ) -> Result<Snapshot> {
         let mut response = config
             .client
             .post(config.sync_url.clone())
             .bearer_auth(config.token.as_str())
             .json(&SyncRequest {
+                traffic,
                 applied_epoch,
                 server_public_key: &config.public_key,
                 vpn_subnet: config.subnet.to_string(),
@@ -413,6 +419,8 @@ mod linux {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut previous_error = None;
+            let generation = uuid::Uuid::new_v4().to_string();
+            let mut sequence = 0;
             loop {
                 interval.tick().await;
                 let now = Instant::now();
@@ -441,8 +449,22 @@ mod linux {
                         return Err(error);
                     }
                     let started = Instant::now();
+                    sequence += 1;
+                    let traffic = if sequence % 5 == 0 {
+                        vpn_wireguard::kernel::read_traffic_counters(&self.config.client_iface)
+                            .await
+                            .ok()
+                            .map(|counters| vpn_api_types::traffic::TrafficReport {
+                                generation: generation.clone(),
+                                sequence,
+                                counters,
+                            })
+                    } else {
+                        None
+                    };
                     let snapshot =
-                        fetch_snapshot(&self.config, self.applied_epoch.as_deref()).await?;
+                        fetch_snapshot(&self.config, self.applied_epoch.as_deref(), traffic)
+                            .await?;
                     let (epoch, peers) = snapshot.validate(&self.config, started)?;
                     Ok::<_, anyhow::Error>((started, epoch, peers))
                 }

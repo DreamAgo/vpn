@@ -88,6 +88,7 @@ pub fn build_router(state: AppState) -> Router {
     let authed_routes = if state.auth_service.is_some() {
         Router::new()
             .route("/api/v1/auth/logout", post(handlers::auth::logout))
+            .route("/api/v1/admin/traffic", get(handlers::traffic::dashboard))
             .route(
                 "/api/v1/cluster/candidates",
                 post(handlers::cluster::candidates),

@@ -17,6 +17,7 @@ pub mod group;
 pub mod peer;
 pub mod subnet;
 pub mod system;
+pub mod traffic;
 pub mod user;
 
 pub use envelope::{ApiResponse, Page};
