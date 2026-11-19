@@ -217,6 +217,12 @@ impl ObfsTransportSecret {
 }
 
 impl PeerService {
+    pub async fn traffic_counters(
+        &self,
+    ) -> Result<Option<Vec<vpn_api_types::traffic::TrafficCounter>>> {
+        self.control.traffic_counters().await
+    }
+
     /// 构造 PeerService。`ip_pool` 应已由调用方用 peers 表中已占用 IP 回填。
     #[allow(clippy::too_many_arguments)]
     pub fn new(

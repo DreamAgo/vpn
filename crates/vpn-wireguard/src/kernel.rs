@@ -193,6 +193,12 @@ impl WireGuardControl for KernelWireGuardControl {
             .collect())
     }
 
+    async fn traffic_counters(
+        &self,
+    ) -> Result<Option<Vec<vpn_api_types::traffic::TrafficCounter>>> {
+        read_traffic_counters(&self.iface).await.map(Some)
+    }
+
     async fn remove_routes(&self, subnets: &[String]) -> Result<()> {
         for subnet in subnets {
             // best-effort：路由可能已被其他途径删除/从未添加，`ip route del` 失败不应致命。
@@ -206,6 +212,47 @@ impl WireGuardControl for KernelWireGuardControl {
     fn server_public_key(&self) -> &str {
         &self.server_public_key
     }
+}
+
+/// Read transfer counters only. Unlike a full dump, this output contains no private keys.
+pub async fn read_traffic_counters(
+    iface: &str,
+) -> Result<Vec<vpn_api_types::traffic::TrafficCounter>> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tokio::process::Command::new("wg")
+            .args(["show", iface, "transfer"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| AppError::WireGuard("读取流量计数超时".into()))?
+    .map_err(|_| AppError::WireGuard("无法读取流量计数".into()))?;
+    if !output.status.success() {
+        return Err(AppError::WireGuard("读取流量计数失败".into()));
+    }
+    parse_traffic_counters(
+        &String::from_utf8(output.stdout)
+            .map_err(|_| AppError::WireGuard("流量计数编码无效".into()))?,
+    )
+}
+
+fn parse_traffic_counters(output: &str) -> Result<Vec<vpn_api_types::traffic::TrafficCounter>> {
+    output
+        .lines()
+        .map(|line| {
+            let values: Vec<_> = line.split_whitespace().collect();
+            let invalid = || AppError::WireGuard("流量计数格式无效".into());
+            if values.len() != 3 {
+                return Err(invalid());
+            }
+            Ok(vpn_api_types::traffic::TrafficCounter {
+                public_key: values[0].into(),
+                rx_bytes: values[1].parse().map_err(|_| invalid())?,
+                tx_bytes: values[2].parse().map_err(|_| invalid())?,
+            })
+        })
+        .collect()
 }
 
 /// 把私钥写入权限 0600 的临时文件，返回路径。
@@ -301,4 +348,20 @@ async fn run_output(cmd: &str, args: &[&str]) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+
+    #[test]
+    fn transfer_output_uses_gateway_receive_as_client_upload() {
+        let counters = parse_traffic_counters("key1\t1024\t2048\nkey2\t0\t9\n").unwrap();
+        assert_eq!(counters.len(), 2);
+        assert_eq!(counters[0].rx_bytes, 1024);
+        assert_eq!(counters[0].tx_bytes, 2048);
+        assert!(parse_traffic_counters("key -1 0").is_err());
+        assert!(parse_traffic_counters("key 1 2 extra").is_err());
+        assert!(parse_traffic_counters("").unwrap().is_empty());
+    }
 }

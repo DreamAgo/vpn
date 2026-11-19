@@ -18,6 +18,7 @@ import { SetupGate } from './components/SetupGate';
 import { LoginPage } from './pages/LoginPage';
 import { SetupWizardPage } from './pages/SetupWizardPage';
 import { DashboardPage } from './pages/DashboardPage';
+import { TrafficPage } from './pages/TrafficPage';
 import { AccountSettingsPage } from './pages/AccountSettingsPage';
 import { UsersPage } from './pages/UsersPage';
 import { GroupsPage } from './pages/GroupsPage';
@@ -114,6 +115,7 @@ function App() {
                       </RequireAdminRoute>
                     }
                   />
+                  <Route path="/traffic" element={<RequireAdminRoute><TrafficPage /></RequireAdminRoute>} />
                   <Route path="/client-versions" element={<RequireAdminRoute><ClientVersionsPage /></RequireAdminRoute>} />
                   <Route path="/account" element={<AccountSettingsPage />} />
                   <Route path="/account/password" element={<AccountSettingsPage />} />

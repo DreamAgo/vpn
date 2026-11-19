@@ -353,6 +353,16 @@ async fn run(
     } else {
         None
     };
+    let traffic = cluster
+        .as_ref()
+        .map(|cluster| cluster.traffic_service())
+        .unwrap_or_else(|| {
+            Arc::new(vpn_server::services::traffic_service::TrafficService::new(
+                pool.clone(),
+            ))
+        });
+    traffic.spawn(peer_service.clone());
+
     let feishu_directory_service = if config.feishu.enabled() {
         let service = Arc::new(vpn_server::services::FeishuDirectoryService::new(
             pool.clone(),
@@ -432,6 +442,7 @@ async fn run(
         .with_notification_service(notification_service)
         .with_db_pool(pool.clone());
     state.cluster = cluster;
+    state.traffic = Some(traffic);
     if let Some(service) = network_acl_service {
         state = state.with_network_acl_service(service);
     }

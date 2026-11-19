@@ -52,3 +52,5 @@ pub use user_service::UserService;
 pub mod client_update_service;
 pub mod feishu_directory_service;
 pub use feishu_directory_service::{FeishuDirectoryService, ReqwestDirectoryApi};
+
+pub mod traffic_service;

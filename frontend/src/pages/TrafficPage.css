@@ -1,0 +1,12 @@
+.traffic-page { display: flex; flex-direction: column; gap: 18px; }
+.traffic-page .page-heading { margin-bottom: 0; gap: 16px; flex-wrap: wrap; }
+.traffic-value { font-family: var(--font-mono, 'IBM Plex Mono', monospace); font-size: 28px; font-weight: 600; margin: 12px 0 6px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.traffic-sources { display: flex; gap: 6px; flex-wrap: wrap; }
+.traffic-chart { overflow-x: auto; }
+.traffic-chart svg { display: block; width: 100%; min-width: 560px; }
+.traffic-grid { stroke: var(--line, #dfe6ef); stroke-dasharray: 3 4; }
+.traffic-axis { fill: var(--ink-soft, #64748b); font-size: 10px; }
+@media (max-width: 600px) {
+  .traffic-page .ant-card-head { flex-wrap: wrap; }
+  .traffic-page .ant-card-extra .ant-space { flex-wrap: wrap; }
+}

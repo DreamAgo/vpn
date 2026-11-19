@@ -5065,6 +5065,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "vpn-api-types",
  "vpn-core",
  "x25519-dalek",
 ]

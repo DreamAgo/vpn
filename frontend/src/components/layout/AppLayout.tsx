@@ -5,6 +5,7 @@ import { Dropdown, App, Button, Tooltip } from 'antd';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   DashboardOutlined,
+  BarChartOutlined,
   UserOutlined,
   TeamOutlined,
   PartitionOutlined,
@@ -34,6 +35,7 @@ import {
 
 const adminRoutes: NonNullable<ProLayoutProps['route']>['routes'] = [
   { path: '/dashboard', name: '仪表盘', icon: <DashboardOutlined /> },
+  { path: '/traffic', name: '流量统计', icon: <BarChartOutlined /> },
   { path: '/users', name: '用户', icon: <UserOutlined /> },
   { path: '/groups', name: '用户组', icon: <TeamOutlined /> },
   { path: '/subnets', name: '网段组', icon: <PartitionOutlined /> },

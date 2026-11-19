@@ -33,6 +33,12 @@ pub trait WireGuardControl: Send + Sync {
     async fn remove_routes(&self, _subnets: &[String]) -> Result<()> {
         Ok(())
     }
+    /// Gateway-side counters. None indicates an unsupported/noop backend.
+    async fn traffic_counters(
+        &self,
+    ) -> Result<Option<Vec<vpn_api_types::traffic::TrafficCounter>>> {
+        Ok(None)
+    }
     /// 服务端公钥（base64）。
     fn server_public_key(&self) -> &str;
 }
